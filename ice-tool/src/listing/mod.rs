@@ -178,6 +178,15 @@ pub(crate) fn cmd_list(args: CloudArgs, config: &IceConfig) -> Result<()> {
     if cloud != Cloud::VastAi {
         ensure_provider_cli_installed(cloud)?;
     }
+    if crate::output::is_json() {
+        let instances = match cloud {
+            Cloud::VastAi => load_json_instances::<vast::Provider>(config)?,
+            Cloud::Gcp => load_json_instances::<gcp::Provider>(config)?,
+            Cloud::Aws => load_json_instances::<aws::Provider>(config)?,
+            Cloud::Local => load_json_instances::<local::Provider>(config)?,
+        };
+        return crate::output::emit("list", cloud, serde_json::json!({"instances": instances}));
+    }
     if stderr_is_interactive() {
         return match cloud {
             Cloud::VastAi => run_interactive_remote_list::<vast::Provider>(config),
@@ -203,6 +212,14 @@ pub(crate) fn cmd_list(args: CloudArgs, config: &IceConfig) -> Result<()> {
         Cloud::Local => print_listed_instances(cloud, &load_local_listed_instances(config)?),
     }
     Ok(())
+}
+
+fn load_json_instances<P: CloudProvider>(config: &IceConfig) -> Result<Vec<serde_json::Value>> {
+    let context = P::context(config)?;
+    // Do not substitute a stale cache or a partial response for a failed query.
+    let mut instances = P::list_instances(&context, &mut |_| {})?;
+    P::sort_instances(&mut instances);
+    Ok(instances.iter().map(CloudInstance::json_summary).collect())
 }
 
 fn run_interactive_local_list(config: &IceConfig) -> Result<()> {
