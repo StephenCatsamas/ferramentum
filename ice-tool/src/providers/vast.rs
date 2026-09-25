@@ -98,7 +98,29 @@ struct AccountSshKey {
 #[derive(Debug, Deserialize)]
 struct VastInstancesResponse {
     #[serde(default)]
-    instances: Vec<VastInstance>,
+    instances: Option<Vec<VastInstance>>,
+    #[serde(default)]
+    next_token: Option<String>,
+}
+
+fn collect_instance_pages<F>(mut fetch_page: F) -> Result<Vec<VastInstance>>
+where
+    F: FnMut(Option<&str>) -> Result<VastInstancesResponse>,
+{
+    let mut instances = Vec::new();
+    let mut after_token: Option<String> = None;
+    let mut seen_tokens = HashSet::new();
+    loop {
+        let page = fetch_page(after_token.as_deref())?;
+        instances.extend(page.instances.unwrap_or_default());
+        let Some(next_token) = page.next_token.filter(|token| !token.is_empty()) else {
+            return Ok(instances);
+        };
+        if !seen_tokens.insert(next_token.clone()) {
+            bail!("vast.ai returned a repeated instance pagination token");
+        }
+        after_token = Some(next_token);
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -345,11 +367,22 @@ impl VastClient {
     }
 
     pub(crate) fn list_instances(&self) -> Result<Vec<VastInstance>> {
-        Ok(serde_json::from_value::<VastInstancesResponse>(
-            self.get_json("/api/v0/instances/", "list instances")?,
-        )
-        .context("Failed to parse vast.ai instances response")?
-        .instances)
+        collect_instance_pages(|after_token| {
+            // v0 listing is retired. Leave select_cols unset so v1 returns the
+            // full instance records used by SSH, workload inference and display.
+            let mut url = reqwest::Url::parse(&format!("{VAST_BASE_URL}/api/v1/instances/"))
+                .context("Invalid vast.ai instance listing URL")?;
+            url.query_pairs_mut()
+                .append_pair("select_filters", "{}")
+                .append_pair("order_by", r#"[{"col":"id","dir":"asc"}]"#)
+                .append_pair("limit", "25");
+            if let Some(token) = after_token {
+                url.query_pairs_mut().append_pair("after_token", token);
+            }
+            let value =
+                self.send_json(|| self.auth(self.http.get(url.clone())), "list instances")?;
+            serde_json::from_value(value).context("Failed to parse vast.ai instances response")
+        })
     }
 
     fn list_scheduled_jobs(&self) -> Result<Vec<VastScheduledJob>> {
@@ -2484,4 +2517,89 @@ fn remaining_hours_display(
         "{:.2}h",
         remaining_hours(instance, scheduled_termination_unix).max(0.0)
     )
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    #[test]
+    fn collects_all_pages_including_an_empty_intermediate_page() {
+        let mut pages = vec![
+            json!({"instances": [{"id": 1, "image_runtype": "ssh"}],
+                   "next_token": "token+/="}),
+            json!({"instances": null, "next_token": "last"}),
+            json!({"instances": [{"id": 2, "label": "ice-second"}],
+                   "next_token": null}),
+        ]
+        .into_iter();
+        let mut requested_tokens = Vec::new();
+        let instances = collect_instance_pages(|token| {
+            requested_tokens.push(token.map(str::to_owned));
+            Ok(serde_json::from_value(
+                pages.next().expect("unexpected extra page"),
+            )?)
+        })
+        .unwrap();
+
+        assert_eq!(
+            requested_tokens,
+            [None, Some("token+/=".to_owned()), Some("last".to_owned())]
+        );
+        assert_eq!(
+            instances.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(instances[0].image_runtype.as_deref(), Some("ssh"));
+        assert_eq!(instances[1].label.as_deref(), Some("ice-second"));
+    }
+
+    #[test]
+    fn empty_accounts_finish_without_a_continuation_token() {
+        for page in [
+            json!({"instances": []}),
+            json!({"instances": null, "next_token": null}),
+            json!({"instances": [], "next_token": ""}),
+        ] {
+            let instances = collect_instance_pages(|token| {
+                assert!(token.is_none());
+                Ok(serde_json::from_value(page.clone())?)
+            })
+            .unwrap();
+            assert!(instances.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_failed_later_page_does_not_return_a_partial_listing() {
+        let error = collect_instance_pages(|token| {
+            if token.is_some() {
+                bail!("page fetch failed");
+            }
+            Ok(serde_json::from_value(json!({
+                "instances": [{"id": 1}], "next_token": "next"
+            }))?)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("page fetch failed"));
+    }
+
+    #[test]
+    fn repeated_tokens_fail_instead_of_looping_forever() {
+        let mut calls = 0;
+        let error = collect_instance_pages(|_| {
+            calls += 1;
+            assert!(calls <= 2);
+            Ok(serde_json::from_value(json!({
+                "instances": [], "next_token": "repeated"
+            }))?)
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(
+            error
+                .to_string()
+                .contains("repeated instance pagination token")
+        );
+    }
 }
