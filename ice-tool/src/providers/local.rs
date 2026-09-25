@@ -26,6 +26,15 @@ pub(crate) struct Provider;
 impl CloudInstance for LocalInstance {
     type ListContext = LocalContext;
 
+    fn json_summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id, "name": self.name, "state": self.state,
+            "image": self.image, "created_at": self.created_at,
+            "started_at": self.started_at, "runtime_seconds": self.runtime_seconds,
+            "workload": crate::output::workload(self.workload.as_ref()),
+        })
+    }
+
     fn cache_key(&self) -> String {
         self.name.clone()
     }
@@ -231,6 +240,23 @@ impl CreateProvider for Provider {
             );
         }
         let context = local_context();
+
+        if args.json && args.dry_run {
+            if matches!(workload, InstanceWorkload::Container(_)) {
+                context.require_runtime()?;
+            }
+            return crate::output::emit(
+                "create",
+                Cloud::Local,
+                serde_json::json!({
+                    "status": "preview", "dry_run": true,
+                    "workload": crate::output::workload(Some(&workload)),
+                    "requested_hours": hours,
+                    "container_runtime": context.runtime.map(|runtime| runtime.shell_prefix()),
+                    "cost": null,
+                }),
+            );
+        }
 
         println!();
         println!("Local workload:");

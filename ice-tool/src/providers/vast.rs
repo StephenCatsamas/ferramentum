@@ -256,6 +256,13 @@ impl VastOffer {
         f64::INFINITY
     }
 
+    pub(crate) fn quoted_total_hourly_price(&self) -> Option<f64> {
+        self.search
+            .as_ref()
+            .and_then(|quote| quote.total_hour)
+            .filter(|price| price.is_finite() && *price >= 0.0)
+    }
+
     pub(crate) fn gpu_name(&self) -> &str {
         self.gpu_name.as_deref().unwrap_or("unknown")
     }
@@ -782,6 +789,17 @@ impl VastClient {
 impl CloudInstance for VastInstance {
     type ListContext = HashMap<u64, f64>;
 
+    fn json_summary(&self) -> Value {
+        json!({
+            "id": self.id.to_string(), "name": self.label, "state": self.state_str(),
+            "gpu_model": self.gpu_name, "hourly_usd": self.dph_total,
+            "image": self.image.as_ref().or(self.image_uuid.as_ref()),
+            "ssh_host": self.ssh_host, "ssh_port": self.ssh_port,
+            "contract_end_unix": self.end_date,
+            "workload": crate::output::workload(self.workload.as_ref()),
+        })
+    }
+
     fn cache_key(&self) -> String {
         self.id.to_string()
     }
@@ -1044,6 +1062,7 @@ impl CommandProvider for Provider {
                 &instance,
                 remote_command.as_deref(),
                 args.preserve_ephemeral,
+                args.json,
             )
         } else if let Some(remote_command) = remote_command.as_deref() {
             open_remote_shell_with_auto_key(
@@ -1127,7 +1146,7 @@ impl CreateProvider for Provider {
         }
 
         let mut rejected_offer_ids = HashSet::new();
-        let instance_id = loop {
+        let (instance_id, selected_offer, mut selected_cost) = loop {
             let offer = find_cheapest_offer(
                 &client,
                 &search,
@@ -1145,7 +1164,9 @@ impl CreateProvider for Provider {
                 hours,
             )?)?;
 
-            print_offer_summary(&offer, &cost, &search);
+            if !args.json {
+                print_offer_summary(&offer, &cost, &search);
+            }
 
             if cost.hourly_usd > search.max_price_per_hr {
                 let available_hours = offer
@@ -1166,6 +1187,24 @@ impl CreateProvider for Provider {
             }
 
             if args.dry_run {
+                if args.json {
+                    let stop = build_vast_autostop_plan(now_unix_secs(), hours)?;
+                    return crate::output::emit(
+                        "create",
+                        Cloud::VastAi,
+                        json!({
+                            "status": "preview", "dry_run": true,
+                            "offer": crate::output::vast_offer(&offer),
+                            "cost": crate::output::cost(&cost),
+                            "cost_scope": "provider_rate",
+                            "quoted_total_hourly_usd": offer.quoted_total_hourly_price(),
+                            "allocated_disk_gb": VAST_DEFAULT_DISK_GB,
+                            "image": create_body.get("image"),
+                            "scheduled_stop_unix": stop.stop_at_unix,
+                            "workload": crate::output::workload(Some(&workload)),
+                        }),
+                    );
+                }
                 println!(
                     "Dry run: best matching offer is {} at ${:.4}/hr, est ${:.4} for {:.3}h scheduled ({:.3}h requested). Aborting before accept/pay/create.",
                     offer.id, price, cost.total_usd, cost.billed_hours, cost.requested_hours
@@ -1173,6 +1212,14 @@ impl CreateProvider for Provider {
                 return Ok(());
             }
 
+            if args.json {
+                eprintln!(
+                    "Selected offer {} ({}) at ${:.4}/hr.",
+                    offer.id,
+                    offer.gpu_name(),
+                    price
+                );
+            }
             match prompt_offer_decision(&build_accept_prompt(&cost))? {
                 crate::model::OfferDecision::ChangeFilter => {
                     prompt_adjust_search_filters(
@@ -1182,7 +1229,15 @@ impl CreateProvider for Provider {
                     )?;
                 }
                 crate::model::OfferDecision::Reject => {
-                    println!("Aborted.");
+                    if args.json {
+                        crate::output::emit(
+                            "create",
+                            Cloud::VastAi,
+                            json!({"status": "cancelled"}),
+                        )?;
+                    } else {
+                        println!("Aborted.");
+                    }
                     return Ok(());
                 }
                 crate::model::OfferDecision::Accept => {
@@ -1192,7 +1247,7 @@ impl CreateProvider for Provider {
                         Ok(instance_id) => {
                             create_spinner
                                 .finish_with_message(format!("Created instance {instance_id}."));
-                            break instance_id;
+                            break (instance_id, offer, cost);
                         }
                         Err(err) => {
                             create_spinner.finish_and_clear();
@@ -1235,6 +1290,31 @@ impl CreateProvider for Provider {
             format_unix_utc(auto_stop_plan.stop_at_unix),
             auto_stop_plan.runtime_hours
         ));
+
+        if args.json {
+            let instance = wait_for_ssh_ready(
+                &client,
+                instance_id,
+                Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
+            )?;
+            selected_cost.billed_hours = auto_stop_plan.runtime_hours;
+            selected_cost.total_usd = selected_cost.hourly_usd * auto_stop_plan.runtime_hours;
+            return crate::output::emit(
+                "create",
+                Cloud::VastAi,
+                json!({
+                    "status": "created", "instance": instance.json_summary(),
+                    "offer": crate::output::vast_offer(&selected_offer),
+                    "cost": crate::output::cost(&selected_cost),
+                    "cost_scope": "provider_rate",
+                    "quoted_total_hourly_usd": selected_offer.quoted_total_hourly_price(),
+                    "allocated_disk_gb": VAST_DEFAULT_DISK_GB,
+                    "image": create_body.get("image"),
+                    "scheduled_stop_unix": auto_stop_plan.stop_at_unix,
+                    "storage_charges_continue_after_stop": true,
+                }),
+            );
+        }
 
         match &workload {
             InstanceWorkload::Shell => {
@@ -1570,11 +1650,14 @@ fn print_shell_command_with_auto_key(
     instance: &VastInstance,
     remote_command: Option<&str>,
     preserve_ephemeral: bool,
+    json: bool,
 ) -> Result<()> {
-    println!(
-        "{}",
-        shell_command_with_auto_key(client, instance, remote_command, preserve_ephemeral)?
-    );
+    let command =
+        shell_command_with_auto_key(client, instance, remote_command, preserve_ephemeral, json)?;
+    if json {
+        return crate::output::connection(Cloud::VastAi, instance.json_summary(), &command);
+    }
+    println!("{command}");
     Ok(())
 }
 
@@ -1583,6 +1666,7 @@ fn shell_command_with_auto_key(
     instance: &VastInstance,
     remote_command: Option<&str>,
     preserve_ephemeral: bool,
+    quiet_probe: bool,
 ) -> Result<String> {
     with_auto_key_behavior(
         client,
@@ -1593,7 +1677,22 @@ fn shell_command_with_auto_key(
             TemporaryKeyBehavior::Reject
         },
         |identity| {
-            run_ssh_command(instance, identity, Some("true"), false)?;
+            if quiet_probe {
+                let (host, port) = ssh_target(instance)?;
+                wait_for_ssh_port_preflight(instance.id, &host, port, Duration::from_secs(30))?;
+                let output = Command::new("ssh")
+                    .args(ssh_args(&host, port, identity))
+                    .arg("true")
+                    .stdin(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .output()
+                    .context("Failed to run ssh readiness check")?;
+                if !output.status.success() {
+                    bail!("ssh exited with status {}", output.status);
+                }
+            } else {
+                run_ssh_command(instance, identity, Some("true"), false)?;
+            }
             let (host, port) = ssh_target(instance)?;
             let mut args = ssh_args(&host, port, identity);
             if let Some(remote_command) = remote_command {

@@ -68,6 +68,9 @@ where
 pub(crate) trait CloudInstance {
     type ListContext;
 
+    /// Stable data fields only: no display formatting, configuration or credentials.
+    fn json_summary(&self) -> serde_json::Value;
+
     fn cache_key(&self) -> String;
     fn display_name(&self) -> String;
     fn state_value(&self) -> &str;
@@ -290,7 +293,11 @@ impl<T: RemoteSshProvider> CommandProvider for T {
             Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
         )?;
         if args.print_creds {
-            println!("{}", T::shell_connect_command(config, &instance)?);
+            let command = T::shell_connect_command(config, &instance)?;
+            if args.json {
+                return crate::output::connection(T::CLOUD, instance.json_summary(), &command);
+            }
+            println!("{command}");
             return Ok(());
         }
         T::open_instance_shell(config, &instance)

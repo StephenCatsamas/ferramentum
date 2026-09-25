@@ -11,6 +11,7 @@ mod http_retry;
 mod listing;
 mod local;
 mod model;
+mod output;
 mod providers;
 mod provision;
 mod remote;

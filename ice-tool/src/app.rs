@@ -240,6 +240,11 @@ fn print_login_outcome(cloud: Cloud, outcome: &LoginOutcome) {
 }
 
 fn cmd_create(args: CreateArgs, config: &mut IceConfig) -> Result<()> {
+    if args.json && !args.dry_run && !args.ssh {
+        bail!(
+            "`create --json` requires `--ssh` or `--dry-run`; managed workload output is not JSON."
+        );
+    }
     let cloud = resolve_cloud(args.cloud, config)?;
     match cloud {
         Cloud::VastAi => create_for::<vast::Provider>(config, &args),
@@ -367,7 +372,15 @@ where
                 )?;
             }
             MarketCandidateReviewOutcome::Reject => {
-                println!("Aborted.");
+                if args.json {
+                    crate::output::emit(
+                        "create",
+                        P::CLOUD,
+                        serde_json::json!({"status": "cancelled"}),
+                    )?;
+                } else {
+                    println!("Aborted.");
+                }
                 return Ok(());
             }
             MarketCandidateReviewOutcome::DryRunComplete => return Ok(()),
@@ -375,6 +388,19 @@ where
     };
 
     let instance = P::create_machine(&effective_config, &candidate, hours, &workload)?;
+    if args.json {
+        return crate::output::emit(
+            "create",
+            P::CLOUD,
+            serde_json::json!({
+                "status": "created", "instance": instance.json_summary(),
+                "machine": crate::output::machine(&candidate),
+                "cost": crate::output::cost(&estimate_runtime_cost(P::CLOUD, candidate.hourly_usd, hours)?),
+                "cost_scope": "compute",
+                "allocated_disk_gb": crate::output::allocated_disk_gb(&effective_config, P::CLOUD),
+            }),
+        );
+    }
     if let InstanceWorkload::Unpack(source) = &workload {
         P::deploy_unpack(&effective_config, &instance, source)?;
         if prompt_confirm("Follow unpack logs now?", true)? {
@@ -401,6 +427,10 @@ fn review_market_candidate<P: MarketCreateProvider + 'static>(
     hours: f64,
     candidate: CloudMachineCandidate,
 ) -> Result<MarketCandidateReviewOutcome> {
+    if args.json {
+        let candidate = P::refresh_machine_offer(config, &candidate)?;
+        return review_verified_market_candidate(config, P::CLOUD, args, search, hours, candidate);
+    }
     if matches!(P::CLOUD, Cloud::Gcp | Cloud::Aws) {
         return review_live_market_candidate::<P>(config, args, search, hours, candidate);
     }
@@ -565,7 +595,9 @@ fn review_verified_market_candidate(
     candidate: CloudMachineCandidate,
 ) -> Result<MarketCandidateReviewOutcome> {
     let cost = estimate_runtime_cost(cloud, candidate.hourly_usd, hours)?;
-    print_machine_candidate_summary(config, cloud, &candidate, &cost, search)?;
+    if !args.json {
+        print_machine_candidate_summary(config, cloud, &candidate, &cost, search)?;
+    }
 
     if cost.hourly_usd > search.max_price_per_hr {
         bail!(
@@ -581,6 +613,21 @@ fn review_verified_market_candidate(
     }
 
     if args.dry_run {
+        if args.json {
+            crate::output::emit(
+                "create",
+                cloud,
+                serde_json::json!({
+                    "status": "preview", "dry_run": true,
+                    "machine": crate::output::machine(&candidate),
+                    "cost": crate::output::cost(&cost),
+                    "cost_scope": "compute",
+                    "allocated_disk_gb": crate::output::allocated_disk_gb(config, cloud),
+                    "workload": crate::output::workload(Some(&resolve_deploy_workload(&args.target_request())?)),
+                }),
+            )?;
+            return Ok(MarketCandidateReviewOutcome::DryRunComplete);
+        }
         println!(
             "Dry run: cheapest matching machine is {} in {} at ${:.4}/hr, est ${:.4} for {:.3}h scheduled ({:.3}h requested). Aborting before create.",
             candidate.machine,
@@ -593,6 +640,12 @@ fn review_verified_market_candidate(
         return Ok(MarketCandidateReviewOutcome::DryRunComplete);
     }
 
+    if args.json {
+        eprintln!(
+            "Selected {} in {} at ${:.4}/hr.",
+            candidate.machine, candidate.region, candidate.hourly_usd
+        );
+    }
     Ok(match prompt_offer_decision(&build_accept_prompt(&cost))? {
         OfferDecision::Accept => MarketCandidateReviewOutcome::Accept(candidate),
         OfferDecision::Reject => MarketCandidateReviewOutcome::Reject,

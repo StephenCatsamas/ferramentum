@@ -78,6 +78,9 @@ pub(crate) enum Commands {
 
 #[derive(Debug, Args)]
 pub(crate) struct CloudArgs {
+    /// Write a versioned JSON result to stdout.
+    #[arg(long)]
+    pub(crate) json: bool,
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
 }
@@ -152,6 +155,9 @@ pub(crate) struct ConfigUnsetArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ShellArgs {
+    /// Write connection information as JSON. Does not open an interactive shell.
+    #[arg(long, requires = "print_creds")]
+    pub(crate) json: bool,
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
     #[arg(long)]
@@ -188,6 +194,9 @@ pub(crate) struct InstanceArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct CreateArgs {
+    /// Write the preview or created machine as JSON. Creation requires --ssh.
+    #[arg(long)]
+    pub(crate) json: bool,
     /// Target cloud. Defaults to `default.cloud`.
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,

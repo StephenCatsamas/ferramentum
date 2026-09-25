@@ -394,6 +394,16 @@ impl AwsInstance {
 impl CloudInstance for AwsInstance {
     type ListContext = ();
 
+    fn json_summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.instance_id, "name": self.name, "state": self.state,
+            "region": self.region, "machine_type": self.instance_type,
+            "public_ip": self.public_ip, "public_dns": self.public_dns,
+            "launched_at": self.launch_time,
+            "workload": crate::output::workload(self.workload.as_ref()),
+        })
+    }
+
     fn cache_key(&self) -> String {
         format!("{}/{}", self.region, self.instance_id)
     }
