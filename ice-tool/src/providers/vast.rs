@@ -1062,7 +1062,7 @@ impl CommandProvider for Provider {
                 &instance,
                 remote_command.as_deref(),
                 args.preserve_ephemeral,
-                args.json,
+                crate::output::is_json(),
             )
         } else if let Some(remote_command) = remote_command.as_deref() {
             open_remote_shell_with_auto_key(
@@ -1164,7 +1164,7 @@ impl CreateProvider for Provider {
                 hours,
             )?)?;
 
-            if !args.json {
+            if !crate::output::is_json() {
                 print_offer_summary(&offer, &cost, &search);
             }
 
@@ -1187,7 +1187,7 @@ impl CreateProvider for Provider {
             }
 
             if args.dry_run {
-                if args.json {
+                if crate::output::is_json() {
                     let stop = build_vast_autostop_plan(now_unix_secs(), hours)?;
                     return crate::output::emit(
                         "create",
@@ -1212,7 +1212,7 @@ impl CreateProvider for Provider {
                 return Ok(());
             }
 
-            if args.json {
+            if crate::output::is_json() {
                 eprintln!(
                     "Selected offer {} ({}) at ${:.4}/hr.",
                     offer.id,
@@ -1229,7 +1229,7 @@ impl CreateProvider for Provider {
                     )?;
                 }
                 crate::model::OfferDecision::Reject => {
-                    if args.json {
+                    if crate::output::is_json() {
                         crate::output::emit(
                             "create",
                             Cloud::VastAi,
@@ -1291,12 +1291,19 @@ impl CreateProvider for Provider {
             auto_stop_plan.runtime_hours
         ));
 
-        if args.json {
-            let instance = wait_for_ssh_ready(
-                &client,
-                instance_id,
-                Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-            )?;
+        if crate::output::is_json() {
+            let timeout = Duration::from_secs(VAST_WAIT_TIMEOUT_SECS);
+            let mut instance = match &workload {
+                InstanceWorkload::Container(_) => {
+                    wait_for_workload_start(&client, instance_id, timeout)?
+                }
+                _ => wait_for_ssh_ready(&client, instance_id, timeout)?,
+            };
+            instance.workload = Some(workload.clone());
+            upsert_instance::<CacheModel>(&instance);
+            if let InstanceWorkload::Unpack(source) = &workload {
+                deploy_unpack(config, &client, &instance, source)?;
+            }
             selected_cost.billed_hours = auto_stop_plan.runtime_hours;
             selected_cost.total_usd = selected_cost.hourly_usd * auto_stop_plan.runtime_hours;
             return crate::output::emit(
@@ -2151,9 +2158,21 @@ fn run_ssh_command(
         command.arg(remote_command);
     }
 
-    let status = command
-        .status()
-        .with_context(|| format!("Failed to run ssh into instance {}", instance.id))?;
+    if crate::output::streaming_logs() {
+        return crate::output::run_log_command(&mut command, "stream vast.ai unpack logs");
+    }
+    let status = if crate::output::is_json() {
+        // Capture deployment stdout while preserving diagnostics and the SSH
+        // status wording used by the existing automatic-key retry logic.
+        command
+            .stdin(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+            .map(|output| output.status)
+    } else {
+        command.status()
+    }
+    .with_context(|| format!("Failed to run ssh into instance {}", instance.id))?;
     if !status.success() {
         bail!("ssh exited with status {status}");
     }
@@ -2574,6 +2593,16 @@ fn workload_completed(instance: &VastInstance) -> bool {
 }
 
 fn print_log_delta(previous: &mut String, current: &str) -> Result<()> {
+    if crate::output::streaming_logs() {
+        let (text, reset) = match current.strip_prefix(previous.as_str()) {
+            Some(delta) => (delta, false),
+            None => (current, true),
+        };
+        crate::output::log_text("combined", text, reset)?;
+        previous.clear();
+        previous.push_str(current);
+        return Ok(());
+    }
     let mut stdout = io::stdout().lock();
     if current.is_empty() {
         if previous.is_empty() {

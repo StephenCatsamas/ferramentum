@@ -137,36 +137,97 @@ impl Drop for LiveOfferRenderer {
 }
 
 pub(crate) fn main() -> ExitCode {
-    match run() {
-        Ok(code) => code,
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let json = std::env::args_os()
+                .skip(1)
+                .take_while(|arg| arg != "--")
+                .any(|arg| arg == "--json");
+            if json && error.use_stderr() {
+                // Clap can echo supplied values. Do not repeat credentials from
+                // config assignments in an argument-validation error.
+                let message = redact_cli_assignments(error.to_string());
+                if let Err(error) = crate::output::error(None, None, "invalid_arguments", &message)
+                {
+                    eprintln!("{error}");
+                }
+                return ExitCode::from(2);
+            }
+            error.exit();
+        }
+    };
+    crate::output::initialize(cli.json);
+    let name = cli.command.name();
+    let mut config = IceConfig::default();
+    let mut cloud = cli.command.cloud(&config);
+    let result = (|| {
+        ensure_runtime_gpu_data_files()?;
+        config = load_config()?;
+        cloud = cli.command.cloud(&config);
+        run(cli.command, &mut config)
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            print_big_red_error(&format!("{err:#}"));
-            ExitCode::from(1)
+            let interrupted = capulus::error_is_cancelled(&err);
+            if cli.json {
+                // Keep the outer context; TOML parser causes can contain source
+                // excerpts, including credentials from a malformed config file.
+                let mut message = redact_cli_assignments(err.to_string());
+                for secret in [
+                    &config.auth.vast_ai.api_key,
+                    &config.auth.aws.access_key_id,
+                    &config.auth.aws.secret_access_key,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !secret.is_empty() {
+                        message = message.replace(secret, "<redacted>");
+                    }
+                }
+                if let Err(error) =
+                    crate::output::error(Some(name), cloud, "command_failed", &message)
+                {
+                    eprintln!("{error}");
+                }
+            } else {
+                print_big_red_error(&format!("{err:#}"));
+            }
+            ExitCode::from(if interrupted { 130 } else { 1 })
         }
     }
 }
 
-pub(crate) fn run() -> Result<ExitCode> {
-    let cli = Cli::parse();
-    ensure_runtime_gpu_data_files()?;
-    let mut config = load_config()?;
-
-    match cli.command {
-        Commands::Login(args) => cmd_login(args, &mut config)?,
-        Commands::Config(args) => cmd_config(args, &mut config)?,
-        Commands::List(args) => crate::listing::cmd_list(args, &config)?,
-        Commands::Logs(args) => crate::commands::cmd_logs(args, &config)?,
-        Commands::Shell(args) => crate::commands::cmd_shell(args, &config)?,
-        Commands::Pull(args) => crate::commands::cmd_pull(args, &config)?,
-        Commands::Push(args) => crate::commands::cmd_push(args, &config)?,
-        Commands::Stop(args) => crate::commands::cmd_stop(args, &config)?,
-        Commands::Start(args) => crate::commands::cmd_start(args, &config)?,
-        Commands::Delete(args) => crate::commands::cmd_delete(args, &config)?,
-        Commands::Create(args) => cmd_create(args, &mut config)?,
-        Commands::RefreshCatalog(args) => cmd_refresh_catalog(args, &config)?,
+fn redact_cli_assignments(mut message: String) -> String {
+    for arg in std::env::args_os().skip(1) {
+        let arg = arg.to_string_lossy();
+        if let Some((key, value)) = arg.split_once('=')
+            && key.starts_with("auth.")
+            && !value.is_empty()
+        {
+            message = message.replace(value, "<redacted>");
+        }
     }
+    message
+}
 
-    Ok(ExitCode::SUCCESS)
+fn run(command: Commands, config: &mut IceConfig) -> Result<()> {
+    match command {
+        Commands::Login(args) => cmd_login(args, config),
+        Commands::Config(args) => cmd_config(args, config),
+        Commands::List(args) => crate::listing::cmd_list(args, config),
+        Commands::Logs(args) => crate::commands::cmd_logs(args, config),
+        Commands::Shell(args) => crate::commands::cmd_shell(args, config),
+        Commands::Pull(args) => crate::commands::cmd_pull(args, config),
+        Commands::Push(args) => crate::commands::cmd_push(args, config),
+        Commands::Stop(args) => crate::commands::cmd_stop(args, config),
+        Commands::Start(args) => crate::commands::cmd_start(args, config),
+        Commands::Delete(args) => crate::commands::cmd_delete(args, config),
+        Commands::Create(args) => cmd_create(args, config),
+        Commands::RefreshCatalog(args) => cmd_refresh_catalog(args, config),
+    }
 }
 
 fn cmd_login(args: LoginArgs, config: &mut IceConfig) -> Result<()> {
@@ -180,6 +241,20 @@ fn cmd_login(args: LoginArgs, config: &mut IceConfig) -> Result<()> {
         Cloud::Aws => login_aws(config, args.force)?,
         Cloud::Local => login_local()?,
     };
+    if crate::output::is_json() {
+        let method = match outcome.method {
+            LoginMethod::Cached => "cached",
+            LoginMethod::AutoDetected => "auto_detected",
+            LoginMethod::Prompted => "prompted",
+        };
+        return crate::output::emit(
+            "login",
+            cloud,
+            serde_json::json!({
+                "status": "ready", "method": method, "saved_path": outcome.saved_path,
+            }),
+        );
+    }
     print_login_outcome(cloud, &outcome);
     Ok(())
 }
@@ -194,6 +269,15 @@ fn cmd_config(args: ConfigArgs, config: &mut IceConfig) -> Result<()> {
 }
 
 fn cmd_config_list(config: &IceConfig) -> Result<()> {
+    if crate::output::is_json() {
+        return crate::output::emit(
+            "config list",
+            None,
+            serde_json::json!({
+                "values": crate::output::config_values(config)?,
+            }),
+        );
+    }
     for key in supported_config_keys() {
         println!("{key} = {}", get_config_value(config, key)?);
     }
@@ -202,6 +286,15 @@ fn cmd_config_list(config: &IceConfig) -> Result<()> {
 
 fn cmd_config_get(args: ConfigGetArgs, config: &IceConfig) -> Result<()> {
     let key = normalize_config_key(&args.key)?;
+    if crate::output::is_json() {
+        return crate::output::emit(
+            "config get",
+            None,
+            serde_json::json!({
+                "key": key, "value": crate::output::config_values(config)?[&key],
+            }),
+        );
+    }
     println!("{key} = {}", get_config_value(config, &key)?);
     Ok(())
 }
@@ -212,6 +305,15 @@ fn cmd_config_set(args: ConfigSetArgs, config: &mut IceConfig) -> Result<()> {
     let (key, value) = parse_key_value_pair(&args.pair)?;
     let rendered = set_config_value(config, &key, &value)?;
     let path = save_config(config)?;
+    if crate::output::is_json() {
+        return crate::output::emit(
+            "config set",
+            None,
+            serde_json::json!({
+                "key": key, "value": crate::output::config_values(config)?[&key], "path": path,
+            }),
+        );
+    }
     print_notice(&format!("Set `{key}` = {rendered} ({})", path.display()));
     Ok(())
 }
@@ -222,6 +324,15 @@ fn cmd_config_unset(args: ConfigUnsetArgs, config: &mut IceConfig) -> Result<()>
     let key = normalize_config_key(&args.key)?;
     unset_config_value(config, &key)?;
     let path = save_config(config)?;
+    if crate::output::is_json() {
+        return crate::output::emit(
+            "config unset",
+            None,
+            serde_json::json!({
+                "key": key, "value": null, "path": path,
+            }),
+        );
+    }
     print_notice(&format!("Unset `{key}` ({})", path.display()));
     Ok(())
 }
@@ -240,11 +351,6 @@ fn print_login_outcome(cloud: Cloud, outcome: &LoginOutcome) {
 }
 
 fn cmd_create(args: CreateArgs, config: &mut IceConfig) -> Result<()> {
-    if args.json && !args.dry_run && !args.ssh {
-        bail!(
-            "`create --json` requires `--ssh` or `--dry-run`; managed workload output is not JSON."
-        );
-    }
     let cloud = resolve_cloud(args.cloud, config)?;
     match cloud {
         Cloud::VastAi => create_for::<vast::Provider>(config, &args),
@@ -264,7 +370,7 @@ fn refresh_catalog_error_message(cloud: Cloud) -> Option<String> {
     }
 }
 
-fn refresh_catalog_for_cloud(cloud: Cloud, config: &IceConfig) -> Result<()> {
+fn refresh_catalog_for_cloud(cloud: Cloud, config: &IceConfig) -> Result<serde_json::Value> {
     if let Some(message) = refresh_catalog_error_message(cloud) {
         bail!("{message}");
     }
@@ -272,6 +378,14 @@ fn refresh_catalog_for_cloud(cloud: Cloud, config: &IceConfig) -> Result<()> {
         Cloud::Gcp => {
             ensure_provider_cli_installed(Cloud::Gcp)?;
             let outcome = gcp::refresh_local_catalog(config)?;
+            let result = serde_json::json!({
+                "cloud": cloud, "changed_entries": outcome.changed_entry_count,
+                "entries": outcome.entry_count, "path": outcome.path,
+                "warning_count": outcome.warning_count, "warnings": outcome.warning_summary,
+            });
+            if crate::output::is_json() {
+                return Ok(result);
+            }
             println!(
                 "Refreshed gcp catalog with {} changed entries ({} total priced machine entries, {}).",
                 outcome.changed_entry_count,
@@ -287,11 +401,19 @@ fn refresh_catalog_for_cloud(cloud: Cloud, config: &IceConfig) -> Result<()> {
                     print_warning(&line);
                 }
             }
-            Ok(())
+            Ok(result)
         }
         Cloud::Aws => {
             ensure_provider_cli_installed(Cloud::Aws)?;
             let outcome = aws::refresh_local_catalog(config)?;
+            let result = serde_json::json!({
+                "cloud": cloud, "changed_entries": outcome.changed_entry_count,
+                "entries": outcome.entry_count, "path": outcome.path,
+                "warning_count": outcome.warning_count, "warnings": outcome.warning_summary,
+            });
+            if crate::output::is_json() {
+                return Ok(result);
+            }
             println!(
                 "Refreshed aws catalog with {} changed entries ({} total priced machine entries, {}).",
                 outcome.changed_entry_count,
@@ -307,19 +429,26 @@ fn refresh_catalog_for_cloud(cloud: Cloud, config: &IceConfig) -> Result<()> {
                     print_warning(&line);
                 }
             }
-            Ok(())
+            Ok(result)
         }
         _ => unreachable!("non-GCP/AWS refresh-catalog availability is handled above"),
     }
 }
 
 fn cmd_refresh_catalog(args: RefreshCatalogArgs, config: &IceConfig) -> Result<()> {
-    if let Some(cloud) = args.cloud {
-        return refresh_catalog_for_cloud(cloud, config);
-    }
-
-    for cloud in [Cloud::Gcp, Cloud::Aws] {
-        refresh_catalog_for_cloud(cloud, config)?;
+    let clouds = args
+        .cloud
+        .map_or_else(|| vec![Cloud::Gcp, Cloud::Aws], |cloud| vec![cloud]);
+    let results = clouds
+        .into_iter()
+        .map(|cloud| refresh_catalog_for_cloud(cloud, config))
+        .collect::<Result<Vec<_>>>()?;
+    if crate::output::is_json() {
+        crate::output::emit(
+            "refresh-catalog",
+            args.cloud,
+            serde_json::json!({"catalogs": results}),
+        )?;
     }
     Ok(())
 }
@@ -372,7 +501,7 @@ where
                 )?;
             }
             MarketCandidateReviewOutcome::Reject => {
-                if args.json {
+                if crate::output::is_json() {
                     crate::output::emit(
                         "create",
                         P::CLOUD,
@@ -388,7 +517,10 @@ where
     };
 
     let instance = P::create_machine(&effective_config, &candidate, hours, &workload)?;
-    if args.json {
+    if let InstanceWorkload::Unpack(source) = &workload {
+        P::deploy_unpack(&effective_config, &instance, source)?;
+    }
+    if crate::output::is_json() {
         return crate::output::emit(
             "create",
             P::CLOUD,
@@ -401,8 +533,7 @@ where
             }),
         );
     }
-    if let InstanceWorkload::Unpack(source) = &workload {
-        P::deploy_unpack(&effective_config, &instance, source)?;
+    if matches!(workload, InstanceWorkload::Unpack(_)) {
         if prompt_confirm("Follow unpack logs now?", true)? {
             print_stage("Following unpack logs");
             P::stream_unpack_logs(&effective_config, &instance, 200, true)?;
@@ -427,7 +558,7 @@ fn review_market_candidate<P: MarketCreateProvider + 'static>(
     hours: f64,
     candidate: CloudMachineCandidate,
 ) -> Result<MarketCandidateReviewOutcome> {
-    if args.json {
+    if crate::output::is_json() {
         let candidate = P::refresh_machine_offer(config, &candidate)?;
         return review_verified_market_candidate(config, P::CLOUD, args, search, hours, candidate);
     }
@@ -595,7 +726,7 @@ fn review_verified_market_candidate(
     candidate: CloudMachineCandidate,
 ) -> Result<MarketCandidateReviewOutcome> {
     let cost = estimate_runtime_cost(cloud, candidate.hourly_usd, hours)?;
-    if !args.json {
+    if !crate::output::is_json() {
         print_machine_candidate_summary(config, cloud, &candidate, &cost, search)?;
     }
 
@@ -613,7 +744,7 @@ fn review_verified_market_candidate(
     }
 
     if args.dry_run {
-        if args.json {
+        if crate::output::is_json() {
             crate::output::emit(
                 "create",
                 cloud,
@@ -640,7 +771,7 @@ fn review_verified_market_candidate(
         return Ok(MarketCandidateReviewOutcome::DryRunComplete);
     }
 
-    if args.json {
+    if crate::output::is_json() {
         eprintln!(
             "Selected {} in {} at ${:.4}/hr.",
             candidate.machine, candidate.region, candidate.hourly_usd
@@ -1418,7 +1549,7 @@ fn aws_identity_detected(config: &IceConfig, include_cached: bool) -> Result<boo
         "--region",
         "us-east-1",
     ]);
-    if default_chain.status().is_ok_and(|status| status.success()) {
+    if identity_probe_succeeded(&mut default_chain) {
         return Ok(true);
     }
 
@@ -1448,5 +1579,13 @@ fn aws_identity_detected(config: &IceConfig, include_cached: bool) -> Result<boo
             "--region",
             "us-east-1",
         ]);
-    Ok(explicit_keys.status().is_ok_and(|status| status.success()))
+    Ok(identity_probe_succeeded(&mut explicit_keys))
+}
+
+fn identity_probe_succeeded(command: &mut Command) -> bool {
+    if crate::output::is_json() {
+        command.output().is_ok_and(|output| output.status.success())
+    } else {
+        command.status().is_ok_and(|status| status.success())
+    }
 }

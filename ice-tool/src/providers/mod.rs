@@ -294,7 +294,7 @@ impl<T: RemoteSshProvider> CommandProvider for T {
         )?;
         if args.print_creds {
             let command = T::shell_connect_command(config, &instance)?;
-            if args.json {
+            if crate::output::is_json() {
                 return crate::output::connection(T::CLOUD, instance.json_summary(), &command);
             }
             println!("{command}");

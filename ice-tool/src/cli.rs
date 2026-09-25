@@ -12,6 +12,9 @@ use crate::model::{Cloud, DeployTargetRequest};
     after_help = "Examples:\n  ice create test-crate\n  ice create --arca test-crate --hours 0.25\n  ice create --unpack arca:test-crate --cloud vast.ai\n  ice create --container us-central1-docker.pkg.dev/my-project/arca/my-image:tag --cloud vast.ai\n  ice create --ssh --cloud gcp --machine g2-standard-4"
 )]
 pub(crate) struct Cli {
+    /// Write versioned JSON results (JSON Lines for logs). Shell requires --print-creds.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -78,9 +81,6 @@ pub(crate) enum Commands {
 
 #[derive(Debug, Args)]
 pub(crate) struct CloudArgs {
-    /// Write a versioned JSON result to stdout.
-    #[arg(long)]
-    pub(crate) json: bool,
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
 }
@@ -155,9 +155,6 @@ pub(crate) struct ConfigUnsetArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct ShellArgs {
-    /// Write connection information as JSON. Does not open an interactive shell.
-    #[arg(long, requires = "print_creds")]
-    pub(crate) json: bool,
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
     #[arg(long)]
@@ -194,9 +191,6 @@ pub(crate) struct InstanceArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct CreateArgs {
-    /// Write the preview or created machine as JSON. Creation requires --ssh.
-    #[arg(long)]
-    pub(crate) json: bool,
     /// Target cloud. Defaults to `default.cloud`.
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
@@ -244,6 +238,46 @@ pub(crate) struct CreateArgs {
         help = "Defaults to a local `arca` artifact selector."
     )]
     pub(crate) target: Option<String>,
+}
+
+impl Commands {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Login(_) => "login",
+            Self::Config(args) => match args.command {
+                ConfigCommands::List(_) => "config list",
+                ConfigCommands::Get(_) => "config get",
+                ConfigCommands::Set(_) => "config set",
+                ConfigCommands::Unset(_) => "config unset",
+            },
+            Self::List(_) => "list",
+            Self::Logs(_) => "logs",
+            Self::Shell(_) => "shell",
+            Self::Pull(_) => "pull",
+            Self::Push(_) => "push",
+            Self::Stop(_) => "stop",
+            Self::Start(_) => "start",
+            Self::Delete(_) => "delete",
+            Self::Create(_) => "create",
+            Self::RefreshCatalog(_) => "refresh-catalog",
+        }
+    }
+
+    pub(crate) fn cloud(&self, config: &crate::model::IceConfig) -> Option<Cloud> {
+        let requested = match self {
+            Self::Config(_) => return None,
+            Self::RefreshCatalog(args) => return args.cloud,
+            Self::Login(args) => args.cloud,
+            Self::List(args) => args.cloud,
+            Self::Logs(args) => args.cloud,
+            Self::Shell(args) => args.cloud,
+            Self::Pull(args) => args.cloud,
+            Self::Push(args) => args.cloud,
+            Self::Stop(args) | Self::Start(args) | Self::Delete(args) => args.cloud,
+            Self::Create(args) => args.cloud,
+        };
+        requested.or(config.default.cloud)
+    }
 }
 
 impl CreateArgs {

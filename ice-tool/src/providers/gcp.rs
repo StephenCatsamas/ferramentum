@@ -2783,6 +2783,7 @@ fn registry_access_token(config: &IceConfig) -> Result<String> {
         configured_credentials_path: config.auth.gcp.service_account_json.as_deref(),
         cache_path: &cache_path,
     })
+    .context("Failed to obtain GCP registry credentials")
 }
 
 fn service_account_email(config: &IceConfig) -> Result<Option<String>> {

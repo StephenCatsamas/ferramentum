@@ -178,7 +178,7 @@ pub(crate) fn cmd_list(args: CloudArgs, config: &IceConfig) -> Result<()> {
     if cloud != Cloud::VastAi {
         ensure_provider_cli_installed(cloud)?;
     }
-    if args.json {
+    if crate::output::is_json() {
         let instances = match cloud {
             Cloud::VastAi => load_json_instances::<vast::Provider>(config)?,
             Cloud::Gcp => load_json_instances::<gcp::Provider>(config)?,

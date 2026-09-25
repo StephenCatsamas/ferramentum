@@ -50,22 +50,27 @@ Supported cloud identifiers:
 
 ## JSON output
 
-Add `--json` to these existing commands:
+`--json` is a global option for every command. It can appear before the command or
+after its arguments, including after a nested `config` subcommand:
 
 ```sh
 ice list --cloud vast.ai --json
 ice create --cloud vast.ai --ssh --dry-run --json
 ice create --cloud vast.ai --ssh --json
 ice shell --cloud vast.ai INSTANCE --print-creds --json
+ice --json stop --cloud vast.ai INSTANCE
+ice config get default.runtime_hours --json
+ice logs --cloud local INSTANCE --follow --json
 ```
 
-Listing supports all providers. Creation previews support all providers and target
-modes; actual JSON creation supports `--ssh` machines on Vast, GCP and AWS. Managed
-workload creation can produce arbitrary output and currently rejects `--json`
-unless `--dry-run` is supplied. Connection output supports Vast, GCP and AWS;
-`shell --json` requires `--print-creds`.
+JSON uses the same provider and workload support as each existing command. Actual
+creation and previews both support JSON, including managed workloads. Interactive
+shell sessions require a terminal: `shell --json` requires `--print-creds`, which
+supports Vast, GCP and AWS. Local shell connection printing remains unsupported.
+Clap's `--help`, `help` and argument-validation usage text remain human-readable;
+argument errors with `--json` put that text inside a JSON error message.
 
-Successful commands write exactly one JSON object and a newline to stdout:
+Successful commands other than `logs` write one JSON object and a newline to stdout:
 
 ```json
 {"schema_version":1,"command":"list","cloud":"vast.ai","result":{"instances":[]}}
@@ -86,16 +91,57 @@ Successful commands write exactly one JSON object and a newline to stdout:
 - `shell --print-creds` returns instance details and a `connect_command` string.
   It retains the existing readiness/key setup behavior. It can include a local
   identity-file path, but never key contents or provider credentials.
+- `start` and `stop` return the observed instance state and a `changed` boolean,
+  distinguishing an already running/stopped instance from a state transition.
+  `delete` returns `status: "deleted"`, `instance_id` and `name` after deletion.
+- `pull` and `push` return `status: "completed"`, the requested instance identifier
+  and the local/remote paths after the transfer succeeds. Paths retain the user's
+  spelling; omitted destinations are represented as `"."`.
+- `config list` returns a flat `values` object keyed by supported configuration
+  keys. `get`, `set` and `unset` return `key` and `value`; writes also return `path`.
+  Values preserve number/array types; unset values are `null`. Configured API and
+  AWS keys are `"<redacted>"`. Config commands have `cloud: null`.
+- `login` returns `status: "ready"`, a `method` of `cached`, `auto_detected` or
+  `prompted`, and an optional `saved_path`, without credentials.
+- `refresh-catalog` returns a `catalogs` array with each provider's entry count,
+  changed entry count, catalog path and warnings. Without `--cloud`, the envelope
+  has `cloud: null` and includes both catalogs after both refreshes succeed.
 
-Progress, prompts and errors use stderr. Failures return a nonzero exit status
-without a success document on stdout; an empty successful listing returns `[]`.
+`logs` writes JSON Lines, including without `--follow`. Each record uses the same
+envelope and identifies the requested instance in `result.instance`. Data records
+have `event: "data"`, a `stream` of `stdout`, `stderr` or `combined`, `text`, and
+`reset`. Records contain chunks, not necessarily complete lines. Concatenate text
+per stream; `reset: true` means a provider snapshot or local file was replaced or
+truncated. UTF-8 characters spanning reads are preserved; invalid bytes become
+replacement characters. Log contents are application output and are not redacted.
+Local unpack logs also emit `event: "workload_exit"` with a numeric `exit_code`
+(or `null` if unparseable). Successful log retrieval ends with `event: "complete"`;
+this does not mean the workload itself succeeded.
+
+Progress, prompts and diagnostics use stderr. Failures write an error envelope to
+stdout and return a nonzero exit status:
+
+```json
+{"schema_version":1,"command":"list","cloud":"gcp","error":{"code":"command_failed","message":"Failed to list instances"}}
+```
+
+Argument errors use `code: "invalid_arguments"` and exit status 2; command failures
+use `code: "command_failed"` and exit status 1. Error envelopes have no `result`;
+`command` and `cloud` may be `null` when parsing or configuration loading fails.
+Messages are diagnostic text, not stable error identifiers. A log stream may emit
+data before its final error record; it will not emit `complete` on failure. An
+empty successful listing returns `instances: []`.
+Interrupting a subprocess log stream with Ctrl-C stops its log transport and exits
+with status 130. Consumers should also handle externally terminated processes
+that exit without a final JSON record.
 JSON listing reports fresh provider results and does not substitute cached records
 when a query fails. Consumers should check the exit status and schema version and
 tolerate additional fields.
 
 `--json` selects output format; it does not accept a rental offer or bypass existing
-confirmation prompts. JSON creation returns the machine details without offering
-to open an interactive shell. Commands without `--json` retain normal output.
+confirmation prompts. JSON creation finishes the existing deployment and returns
+the instance details without offering to open a shell or follow logs. Commands
+without `--json` retain normal output.
 
 ## Config
 

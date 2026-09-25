@@ -378,6 +378,9 @@ pub(crate) fn run_command_status_with_stdin(
 }
 
 pub(crate) fn run_command_status(command: &mut Command, context: &str) -> Result<()> {
+    if crate::output::streaming_logs() {
+        return crate::output::run_log_command(command, context);
+    }
     capulus::process::run_status(command, context)
 }
 

@@ -1,15 +1,29 @@
 //! Explicit, non-secret projections for the CLI's machine-readable output.
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::process::{Command, Stdio};
+use std::sync::{OnceLock, mpsc};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::model::{Cloud, CloudMachineCandidate, IceConfig, RuntimeCostEstimate};
 use crate::providers::vast::VastOffer;
 use crate::workload::InstanceWorkload;
 
-pub(crate) fn document(command: &str, cloud: Cloud, result: Value) -> Value {
-    json!({"schema_version": 1, "command": command, "cloud": cloud, "result": result})
+// A CLI process handles one command. Output policy is initialized once, before dispatch.
+static JSON: OnceLock<bool> = OnceLock::new();
+static LOG_CONTEXT: OnceLock<(Cloud, String)> = OnceLock::new();
+
+pub(crate) fn initialize(json: bool) {
+    let _ = JSON.set(json);
+}
+
+pub(crate) fn is_json() -> bool {
+    JSON.get().copied().unwrap_or(false)
+}
+
+pub(crate) fn document(command: &str, cloud: impl Into<Option<Cloud>>, result: Value) -> Value {
+    json!({"schema_version": 1, "command": command, "cloud": cloud.into(), "result": result})
 }
 
 pub(crate) fn write_document(mut writer: impl Write, value: &Value) -> Result<()> {
@@ -18,8 +32,202 @@ pub(crate) fn write_document(mut writer: impl Write, value: &Value) -> Result<()
     writer.flush().context("Failed to flush JSON output")
 }
 
-pub(crate) fn emit(command: &str, cloud: Cloud, result: Value) -> Result<()> {
+pub(crate) fn emit(command: &str, cloud: impl Into<Option<Cloud>>, result: Value) -> Result<()> {
     write_document(io::stdout().lock(), &document(command, cloud, result))
+}
+
+pub(crate) fn error(
+    command: Option<&str>,
+    cloud: Option<Cloud>,
+    code: &str,
+    message: &str,
+) -> Result<()> {
+    write_document(
+        io::stdout().lock(),
+        &json!({
+            "schema_version": 1, "command": command, "cloud": cloud,
+            "error": {"code": code, "message": message},
+        }),
+    )
+}
+
+pub(crate) fn config_values(config: &IceConfig) -> Result<Value> {
+    let raw = serde_json::to_value(config)?;
+    let mut values = serde_json::Map::new();
+    for &key in crate::config_store::supported_config_keys() {
+        let value = key.split('.').fold(&raw, |value, part| &value[part]);
+        let value = if matches!(
+            key,
+            "auth.vast_ai.api_key" | "auth.aws.access_key_id" | "auth.aws.secret_access_key"
+        ) && !value.is_null()
+        {
+            json!("<redacted>")
+        } else {
+            value.clone()
+        };
+        values.insert(key.to_owned(), value);
+    }
+    Ok(Value::Object(values))
+}
+
+pub(crate) fn begin_logs(cloud: Cloud, instance: &str) {
+    if is_json() {
+        let _ = LOG_CONTEXT.set((cloud, instance.to_owned()));
+    }
+}
+
+pub(crate) fn streaming_logs() -> bool {
+    LOG_CONTEXT.get().is_some()
+}
+
+pub(crate) fn log_event(event: Value) -> Result<()> {
+    let (cloud, instance) = LOG_CONTEXT
+        .get()
+        .context("Log output was not initialized")?;
+    let mut result = event;
+    result["instance"] = json!(instance);
+    emit("logs", *cloud, result)
+}
+
+pub(crate) fn log_text(stream: &str, text: &str, reset: bool) -> Result<()> {
+    if text.is_empty() && !reset {
+        return Ok(());
+    }
+    log_event(json!({"event": "data", "stream": stream, "text": text, "reset": reset}))
+}
+
+// Decode incrementally so multibyte UTF-8 split across reads is preserved. Invalid
+// bytes are replaced, like provider text APIs; records are chunks, not log lines.
+#[derive(Default)]
+pub(crate) struct LogDecoder {
+    pending: Vec<u8>,
+}
+
+impl LogDecoder {
+    pub(crate) fn feed(
+        &mut self,
+        bytes: &[u8],
+        finished: bool,
+        mut emit: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        self.pending.extend_from_slice(bytes);
+        let mut offset = 0;
+        while offset < self.pending.len() {
+            match std::str::from_utf8(&self.pending[offset..]) {
+                Ok(text) => {
+                    emit(text)?;
+                    offset = self.pending.len();
+                }
+                Err(error) => {
+                    let end = offset + error.valid_up_to();
+                    if end > offset {
+                        emit(std::str::from_utf8(&self.pending[offset..end])?)?;
+                    }
+                    offset = end;
+                    if let Some(length) = error.error_len() {
+                        emit("\u{fffd}")?;
+                        offset += length;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        self.pending.drain(..offset);
+        if finished && !self.pending.is_empty() {
+            emit(&String::from_utf8_lossy(&self.pending))?;
+            self.pending.clear();
+        }
+        Ok(())
+    }
+}
+
+fn read_log_chunks(mut reader: impl Read, mut emit: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    let mut buffer = [0u8; 8192];
+    let mut decoder = LogDecoder::default();
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        decoder.feed(&buffer[..count], count == 0, &mut emit)?;
+        if count == 0 {
+            return Ok(());
+        }
+    }
+}
+
+pub(crate) fn run_log_command(command: &mut Command, context: &str) -> Result<()> {
+    let cancellation =
+        capulus::Cancellation::install().context("Failed to install log cancellation handler")?;
+    // Provider CLIs may launch SSH as a child. Keep the entire log transport in
+    // its own process group so a closed consumer pipe can stop both processes.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to {context}"))?;
+    let stdout = child.stdout.take().context("Missing log stdout")?;
+    let stderr = child.stderr.take().context("Missing log stderr")?;
+    // Bounded buffering and concurrent readers keep either pipe from blocking
+    // the other. A broken output pipe stops the subprocess and reaps it.
+    let status = std::thread::scope(|scope| -> Result<_> {
+        let (sender, receiver) = mpsc::sync_channel::<Result<(&str, String)>>(16);
+        for (reader, stream) in [
+            (Box::new(stdout) as Box<dyn Read + Send>, "stdout"),
+            (Box::new(stderr) as Box<dyn Read + Send>, "stderr"),
+        ] {
+            let sender = sender.clone();
+            scope.spawn(move || {
+                let result = read_log_chunks(reader, |text| {
+                    sender
+                        .send(Ok((stream, text.to_owned())))
+                        .map_err(|_| anyhow::anyhow!("Log output closed"))
+                });
+                if let Err(error) = result {
+                    let _ = sender.send(Err(error));
+                }
+            });
+        }
+        drop(sender);
+        let result = loop {
+            if let Err(error) = cancellation.check() {
+                break Err(error.into());
+            }
+            match receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(message) => {
+                    if let Err(error) =
+                        message.and_then(|(stream, text)| log_text(stream, &text, false))
+                    {
+                        break Err(error);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+            }
+        };
+        drop(receiver);
+        if result.is_err() {
+            #[cfg(unix)]
+            // SAFETY: this group was created by the spawn above. The child has
+            // not been reaped, so its PID cannot have been reused for another group.
+            unsafe {
+                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = child.kill();
+        }
+        let status = child
+            .wait()
+            .with_context(|| format!("Failed to wait for {context}"));
+        result?;
+        status
+    })?;
+    if !status.success() {
+        bail!("Failed to {context}: command exited with status {status}");
+    }
+    Ok(())
 }
 
 pub(crate) fn cost(cost: &RuntimeCostEstimate) -> Value {
@@ -81,6 +289,27 @@ pub(crate) fn connection(cloud: Cloud, instance: Value, command: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_decoder_preserves_split_unicode_and_replaces_invalid_bytes() {
+        let mut decoder = LogDecoder::default();
+        let mut output = String::new();
+        for byte in "hello 🦀\n終".as_bytes() {
+            decoder
+                .feed(&[*byte], false, |text| {
+                    output.push_str(text);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        decoder
+            .feed(&[0xff, 0xe2], true, |text| {
+                output.push_str(text);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(output, "hello 🦀\n終\u{fffd}\u{fffd}");
+    }
 
     #[test]
     fn output_is_one_json_document_with_typed_values_and_newline() {

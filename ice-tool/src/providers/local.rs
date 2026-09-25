@@ -241,7 +241,7 @@ impl CreateProvider for Provider {
         }
         let context = local_context();
 
-        if args.json && args.dry_run {
+        if crate::output::is_json() && args.dry_run {
             if matches!(workload, InstanceWorkload::Container(_)) {
                 context.require_runtime()?;
             }
@@ -254,6 +254,18 @@ impl CreateProvider for Provider {
                     "requested_hours": hours,
                     "container_runtime": context.runtime.map(|runtime| runtime.shell_prefix()),
                     "cost": null,
+                }),
+            );
+        }
+
+        if crate::output::is_json() {
+            let instance = crate::local::local_create_instance(config, &context, hours, &workload)?;
+            return crate::output::emit(
+                "create",
+                Cloud::Local,
+                serde_json::json!({
+                    "status": "created", "instance": instance.json_summary(),
+                    "requested_hours": hours, "cost": null,
                 }),
             );
         }
