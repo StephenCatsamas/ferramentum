@@ -321,6 +321,7 @@ fn cmd_refresh_catalog(args: RefreshCatalogArgs, config: &IceConfig) -> Result<(
 
 fn create_for<P: CreateProvider>(config: &mut IceConfig, args: &CreateArgs) -> Result<()> {
     P::ensure_cli()?;
+    apply_create_search_overrides(config, P::CLOUD, args)?;
     P::create(config, args)
 }
 
@@ -985,6 +986,39 @@ fn handle_live_offer_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vast_create_applies_cli_filters_before_provider_setup() {
+        let cli = Cli::try_parse_from([
+            "ice",
+            "create",
+            "--cloud",
+            "vast.ai",
+            "--ssh",
+            "--dry-run",
+            "--min-cpus",
+            "1",
+            "--min-ram-gb",
+            "2",
+            "--gpu",
+            "RTX 3060",
+            "--max-price-per-hr",
+            "0.20",
+        ])
+        .unwrap();
+        let Commands::Create(args) = cli.command else {
+            panic!("expected create command");
+        };
+        let mut config = IceConfig::default();
+        // Missing credentials stop provider setup before any network request.
+        let error = create_for::<vast::Provider>(&mut config, &args).unwrap_err();
+        assert!(error.to_string().contains("Missing Vast API key"));
+        let requirements = build_search_requirements(&config, Cloud::VastAi).unwrap();
+        assert_eq!(requirements.min_cpus, 1);
+        assert_eq!(requirements.min_ram_gb, 2.0);
+        assert_eq!(requirements.allowed_gpus, ["RTX 3060"]);
+        assert_eq!(requirements.max_price_per_hr, 0.20);
+    }
 
     fn test_req() -> CreateSearchRequirements {
         CreateSearchRequirements {
