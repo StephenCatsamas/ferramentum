@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 mod app;
 mod arca;
+mod automation;
 mod cache;
 mod cli;
 mod commands;
@@ -15,6 +16,7 @@ mod output;
 mod providers;
 mod provision;
 mod remote;
+mod selection;
 mod support;
 mod ui;
 mod unpack;

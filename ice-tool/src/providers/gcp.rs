@@ -42,9 +42,9 @@ use crate::support::{
     GCP_CLOUD_PLATFORM_SCOPE, GCP_CONTAINER_IMAGE_FAMILY, GCP_CONTAINER_IMAGE_PROJECT,
     ICE_LABEL_PREFIX, ICE_WORKLOAD_CONTAINER_METADATA_KEY, ICE_WORKLOAD_KIND_METADATA_KEY,
     ICE_WORKLOAD_REGISTRY_METADATA_KEY, ICE_WORKLOAD_SOURCE_METADATA_KEY, VAST_POLL_INTERVAL_SECS,
-    VAST_WAIT_TIMEOUT_SECS, build_cloud_instance_name, elapsed_hours_from_rfc3339, elapsed_since,
-    now_unix_secs, prefix_lookup_indices, progress_bar, render_command_line, run_command_json,
-    run_command_status, run_command_text, spinner, visible_instance_name, write_temp_file,
+    build_cloud_instance_name, elapsed_hours_from_rfc3339, elapsed_since, now_unix_secs,
+    prefix_lookup_indices, progress_bar, render_command_line, run_command_json, run_command_status,
+    run_command_text, spinner, visible_instance_name, write_temp_file,
 };
 use crate::ui::print_warning;
 use crate::unpack::{
@@ -1383,6 +1383,9 @@ pub(crate) fn select_cheapest_machine_candidate(
         {
             continue;
         }
+        if req.gpu_count == Some(0) && !entry.gpus.is_empty() {
+            continue;
+        }
         if entry.vcpus < req.min_cpus || f64::from(entry.ram_mb) + 0.000_001 < min_ram_mb {
             continue;
         }
@@ -1400,15 +1403,19 @@ pub(crate) fn select_cheapest_machine_candidate(
     }
 
     if candidates.is_empty() {
-        bail!(
-            "No gcp machine type matches filters (min_cpus={}, min_ram_gb={}, allowed_gpus=[{}]){}.",
-            req.min_cpus,
-            req.min_ram_gb,
-            req.allowed_gpus.join(", "),
-            override_name
-                .map(|name| format!(", machine={name}"))
-                .unwrap_or_default()
-        );
+        return Err(crate::automation::error(
+            "no_matching_offers",
+            format!(
+                "No gcp machine type matches filters (min_cpus={}, min_ram_gb={}, allowed_gpus=[{}]){}.",
+                req.min_cpus,
+                req.min_ram_gb,
+                req.allowed_gpus.join(", "),
+                override_name
+                    .map(|name| format!(", machine={name}"))
+                    .unwrap_or_default()
+            ),
+            serde_json::json!({}),
+        ));
     }
 
     candidates.sort_by(|left, right| {
@@ -2538,7 +2545,11 @@ pub(crate) fn wait_for_state(
     let start = SystemTime::now();
     loop {
         if elapsed_since(start)? > timeout {
-            bail!("Timed out waiting for gcp instance `{name}` to reach `{desired_state}`");
+            return Err(crate::automation::error(
+                "startup_timeout",
+                format!("Timed out waiting for gcp instance `{name}` to reach `{desired_state}`"),
+                serde_json::json!({"instance_id": name.to_string(), "timeout_seconds": timeout.as_secs()}),
+            ));
         }
         let instance = describe_instance(config, name, zone)?;
         if instance.status.eq_ignore_ascii_case(desired_state) {
@@ -2578,6 +2589,14 @@ fn build_shell_connect_command(config: &IceConfig, instance: &GcpInstance) -> Re
         "--ssh-flag=StrictHostKeyChecking=accept-new".to_owned(),
         "--ssh-flag=-t".to_owned(),
     ];
+    if crate::automation::non_interactive() {
+        args.push("--quiet".to_owned());
+        args.extend(
+            crate::automation::ssh_options()
+                .chunks_exact(2)
+                .map(|pair| format!("--ssh-flag=-o{}", pair[1])),
+        );
+    }
     if let Some(project) = config
         .auth
         .gcp
@@ -2588,6 +2607,19 @@ fn build_shell_connect_command(config: &IceConfig, instance: &GcpInstance) -> Re
     {
         args.push("--project".to_owned());
         args.push(project.to_owned());
+    }
+    if let Some(path) = config
+        .auth
+        .gcp
+        .service_account_json
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        let prefix = [
+            format!("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE={path}"),
+            "gcloud".to_owned(),
+        ];
+        return Ok(render_command_line("env", prefix.into_iter().chain(args)));
     }
     Ok(render_command_line("gcloud", args))
 }
@@ -2764,16 +2796,24 @@ pub(crate) fn create_instance(
         }
     }
     maybe_add_project_arg(&mut command, config);
+    crate::automation::recovery(
+        "creating",
+        serde_json::json!({"instance_name": name, "zone": zone}),
+    );
     let result = run_command_status(&mut command, "create gcp instance");
     let _ = fs::remove_file(&script_path);
     result?;
+    crate::automation::recovery(
+        "waiting_for_startup",
+        serde_json::json!({"instance_id": name}),
+    );
     spinner.finish_with_message("Creation requested.");
     wait_for_state(
         config,
         &name,
         &zone,
         "RUNNING",
-        Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
+        crate::automation::startup_timeout(),
     )
 }
 
@@ -2803,7 +2843,20 @@ fn service_account_email(config: &IceConfig) -> Result<Option<String>> {
 }
 
 fn command(config: &IceConfig) -> Command {
-    gcp::command(config.auth.gcp.service_account_json.as_deref())
+    let mut command = gcp::command(config.auth.gcp.service_account_json.as_deref());
+    if let Some(path) = config
+        .auth
+        .gcp
+        .service_account_json
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    {
+        // GOOGLE_APPLICATION_CREDENTIALS configures ADC, while gcloud's resource
+        // commands need its own credential-file override (without an auth wizard).
+        command.env("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", path);
+    }
+    crate::automation::prepare_command(&mut command);
+    command
 }
 
 fn maybe_add_project_arg(command: &mut Command, config: &IceConfig) {
@@ -2943,10 +2996,14 @@ fn wait_for_ssh_ready(config: &IceConfig, instance: &GcpInstance, timeout: Durat
     loop {
         if elapsed_since(start)? > timeout {
             spinner.finish_and_clear();
-            bail!(
-                "Timed out waiting for SSH readiness on gcp instance `{}`.",
-                instance.name
-            );
+            return Err(crate::automation::error(
+                "startup_timeout",
+                format!(
+                    "Timed out waiting for SSH readiness on gcp instance `{}`.",
+                    instance.name
+                ),
+                serde_json::json!({"instance_id": instance.name, "timeout_seconds": timeout.as_secs()}),
+            ));
         }
         if run_ssh_command(config, instance, &probe, false).is_ok() {
             spinner.finish_with_message(format!(

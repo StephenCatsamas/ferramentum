@@ -24,10 +24,9 @@ use crate::providers::{
     CloudInstance, CloudProvider, CreateProvider, MarketCreateProvider, aws, gcp, local, vast,
 };
 use crate::provision::{
-    build_accept_prompt, build_search_requirements, ensure_default_create_config,
-    estimate_runtime_cost, find_cheapest_cloud_machine, load_gpu_options,
-    machine_candidate_summary_lines, prompt_adjust_search_filters, prompt_create_search_filters,
-    prompt_offer_decision,
+    build_accept_prompt, build_search_requirements, estimate_runtime_cost,
+    find_cheapest_cloud_machine, load_gpu_options, machine_candidate_summary_lines,
+    prompt_adjust_search_filters, prompt_create_search_filters, prompt_offer_decision,
 };
 use crate::support::{
     ensure_command_available, ensure_provider_cli_installed, maybe_open_browser, nonempty_string,
@@ -158,10 +157,12 @@ pub(crate) fn main() -> ExitCode {
         }
     };
     crate::output::initialize(cli.json);
+    crate::automation::initialize(&cli);
     let name = cli.command.name();
     let mut config = IceConfig::default();
     let mut cloud = cli.command.cloud(&config);
     let result = (|| {
+        crate::automation::validate_command(&cli.command)?;
         ensure_runtime_gpu_data_files()?;
         config = load_config()?;
         cloud = cli.command.cloud(&config);
@@ -187,8 +188,7 @@ pub(crate) fn main() -> ExitCode {
                         message = message.replace(secret, "<redacted>");
                     }
                 }
-                if let Err(error) =
-                    crate::output::error(Some(name), cloud, "command_failed", &message)
+                if let Err(error) = crate::output::command_error(Some(name), cloud, &err, &message)
                 {
                     eprintln!("{error}");
                 }
@@ -201,6 +201,18 @@ pub(crate) fn main() -> ExitCode {
 }
 
 fn redact_cli_assignments(mut message: String) -> String {
+    for key in [
+        "VAST_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+    ] {
+        if let Ok(secret) = std::env::var(key)
+            && !secret.is_empty()
+        {
+            message = message.replace(&secret, "<redacted>");
+        }
+    }
     for arg in std::env::args_os().skip(1) {
         let arg = arg.to_string_lossy();
         if let Some((key, value)) = arg.split_once('=')
@@ -275,9 +287,11 @@ fn cmd_config_list(config: &IceConfig) -> Result<()> {
             None,
             serde_json::json!({
                 "values": crate::output::config_values(config)?,
+                "path": crate::config_store::config_path()?,
             }),
         );
     }
+    println!("Config: {}", crate::config_store::config_path()?.display());
     for key in supported_config_keys() {
         println!("{key} = {}", get_config_value(config, key)?);
     }
@@ -352,6 +366,17 @@ fn print_login_outcome(cloud: Cloud, outcome: &LoginOutcome) {
 
 fn cmd_create(args: CreateArgs, config: &mut IceConfig) -> Result<()> {
     let cloud = resolve_cloud(args.cloud, config)?;
+    let mut effective = crate::selection::resolve(config, cloud, &args)?;
+    resolve_deploy_workload(&args.target_request())?;
+    resolve_deploy_hours(&effective, args.hours)?;
+    if crate::automation::non_interactive() && cloud != Cloud::Local && !args.dry_run && !args.yes {
+        return Err(crate::automation::error(
+            "confirmation_required",
+            "Use --yes to accept creation within the supplied filters and price ceiling, or --dry-run to preview.",
+            serde_json::json!({"required_flags": ["--yes"]}),
+        ));
+    }
+    let config = &mut effective;
     match cloud {
         Cloud::VastAi => create_for::<vast::Provider>(config, &args),
         Cloud::Local => create_for::<local::Provider>(config, &args),
@@ -455,7 +480,6 @@ fn cmd_refresh_catalog(args: RefreshCatalogArgs, config: &IceConfig) -> Result<(
 
 fn create_for<P: CreateProvider>(config: &mut IceConfig, args: &CreateArgs) -> Result<()> {
     P::ensure_cli()?;
-    apply_create_search_overrides(config, P::CLOUD, args)?;
     P::create(config, args)
 }
 
@@ -468,23 +492,16 @@ where
     P: 'static,
 {
     P::ensure_cli()?;
-    let gpu_options = load_gpu_options(P::CLOUD, None);
-    let effective_config = {
-        let _config_lock = acquire_config_lock(true)?;
-        let mut effective_config = load_config()?;
-        apply_create_search_overrides(&mut effective_config, P::CLOUD, args)?;
-        ensure_default_create_config(&mut effective_config, P::CLOUD, &gpu_options)?;
-        config.clone_from(&effective_config);
-        effective_config
-    };
+    let effective_config = config.clone();
     let hours = resolve_deploy_hours(&effective_config, args.hours)?;
     let workload = resolve_deploy_workload(&args.target_request())?;
     let mut search = build_search_requirements(&effective_config, P::CLOUD)?;
     if args.custom {
-        prompt_create_search_filters(P::CLOUD, &mut search, &gpu_options)?;
+        prompt_create_search_filters(P::CLOUD, &mut search, &load_gpu_options(P::CLOUD, None))?;
     }
 
     let candidate = loop {
+        crate::selection::record(&search);
         let candidate = find_cheapest_cloud_machine(
             P::CLOUD,
             &effective_config,
@@ -516,7 +533,15 @@ where
         }
     };
 
+    crate::automation::recovery(
+        "creating",
+        serde_json::json!({"cloud": P::CLOUD, "region": candidate.region}),
+    );
     let instance = P::create_machine(&effective_config, &candidate, hours, &workload)?;
+    crate::automation::recovery(
+        "deploying",
+        serde_json::json!({"instance_id": instance.json_summary()["id"]}),
+    );
     if let InstanceWorkload::Unpack(source) = &workload {
         P::deploy_unpack(&effective_config, &instance, source)?;
     }
@@ -532,6 +557,10 @@ where
                 "allocated_disk_gb": crate::output::allocated_disk_gb(&effective_config, P::CLOUD),
             }),
         );
+    }
+    if crate::automation::non_interactive() || args.yes {
+        println!("Created instance {}.", instance.display_name());
+        return Ok(());
     }
     if matches!(workload, InstanceWorkload::Unpack(_)) {
         if prompt_confirm("Follow unpack logs now?", true)? {
@@ -558,7 +587,7 @@ fn review_market_candidate<P: MarketCreateProvider + 'static>(
     hours: f64,
     candidate: CloudMachineCandidate,
 ) -> Result<MarketCandidateReviewOutcome> {
-    if crate::output::is_json() {
+    if crate::output::is_json() || crate::automation::non_interactive() || args.yes {
         let candidate = P::refresh_machine_offer(config, &candidate)?;
         return review_verified_market_candidate(config, P::CLOUD, args, search, hours, candidate);
     }
@@ -570,7 +599,7 @@ fn review_market_candidate<P: MarketCreateProvider + 'static>(
     review_verified_market_candidate(config, P::CLOUD, args, search, hours, candidate)
 }
 
-fn apply_create_search_overrides(
+pub(crate) fn apply_create_search_overrides(
     config: &mut IceConfig,
     cloud: Cloud,
     args: &CreateArgs,
@@ -700,16 +729,20 @@ fn review_live_market_candidate<P: MarketCreateProvider + 'static>(
             let verified_cost = estimate_runtime_cost(P::CLOUD, verified.hourly_usd, hours)?;
             print_machine_candidate_summary(config, P::CLOUD, &verified, &verified_cost, search)?;
             if verified_cost.hourly_usd > search.max_price_per_hr {
-                bail!(
-                    "No machine meets max price ${:.4}/hr. Cheapest matching machine is {} in {} at ${:.4}/hr (est ${:.4} for {:.3}h scheduled, {:.3}h requested).",
-                    search.max_price_per_hr,
-                    verified.machine,
-                    verified.region,
-                    verified.hourly_usd,
-                    verified_cost.total_usd,
-                    verified_cost.billed_hours,
-                    verified_cost.requested_hours
-                );
+                return Err(crate::automation::error(
+                    "no_matching_offers",
+                    format!(
+                        "No machine meets max price ${:.4}/hr. Cheapest matching machine is {} in {} at ${:.4}/hr (est ${:.4} for {:.3}h scheduled, {:.3}h requested).",
+                        search.max_price_per_hr,
+                        verified.machine,
+                        verified.region,
+                        verified.hourly_usd,
+                        verified_cost.total_usd,
+                        verified_cost.billed_hours,
+                        verified_cost.requested_hours
+                    ),
+                    serde_json::json!({}),
+                ));
             }
             Ok(MarketCandidateReviewOutcome::Accept(verified))
         }
@@ -731,16 +764,20 @@ fn review_verified_market_candidate(
     }
 
     if cost.hourly_usd > search.max_price_per_hr {
-        bail!(
-            "No machine meets max price ${:.4}/hr. Cheapest matching machine is {} in {} at ${:.4}/hr (est ${:.4} for {:.3}h scheduled, {:.3}h requested).",
-            search.max_price_per_hr,
-            candidate.machine,
-            candidate.region,
-            candidate.hourly_usd,
-            cost.total_usd,
-            cost.billed_hours,
-            cost.requested_hours
-        );
+        return Err(crate::automation::error(
+            "no_matching_offers",
+            format!(
+                "No machine meets max price ${:.4}/hr. Cheapest matching machine is {} in {} at ${:.4}/hr (est ${:.4} for {:.3}h scheduled, {:.3}h requested).",
+                search.max_price_per_hr,
+                candidate.machine,
+                candidate.region,
+                candidate.hourly_usd,
+                cost.total_usd,
+                cost.billed_hours,
+                cost.requested_hours
+            ),
+            serde_json::json!({}),
+        ));
     }
 
     if args.dry_run {
@@ -777,11 +814,17 @@ fn review_verified_market_candidate(
             candidate.machine, candidate.region, candidate.hourly_usd
         );
     }
-    Ok(match prompt_offer_decision(&build_accept_prompt(&cost))? {
-        OfferDecision::Accept => MarketCandidateReviewOutcome::Accept(candidate),
-        OfferDecision::Reject => MarketCandidateReviewOutcome::Reject,
-        OfferDecision::ChangeFilter => MarketCandidateReviewOutcome::ChangeFilter,
-    })
+    Ok(
+        match if args.yes {
+            OfferDecision::Accept
+        } else {
+            prompt_offer_decision(&build_accept_prompt(&cost))?
+        } {
+            OfferDecision::Accept => MarketCandidateReviewOutcome::Accept(candidate),
+            OfferDecision::Reject => MarketCandidateReviewOutcome::Reject,
+            OfferDecision::ChangeFilter => MarketCandidateReviewOutcome::ChangeFilter,
+        },
+    )
 }
 
 fn spawn_machine_offer_refresh<P: MarketCreateProvider + 'static>(
@@ -1172,7 +1215,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn vast_create_applies_cli_filters_before_provider_setup() {
+    fn create_resolves_cli_filters_without_mutating_saved_configuration() {
         let cli = Cli::try_parse_from([
             "ice",
             "create",
@@ -1193,11 +1236,11 @@ mod tests {
         let Commands::Create(args) = cli.command else {
             panic!("expected create command");
         };
-        let mut config = IceConfig::default();
-        // Missing credentials stop provider setup before any network request.
-        let error = create_for::<vast::Provider>(&mut config, &args).unwrap_err();
-        assert!(error.to_string().contains("Missing Vast API key"));
-        let requirements = build_search_requirements(&config, Cloud::VastAi).unwrap();
+        let config = IceConfig::default();
+        // Resolution is pure with respect to the saved configuration.
+        let effective = crate::selection::resolve(&config, Cloud::VastAi, &args).unwrap();
+        assert!(config.default.vast_ai.max_price_per_hr.is_none());
+        let requirements = build_search_requirements(&effective, Cloud::VastAi).unwrap();
         assert_eq!(requirements.min_cpus, 1);
         assert_eq!(requirements.min_ram_gb, 2.0);
         assert_eq!(requirements.allowed_gpus, ["RTX 3060"]);
@@ -1210,6 +1253,7 @@ mod tests {
             min_ram_gb: 1.0,
             allowed_gpus: Vec::new(),
             max_price_per_hr: 1.0,
+            ..Default::default()
         }
     }
 
@@ -1301,6 +1345,15 @@ fn login_local() -> Result<LoginOutcome> {
 }
 
 fn login_vast(config: &mut IceConfig, force: bool) -> Result<LoginOutcome> {
+    if let Ok(key) = std::env::var("VAST_API_KEY")
+        && !key.trim().is_empty()
+    {
+        vast::VastClient::new(&key)?.validate_api_key()?;
+        return Ok(LoginOutcome {
+            method: LoginMethod::AutoDetected,
+            saved_path: None,
+        });
+    }
     if !force && let Some(existing_key) = config.auth.vast_ai.api_key.as_deref() {
         match vast::VastClient::new(existing_key)?.validate_api_key() {
             Ok(()) => {
@@ -1313,6 +1366,13 @@ fn login_vast(config: &mut IceConfig, force: bool) -> Result<LoginOutcome> {
         }
     }
 
+    if crate::automation::non_interactive() {
+        return Err(crate::automation::error(
+            "authentication_required",
+            "Supply valid vast.ai credentials before running this command.",
+            serde_json::json!({"cloud": "vast.ai"}),
+        ));
+    }
     require_interactive("`ice login --cloud vast.ai` requires interactive stdin.")?;
     let key_page = "https://cloud.vast.ai/manage-keys/";
     print_notice(&format!(
@@ -1384,6 +1444,13 @@ fn login_gcp(config: &mut IceConfig, force: bool) -> Result<LoginOutcome> {
         });
     }
 
+    if crate::automation::non_interactive() {
+        return Err(crate::automation::error(
+            "authentication_required",
+            "Supply valid gcp credentials before running this command.",
+            serde_json::json!({"cloud": "gcp"}),
+        ));
+    }
     require_interactive("`ice login --cloud gcp` requires interactive stdin.")?;
     maybe_open_browser("https://console.cloud.google.com/");
     print_warning(
@@ -1473,6 +1540,13 @@ fn login_aws(config: &mut IceConfig, force: bool) -> Result<LoginOutcome> {
         });
     }
 
+    if crate::automation::non_interactive() {
+        return Err(crate::automation::error(
+            "authentication_required",
+            "Supply valid aws credentials before running this command.",
+            serde_json::json!({"cloud": "aws"}),
+        ));
+    }
     require_interactive("`ice login --cloud aws` requires interactive stdin.")?;
     maybe_open_browser("https://console.aws.amazon.com/");
     print_warning("Could not auto-detect AWS credentials. Enter an access key pair.");
@@ -1583,6 +1657,7 @@ fn aws_identity_detected(config: &IceConfig, include_cached: bool) -> Result<boo
 }
 
 fn identity_probe_succeeded(command: &mut Command) -> bool {
+    crate::automation::prepare_command(command);
     if crate::output::is_json() {
         command.output().is_ok_and(|output| output.status.success())
     } else {

@@ -25,9 +25,9 @@ use crate::providers::{
 };
 use crate::provision::{
     apply_vast_autostop_cost_estimate, build_accept_prompt, build_search_requirements,
-    build_vast_autostop_plan, ensure_default_create_config, estimate_runtime_cost,
-    find_cheapest_offer, load_gpu_options, print_offer_summary, prompt_adjust_search_filters,
-    prompt_create_search_filters, prompt_offer_decision,
+    build_vast_autostop_plan, estimate_runtime_cost, find_cheapest_offer, load_gpu_options,
+    print_offer_summary, prompt_adjust_search_filters, prompt_create_search_filters,
+    prompt_offer_decision,
 };
 use crate::remote::{
     RemoteAccess, discover_local_ssh_keypair, run_rsync_download, run_rsync_upload,
@@ -36,9 +36,9 @@ use crate::remote::{
 use crate::support::{
     ICE_LABEL_PREFIX, VAST_DEFAULT_DISK_GB, VAST_DEFAULT_IMAGE,
     VAST_LOG_READY_POLL_INTERVAL_MILLIS, VAST_LOG_READY_TIMEOUT_SECS, VAST_POLL_INTERVAL_SECS,
-    VAST_WAIT_TIMEOUT_SECS, build_cloud_instance_name, elapsed_since, extract_api_error_message,
-    format_unix_utc, now_unix_secs, now_unix_secs_f64, parse_json_response, prefix_lookup_indices,
-    prompt_confirm, render_command_line, spinner, truncate_ellipsis, visible_instance_name,
+    build_cloud_instance_name, elapsed_since, extract_api_error_message, format_unix_utc,
+    now_unix_secs, now_unix_secs_f64, parse_json_response, prefix_lookup_indices, prompt_confirm,
+    render_command_line, spinner, truncate_ellipsis, visible_instance_name,
 };
 use crate::ui::{print_stage, print_warning};
 use crate::unpack::{
@@ -60,6 +60,18 @@ struct VastOffersResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct VastOffer {
+    #[serde(default)]
+    pub(crate) gpu_ram: Option<f64>,
+    #[serde(default)]
+    pub(crate) disk_space: Option<f64>,
+    #[serde(default)]
+    pub(crate) inet_down: Option<f64>,
+    #[serde(default)]
+    pub(crate) inet_up: Option<f64>,
+    #[serde(default)]
+    pub(crate) inet_down_cost: Option<f64>,
+    #[serde(default)]
+    pub(crate) inet_up_cost: Option<f64>,
     pub(crate) id: u64,
     #[serde(default)]
     pub(crate) gpu_name: Option<String>,
@@ -1034,6 +1046,7 @@ impl CommandProvider for Provider {
         }
 
         if instance.is_stopped() {
+            crate::automation::require_running(instance.id)?;
             if !prompt_confirm("Instance is stopped. Start it before opening shell?", true)? {
                 bail!("Aborted: instance is stopped.");
             }
@@ -1046,15 +1059,11 @@ impl CommandProvider for Provider {
                 &client,
                 instance.id,
                 "running",
-                Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
+                crate::automation::startup_timeout(),
             )?;
         }
 
-        instance = wait_for_ssh_ready(
-            &client,
-            instance.id,
-            Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-        )?;
+        instance = wait_for_ssh_ready(&client, instance.id, crate::automation::startup_timeout())?;
         let remote_command = shell_remote_command(&instance);
         if args.print_creds {
             print_shell_command_with_auto_key(
@@ -1133,8 +1142,6 @@ impl CommandProvider for Provider {
 impl CreateProvider for Provider {
     fn create(config: &mut IceConfig, args: &CreateArgs) -> Result<()> {
         let client = client_from_config(config)?;
-        let gpu_options = load_gpu_options(Cloud::VastAi, Some(&client));
-        ensure_default_create_config(config, Cloud::VastAi, &gpu_options)?;
         let hours = resolve_deploy_hours(config, args.hours)?;
         let workload = resolve_deploy_workload(&args.target_request())?;
         let label = build_cloud_instance_name(&collect_existing_visible_names(&client)?)?;
@@ -1142,11 +1149,16 @@ impl CreateProvider for Provider {
 
         let mut search = build_search_requirements(config, Cloud::VastAi)?;
         if args.custom {
-            prompt_create_search_filters(Cloud::VastAi, &mut search, &gpu_options)?;
+            prompt_create_search_filters(
+                Cloud::VastAi,
+                &mut search,
+                &load_gpu_options(Cloud::VastAi, Some(&client)),
+            )?;
         }
 
         let mut rejected_offer_ids = HashSet::new();
         let (instance_id, selected_offer, mut selected_cost) = loop {
+            crate::selection::record(&search);
             let offer = find_cheapest_offer(
                 &client,
                 &search,
@@ -1174,16 +1186,20 @@ impl CreateProvider for Provider {
                     .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
                     .map(|seconds| seconds / 3600.0)
                     .unwrap_or(0.0);
-                bail!(
-                    "No offer meets max price ${:.4}/hr. Best matching offer is ${:.4}/hr (est ${:.4} for {:.3}h scheduled, {:.3}h requested). Offer {} is available for {:.3}h.",
-                    search.max_price_per_hr,
-                    price,
-                    cost.total_usd,
-                    cost.billed_hours,
-                    cost.requested_hours,
-                    offer.id,
-                    available_hours
-                );
+                return Err(crate::automation::error(
+                    "no_matching_offers",
+                    format!(
+                        "No offer meets max price ${:.4}/hr. Best matching offer is ${:.4}/hr (est ${:.4} for {:.3}h scheduled, {:.3}h requested). Offer {} is available for {:.3}h.",
+                        search.max_price_per_hr,
+                        price,
+                        cost.total_usd,
+                        cost.billed_hours,
+                        cost.requested_hours,
+                        offer.id,
+                        available_hours
+                    ),
+                    serde_json::json!({}),
+                ));
             }
 
             if args.dry_run {
@@ -1198,7 +1214,7 @@ impl CreateProvider for Provider {
                             "cost": crate::output::cost(&cost),
                             "cost_scope": "provider_rate",
                             "quoted_total_hourly_usd": offer.quoted_total_hourly_price(),
-                            "allocated_disk_gb": VAST_DEFAULT_DISK_GB,
+                            "allocated_disk_gb": config.default.vast_ai.disk_gb.unwrap_or(VAST_DEFAULT_DISK_GB as u32),
                             "image": create_body.get("image"),
                             "scheduled_stop_unix": stop.stop_at_unix,
                             "workload": crate::output::workload(Some(&workload)),
@@ -1220,7 +1236,11 @@ impl CreateProvider for Provider {
                     price
                 );
             }
-            match prompt_offer_decision(&build_accept_prompt(&cost))? {
+            match if args.yes {
+                crate::model::OfferDecision::Accept
+            } else {
+                prompt_offer_decision(&build_accept_prompt(&cost))?
+            } {
                 crate::model::OfferDecision::ChangeFilter => {
                     prompt_adjust_search_filters(
                         Cloud::VastAi,
@@ -1243,8 +1263,16 @@ impl CreateProvider for Provider {
                 crate::model::OfferDecision::Accept => {
                     print_stage("Creating instance from accepted offer");
                     let create_spinner = spinner("Accepting offer and creating instance...");
+                    crate::automation::recovery(
+                        "accepting_offer",
+                        json!({"cloud": "vast.ai", "offer_id": offer.id, "instance_name": label}),
+                    );
                     match client.create_instance(offer.id, &create_body) {
                         Ok(instance_id) => {
+                            crate::automation::recovery(
+                                "scheduling_auto_stop",
+                                json!({"cloud": "vast.ai", "instance_id": instance_id.to_string()}),
+                            );
                             create_spinner
                                 .finish_with_message(format!("Created instance {instance_id}."));
                             break (instance_id, offer, cost);
@@ -1256,7 +1284,10 @@ impl CreateProvider for Provider {
                                 "Offer {} acceptance failed: {err:#}",
                                 offer.id
                             ));
-                            if !io::stdin().is_terminal() {
+                            if crate::automation::non_interactive()
+                                || args.yes
+                                || !io::stdin().is_terminal()
+                            {
                                 return Err(err).with_context(|| {
                                     format!("Failed to create instance from offer {}", offer.id)
                                 });
@@ -1291,8 +1322,12 @@ impl CreateProvider for Provider {
             auto_stop_plan.runtime_hours
         ));
 
-        if crate::output::is_json() {
-            let timeout = Duration::from_secs(VAST_WAIT_TIMEOUT_SECS);
+        crate::automation::recovery(
+            "waiting_for_startup",
+            json!({"scheduled_stop_unix": auto_stop_plan.stop_at_unix}),
+        );
+        if crate::output::is_json() || crate::automation::non_interactive() || args.yes {
+            let timeout = crate::automation::startup_timeout();
             let mut instance = match &workload {
                 InstanceWorkload::Container(_) => {
                     wait_for_workload_start(&client, instance_id, timeout)?
@@ -1302,7 +1337,15 @@ impl CreateProvider for Provider {
             instance.workload = Some(workload.clone());
             upsert_instance::<CacheModel>(&instance);
             if let InstanceWorkload::Unpack(source) = &workload {
+                crate::automation::recovery("deploying", json!({}));
                 deploy_unpack(config, &client, &instance, source)?;
+            }
+            if !crate::output::is_json() {
+                println!(
+                    "Created instance {instance_id}; auto-stop at {}.",
+                    format_unix_utc(auto_stop_plan.stop_at_unix)
+                );
+                return Ok(());
             }
             selected_cost.billed_hours = auto_stop_plan.runtime_hours;
             selected_cost.total_usd = selected_cost.hourly_usd * auto_stop_plan.runtime_hours;
@@ -1315,7 +1358,7 @@ impl CreateProvider for Provider {
                     "cost": crate::output::cost(&selected_cost),
                     "cost_scope": "provider_rate",
                     "quoted_total_hourly_usd": selected_offer.quoted_total_hourly_price(),
-                    "allocated_disk_gb": VAST_DEFAULT_DISK_GB,
+                    "allocated_disk_gb": config.default.vast_ai.disk_gb.unwrap_or(VAST_DEFAULT_DISK_GB as u32),
                     "image": create_body.get("image"),
                     "scheduled_stop_unix": auto_stop_plan.stop_at_unix,
                     "storage_charges_continue_after_stop": true,
@@ -1326,11 +1369,8 @@ impl CreateProvider for Provider {
         match &workload {
             InstanceWorkload::Shell => {
                 print_stage("Waiting for SSH access");
-                let instance = wait_for_ssh_ready(
-                    &client,
-                    instance_id,
-                    Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-                )?;
+                let instance =
+                    wait_for_ssh_ready(&client, instance_id, crate::automation::startup_timeout())?;
                 if prompt_confirm("Open shell in the new instance now?", true)? {
                     print_stage("Opening shell");
                     open_shell_with_auto_key(&client, &instance, false)?;
@@ -1341,7 +1381,7 @@ impl CreateProvider for Provider {
                 let instance = wait_for_workload_start(
                     &client,
                     instance_id,
-                    Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
+                    crate::automation::startup_timeout(),
                 )?;
                 println!("Container workload status: {}", status_summary(&instance));
                 if prompt_confirm("Follow container logs now?", true)? {
@@ -1356,13 +1396,11 @@ impl CreateProvider for Provider {
             }
             InstanceWorkload::Unpack(source) => {
                 print_stage("Waiting for SSH access");
-                let mut instance = wait_for_ssh_ready(
-                    &client,
-                    instance_id,
-                    Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-                )?;
+                let mut instance =
+                    wait_for_ssh_ready(&client, instance_id, crate::automation::startup_timeout())?;
                 instance.workload = Some(workload.clone());
                 upsert_instance::<CacheModel>(&instance);
+                crate::automation::recovery("deploying", json!({}));
                 deploy_unpack(config, &client, &instance, source)?;
                 println!(
                     "Unpack workload staged from {}.",
@@ -1385,10 +1423,20 @@ impl CreateProvider for Provider {
 }
 
 pub(crate) fn client_from_config(config: &IceConfig) -> Result<VastClient> {
+    let environment_key = std::env::var("VAST_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty());
     VastClient::new(
-        config.auth.vast_ai.api_key.as_deref().ok_or_else(|| {
-            anyhow!("Missing Vast API key. Run `ice login --cloud vast.ai` first.")
-        })?,
+        environment_key
+            .as_deref()
+            .or(config.auth.vast_ai.api_key.as_deref())
+            .ok_or_else(|| {
+                crate::automation::error(
+                    "authentication_required",
+                    "Missing Vast API key. Supply VAST_API_KEY or configure auth.vast_ai.api_key.",
+                    json!({"environment": "VAST_API_KEY"}),
+                )
+            })?,
     )
 }
 
@@ -1399,7 +1447,7 @@ pub(crate) fn build_create_request(
 ) -> Result<Value> {
     let mut body = json!({
         "client_id": "me",
-        "disk": VAST_DEFAULT_DISK_GB,
+        "disk": config.default.vast_ai.disk_gb.unwrap_or(VAST_DEFAULT_DISK_GB as u32),
         "runtype": runtype_for_workload(workload),
         "label": label,
         "cancel_unavail": true,
@@ -1500,7 +1548,13 @@ pub(crate) fn wait_for_state(
     loop {
         if elapsed_since(start)? > timeout {
             spinner.finish_and_clear();
-            bail!("Timed out waiting for instance {instance_id} to reach state `{desired_state}`.");
+            return Err(crate::automation::error(
+                "startup_timeout",
+                format!(
+                    "Timed out waiting for instance {instance_id} to reach state `{desired_state}`."
+                ),
+                serde_json::json!({"instance_id": instance_id.to_string(), "timeout_seconds": timeout.as_secs()}),
+            ));
         }
 
         if let Some(mut instance) = client.get_instance(instance_id)? {
@@ -1537,12 +1591,11 @@ pub(crate) fn wait_for_ssh_ready(
     loop {
         if elapsed_since(start)? > timeout {
             spinner.finish_and_clear();
-            if let Some(issue) = last_issue {
-                bail!(
-                    "Timed out waiting for SSH readiness on instance {instance_id}. Last issue: {issue}"
-                );
-            }
-            bail!("Timed out waiting for SSH readiness on instance {instance_id}.");
+            return Err(crate::automation::error(
+                "startup_timeout",
+                format!("Timed out waiting for SSH readiness on instance {instance_id}."),
+                json!({"instance_id": instance_id.to_string(), "timeout_seconds": timeout.as_secs(), "last_issue": last_issue}),
+            ));
         }
 
         if let Some(mut instance) = client.get_instance(instance_id)? {
@@ -1588,21 +1641,39 @@ pub(crate) fn wait_for_workload_start(
     loop {
         if elapsed_since(start)? > timeout {
             spinner.finish_and_clear();
-            bail!(
-                "Timed out waiting for Vast entrypoint workload on instance {instance_id}. Last status: {last_status}"
-            );
+            return Err(crate::automation::error(
+                "startup_timeout",
+                format!(
+                    "Timed out waiting for Vast entrypoint workload on instance {instance_id}. Last status: {last_status}"
+                ),
+                json!({"instance_id": instance_id.to_string(), "timeout_seconds": timeout.as_secs(), "last_status": last_status}),
+            ));
         }
 
         if let Some(mut instance) = client.get_instance(instance_id)? {
             hydrate_instance_workload(&mut instance);
             upsert_instance::<CacheModel>(&instance);
             last_status = status_summary(&instance);
+            if instance.actual_status.as_deref().is_some_and(|state| {
+                matches!(state.to_ascii_lowercase().as_str(), "error" | "failed")
+            }) {
+                return Err(crate::automation::error(
+                    "startup_failed",
+                    format!("Instance {instance_id} failed to start: {last_status}"),
+                    json!({"instance_id": instance_id.to_string(), "last_status": last_status}),
+                ));
+            }
             if instance
                 .actual_status
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .is_some_and(|status| !status.eq_ignore_ascii_case("loading"))
+                .is_some_and(|status| {
+                    matches!(
+                        status.to_ascii_lowercase().as_str(),
+                        "running" | "exited" | "stopped"
+                    )
+                })
             {
                 spinner.finish_with_message(format!(
                     "Vast workload on instance {instance_id} reached {last_status}."
@@ -1690,7 +1761,11 @@ fn shell_command_with_auto_key(
                 let output = Command::new("ssh")
                     .args(ssh_args(&host, port, identity))
                     .arg("true")
-                    .stdin(std::process::Stdio::inherit())
+                    .stdin(if crate::automation::non_interactive() {
+                        std::process::Stdio::null()
+                    } else {
+                        std::process::Stdio::inherit()
+                    })
                     .stderr(std::process::Stdio::inherit())
                     .output()
                     .context("Failed to run ssh readiness check")?;
@@ -1981,6 +2056,7 @@ pub(crate) fn ssh_args(host: &str, port: u16, identity_file: Option<&Path>) -> V
         args.push("-o".to_owned());
         args.push("IdentitiesOnly=yes".to_owned());
     }
+    args.extend(crate::automation::ssh_options());
     args.push(format!("root@{host}"));
     args
 }
@@ -2150,6 +2226,7 @@ fn run_ssh_command(
     wait_for_ssh_port_preflight(instance.id, &host, port, Duration::from_secs(30))?;
 
     let mut command = Command::new("ssh");
+    crate::automation::prepare_command(&mut command);
     command.args(ssh_args(&host, port, identity_file));
     if let Some(remote_command) = remote_command {
         if allocate_tty {
@@ -2165,7 +2242,11 @@ fn run_ssh_command(
         // Capture deployment stdout while preserving diagnostics and the SSH
         // status wording used by the existing automatic-key retry logic.
         command
-            .stdin(std::process::Stdio::inherit())
+            .stdin(if crate::automation::non_interactive() {
+                std::process::Stdio::null()
+            } else {
+                std::process::Stdio::inherit()
+            })
             .stderr(std::process::Stdio::inherit())
             .output()
             .map(|output| output.status)
@@ -2356,7 +2437,8 @@ impl TemporarySshKey {
         fs::create_dir(&dir)
             .with_context(|| format!("Failed to create temporary key dir {}", dir.display()))?;
         let private_key_path = dir.join("id_rsa");
-        let status = Command::new("ssh-keygen")
+        let mut command = Command::new("ssh-keygen");
+        command
             .args([
                 "-q",
                 "-t",
@@ -2369,7 +2451,9 @@ impl TemporarySshKey {
                 "ice-vast-temp",
                 "-f",
             ])
-            .arg(&private_key_path)
+            .arg(&private_key_path);
+        crate::automation::prepare_command(&mut command);
+        let status = command
             .status()
             .context("Failed to run `ssh-keygen` for temporary Vast SSH key")?;
         if !status.success() {

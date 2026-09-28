@@ -14,7 +14,7 @@ Installed command: `ice`
 
 ```bash
 ice login --cloud vast.ai
-ice create test-crate
+ice create test-crate --cloud vast.ai --max-price-per-hr 0.60
 ice list --cloud vast.ai
 ice logs --cloud vast.ai <instance> --follow
 ice delete --cloud vast.ai <instance>
@@ -125,8 +125,9 @@ stdout and return a nonzero exit status:
 {"schema_version":1,"command":"list","cloud":"gcp","error":{"code":"command_failed","message":"Failed to list instances"}}
 ```
 
-Argument errors use `code: "invalid_arguments"` and exit status 2; command failures
-use `code: "command_failed"` and exit status 1. Error envelopes have no `result`;
+Argument parsing errors use `code: "invalid_arguments"` and exit status 2; command
+failures use exit status 1 and a specific code when available, otherwise
+`code: "command_failed"`. Error envelopes have no `result`;
 `command` and `cloud` may be `null` when parsing or configuration loading fails.
 Messages are diagnostic text, not stable error identifiers. A log stream may emit
 data before its final error record; it will not emit `complete` on failure. An
@@ -139,13 +140,111 @@ when a query fails. Consumers should check the exit status and schema version an
 tolerate additional fields.
 
 `--json` selects output format; it does not accept a rental offer or bypass existing
-confirmation prompts. JSON creation finishes the existing deployment and returns
+confirmation prompts. Use `create --yes` to accept an offer within the effective
+filters and price ceiling. JSON creation finishes the existing deployment and returns
 the instance details without offering to open a shell or follow logs. Commands
 without `--json` retain normal output.
 
+## Unattended use
+
+Use `--non-interactive --json` for agents and scripts. `--non-interactive` is
+global and guarantees that Ice does not prompt or open a browser, even with a
+terminal attached. It is also enabled automatically when stdin is not a terminal.
+`--json` controls output only; `create --yes` explicitly accepts a rental. Supplying
+`--yes` does not change filters, increase the price ceiling, or start a stopped
+instance while looking up connection details.
+
+Provide credentials first: Vast accepts `VAST_API_KEY` (which takes precedence
+over `auth.vast_ai.api_key` without saving the environment value), GCP uses its
+existing credentials/service-account configuration, and AWS uses its existing
+credentials/configuration. `ice login --non-interactive --cloud CLOUD --json`
+checks credential availability and returns an error when setup is needed
+(Vast and AWS also validate the supplied identity). Configured GCP service-account
+files are passed to resource commands and returned connection commands through
+[gcloud’s credential-file override](https://docs.cloud.google.com/sdk/docs/authenticate).
+Missing cloud tools must be installed before use. AWS/GCP catalogs can
+be prepared with `ice refresh-catalog --cloud CLOUD --non-interactive --json`.
+
+For example, preview a Vast request:
+
+```sh
+ice create --cloud vast.ai --ssh \
+  --gpu-count 1 --min-gpu-memory-gb 24 \
+  --disk-gb 80 --min-download-mbps 500 \
+  --max-price-per-hr 0.60 --hours 1 \
+  --no-defaults --non-interactive --dry-run --json
+```
+
+Replace `--dry-run` with `--yes` to create. A preview does not reserve an offer;
+creation selects against the effective requirements and checks the price again.
+The following use the returned instance ID and existing workload capabilities:
+
+```sh
+ice shell --cloud vast.ai INSTANCE --print-creds --non-interactive --json
+ice push --cloud vast.ai INSTANCE ./input /tmp/input --non-interactive --json
+ice pull --cloud vast.ai INSTANCE /tmp/output ./output --non-interactive --json
+ice logs --cloud vast.ai INSTANCE --tail 100 --non-interactive --json
+ice stop --cloud vast.ai INSTANCE --non-interactive --json
+ice delete --cloud vast.ai INSTANCE --non-interactive --json
+```
+
+Logs remain workload-dependent: shell-only machines have no managed workload
+log. Connection printing requires usable SSH credentials; Vast's existing
+`--preserve-ephemeral` option controls fallback key retention. The current Vast
+key setup flow requires a local SSH keypair to attach when existing access fails.
+Reuse a suitable instance across short jobs in a work session.
+Use `start` explicitly if it is stopped; connection lookup returns
+`instance_stopped` instead of prompting to start it. Stop preserves storage;
+delete removes the instance and its data.
+
+Ice disables cloud CLI prompts/pagers and uses SSH batch authentication for
+unattended probes and transfers. Interactive shells and `--custom` are rejected
+in this mode. Creation returns without offering to open a shell or follow logs.
+
+`create --startup-timeout 30m` changes the readiness wait (default `15m`; seconds
+also accepted, e.g. `90s`). It does not extend the existing runtime or stop
+deadline. Provider requests/probes have their own timeouts, so an in-flight
+request can finish after the readiness deadline. A timeout does not delete the
+instance. JSON errors include `details.recovery` with the operation stage and
+known instance/offer identifiers, plus Vast's scheduled stop when available.
+Inspect that resource before retrying creation; a lost creation response may
+leave its outcome uncertain.
+
+Errors retain a nonzero exit status and the JSON envelope. Codes include
+`invalid_arguments`, `missing_configuration`, `unsupported_filter`,
+`confirmation_required`, `authentication_required`, `interaction_required`,
+`instance_stopped`, `no_matching_offers`, `startup_timeout`, and `startup_failed`.
+Other provider failures use `command_failed`. `details` supplies relevant missing
+settings, unsupported filters, or recovery information. Partial log output can
+precede an error record.
+
 ## Config
 
-Config file: `~/.ice/config.toml`
+Ice uses the OS configuration directory: on Linux,
+`${XDG_CONFIG_HOME:-~/.config}/ice/config.toml`. `ice config list` reports the
+actual path. Configuration is per user, with separate search preferences for
+each cloud. Provider catalogs/GPU data currently remain under `~/.ice/`.
+
+Creation resolves command-line filters over saved provider preferences. Optional
+CPU/RAM/model filters may be unspecified; remote creation requires a positive
+hourly price ceiling from a flag or saved preference. Existing AWS selection
+defaults to CPU-only when no GPU models are supplied; this is now shown explicitly.
+Use `ice config set` to save preferences. Creation and interactive filter editing
+do not save answers or command-line overrides into this file.
+
+`create --no-defaults` ignores saved **search filters and disk preferences** for
+that invocation. It retains credentials, provider location/image settings, the
+default cloud, and the default runtime; pass `--cloud` and `--hours` explicitly
+when those must be reproducible. Existing disk fallbacks remain Vast 32 GB,
+GCP 50 GB, and the AWS AMI's root volume size.
+
+Before searching, human output identifies effective filter values and their
+sources. JSON creation results and relevant errors include `selection`, with
+`config_path`, `saved_filters_ignored`, `price_scope`, and a `filters` map.
+`runtime_hours` records its value/source and `machine` records any explicit
+provider machine selector. Filter entries contain `value` and `source`
+(`command_line`, `saved_configuration`,
+`built_in`, `unspecified`, or `interactive`). Null means unspecified/unknown.
 
 Use:
 
@@ -163,6 +262,9 @@ Auth values are redacted in config output.
 - `default.vast_ai.min_cpus|min_ram_gb|allowed_gpus|max_price_per_hr`
 - `default.gcp.min_cpus|min_ram_gb|allowed_gpus|max_price_per_hr`
 - `default.aws.min_cpus|min_ram_gb|allowed_gpus|max_price_per_hr`
+- Each provider also accepts `gpu_count`, `min_gpu_memory_gb`, `disk_gb`,
+  `min_download_mbps`, and `min_upload_mbps` keys; unsupported provider/filter
+  combinations fail during creation rather than being ignored.
 - `default.gcp.region|zone|image_family|image_project|boot_disk_gb`
 - `default.aws.region|ami|key_name|ssh_key_path|ssh_user|security_group_id|subnet_id|root_disk_gb`
 - `auth.vast_ai.api_key`
@@ -198,6 +300,23 @@ Behavior:
 - `--hours` overrides runtime duration for the deploy. If omitted, `ice` uses
   `default.runtime_hours` and otherwise falls back to `1.0`.
 - `--custom` prompts for search filters on marketplace-backed clouds.
+- `--no-gpu` clears saved GPU models; it does not require CPU-only hardware.
+- `--gpu-count COUNT` requests an exact GPU count. Positive counts are initially
+  supported on Vast; zero explicitly requires a CPU-only candidate on any remote
+  provider. Zero conflicts with GPU model/memory requirements.
+- `--min-gpu-memory-gb GB` requires memory per card, not summed across GPUs (Vast).
+- `--min-download-mbps MBPS` and `--min-upload-mbps MBPS` constrain reported
+  internet bandwidth at the rented host (Vast). They cannot guarantee throughput
+  from a particular image registry. Missing measurements cannot satisfy a filter.
+- `--disk-gb GB` requests allocation on Vast/GCP/AWS. Provider disk units and
+  rounding apply. Vast search pricing uses the same allocation as creation.
+- GPU memory uses Vast's reported GB convention (API memory / 1000), consistent
+  with its official CLI. Network units are megabits per second. JSON offers expose
+  `gpu_memory_gb`, `download_mbps`, `upload_mbps`, and upload/download USD per GB.
+- Price scope remains unchanged: GCP/AWS caps and estimates cover compute; Vast
+  uses the provider rate and reports the allocation-adjusted total separately as
+  `quoted_total_hourly_usd`. Neither is a total spending cap; bandwidth charges
+  are separate. Changing that pricing contract is outside this change.
 - `--machine` pins a specific marketplace machine type.
 - `--dry-run` reports the chosen machine and exits before provisioning.
 

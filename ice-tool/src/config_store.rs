@@ -18,6 +18,21 @@ pub(crate) fn parse_key_value_pair(pair: &str) -> Result<(String, String)> {
 
 pub(crate) fn supported_config_keys() -> &'static [&'static str] {
     &[
+        "default.vast_ai.gpu_count",
+        "default.vast_ai.min_gpu_memory_gb",
+        "default.vast_ai.disk_gb",
+        "default.vast_ai.min_download_mbps",
+        "default.vast_ai.min_upload_mbps",
+        "default.gcp.gpu_count",
+        "default.gcp.min_gpu_memory_gb",
+        "default.gcp.disk_gb",
+        "default.gcp.min_download_mbps",
+        "default.gcp.min_upload_mbps",
+        "default.aws.gpu_count",
+        "default.aws.min_gpu_memory_gb",
+        "default.aws.disk_gb",
+        "default.aws.min_download_mbps",
+        "default.aws.min_upload_mbps",
         "default.cloud",
         "default.runtime_hours",
         "default.vast_ai.min_cpus",
@@ -69,6 +84,14 @@ pub(crate) fn normalize_config_key(key: &str) -> Result<String> {
 
 pub(crate) fn get_config_value(config: &IceConfig, key: &str) -> Result<String> {
     let key = normalize_config_key(key)?;
+    if extra_filter_key(&key) {
+        let value = filter_value(config, &key)?;
+        return Ok(if value.is_null() {
+            "<unset>".to_owned()
+        } else {
+            value.to_string()
+        });
+    }
     let value = match key.as_str() {
         "default.cloud" => config.default.cloud.map(|cloud| cloud.to_string()),
         "default.runtime_hours" => config
@@ -216,6 +239,22 @@ fn parse_positive_f64_config_value(key: &str, value: &str) -> Result<f64> {
 
 pub(crate) fn set_config_value(config: &mut IceConfig, key: &str, value: &str) -> Result<String> {
     let key = normalize_config_key(key)?;
+    if extra_filter_key(&key) {
+        let field = key.rsplit('.').next().unwrap();
+        let parsed = if field == "gpu_count" || field == "disk_gb" {
+            let number = value
+                .parse::<u32>()
+                .with_context(|| format!("{key} expects an integer"))?;
+            if field == "disk_gb" && number == 0 {
+                bail!("{key} must be positive");
+            }
+            serde_json::json!(number)
+        } else {
+            serde_json::json!(parse_positive_f64_config_value(&key, value)?)
+        };
+        set_filter_value(config, &key, parsed.clone())?;
+        return Ok(parsed.to_string());
+    }
     match key.as_str() {
         "default.cloud" => {
             let cloud = parse_cloud(value)?;
@@ -468,6 +507,9 @@ pub(crate) fn set_config_value(config: &mut IceConfig, key: &str, value: &str) -
 
 pub(crate) fn unset_config_value(config: &mut IceConfig, key: &str) -> Result<()> {
     let key = normalize_config_key(key)?;
+    if extra_filter_key(&key) {
+        return set_filter_value(config, &key, serde_json::Value::Null);
+    }
     match key.as_str() {
         "default.cloud" => config.default.cloud = None,
         "default.runtime_hours" => config.default.runtime_hours = None,
@@ -517,7 +559,7 @@ pub(crate) fn parse_cloud(value: &str) -> Result<Cloud> {
     }
 }
 
-fn config_path() -> Result<PathBuf> {
+pub(crate) fn config_path() -> Result<PathBuf> {
     Ok(ice_root_dir()?.join(CONFIG_FILE_NAME))
 }
 
@@ -550,4 +592,32 @@ pub(crate) fn save_config(config: &IceConfig) -> Result<PathBuf> {
     capulus::store::write_toml_file(&path, config, None, None)
         .with_context(|| format!("Failed to write config file: {}", path.display()))?;
     Ok(path)
+}
+
+fn extra_filter_key(key: &str) -> bool {
+    key.starts_with("default.")
+        && matches!(
+            key.rsplit('.').next(),
+            Some(
+                "gpu_count"
+                    | "min_gpu_memory_gb"
+                    | "disk_gb"
+                    | "min_download_mbps"
+                    | "min_upload_mbps"
+            )
+        )
+}
+fn filter_value(config: &IceConfig, key: &str) -> Result<serde_json::Value> {
+    let raw = serde_json::to_value(config)?;
+    Ok(key
+        .split('.')
+        .fold(&raw, |value, part| &value[part])
+        .clone())
+}
+fn set_filter_value(config: &mut IceConfig, key: &str, value: serde_json::Value) -> Result<()> {
+    let parts = key.split('.').collect::<Vec<_>>();
+    let mut raw = serde_json::to_value(&*config)?;
+    raw[parts[0]][parts[1]][parts[2]] = value;
+    *config = serde_json::from_value(raw)?;
+    Ok(())
 }

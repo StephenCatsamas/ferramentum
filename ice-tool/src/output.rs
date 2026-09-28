@@ -22,7 +22,12 @@ pub(crate) fn is_json() -> bool {
     JSON.get().copied().unwrap_or(false)
 }
 
-pub(crate) fn document(command: &str, cloud: impl Into<Option<Cloud>>, result: Value) -> Value {
+pub(crate) fn document(command: &str, cloud: impl Into<Option<Cloud>>, mut result: Value) -> Value {
+    if command == "create"
+        && let Some(selection) = crate::selection::snapshot()
+    {
+        result["selection"] = selection;
+    }
     json!({"schema_version": 1, "command": command, "cloud": cloud.into(), "result": result})
 }
 
@@ -158,6 +163,7 @@ fn read_log_chunks(mut reader: impl Read, mut emit: impl FnMut(&str) -> Result<(
 }
 
 pub(crate) fn run_log_command(command: &mut Command, context: &str) -> Result<()> {
+    crate::automation::prepare_command(command);
     let cancellation =
         capulus::Cancellation::install().context("Failed to install log cancellation handler")?;
     // Provider CLIs may launch SSH as a child. Keep the entire log transport in
@@ -252,6 +258,10 @@ pub(crate) fn workload(workload: Option<&InstanceWorkload>) -> Value {
 pub(crate) fn vast_offer(offer: &VastOffer) -> Value {
     json!({
         "offer_id": offer.id, "gpu_model": offer.gpu_name,
+        "gpu_memory_gb": offer.gpu_ram.map(|v| v / 1000.0),
+        "available_disk_gb": offer.disk_space,
+        "download_mbps": offer.inet_down, "upload_mbps": offer.inet_up,
+        "download_usd_per_gb": offer.inet_down_cost, "upload_usd_per_gb": offer.inet_up_cost,
         "num_gpus": offer.num_gpus, "cpu_cores": offer.cpu_cores_effective,
         "ram_mb": offer.cpu_ram, "hourly_usd": offer.hourly_price(),
         "available_seconds": offer.duration, "location": offer.geolocation,
@@ -273,7 +283,13 @@ pub(crate) fn allocated_disk_gb(config: &IceConfig, cloud: Cloud) -> Option<u32>
         Cloud::Gcp => Some(config.default.gcp.boot_disk_gb.unwrap_or(50)),
         // Without an override, AWS uses the chosen AMI's root volume size.
         Cloud::Aws => config.default.aws.root_disk_gb,
-        Cloud::VastAi => Some(crate::support::VAST_DEFAULT_DISK_GB as u32),
+        Cloud::VastAi => Some(
+            config
+                .default
+                .vast_ai
+                .disk_gb
+                .unwrap_or(crate::support::VAST_DEFAULT_DISK_GB as u32),
+        ),
         Cloud::Local => None,
     }
 }
@@ -283,6 +299,30 @@ pub(crate) fn connection(cloud: Cloud, instance: Value, command: &str) -> Result
         "shell",
         cloud,
         json!({"instance": instance, "connect_command": command}),
+    )
+}
+
+pub(crate) fn command_error(
+    command: Option<&str>,
+    cloud: Option<Cloud>,
+    error: &anyhow::Error,
+    message: &str,
+) -> Result<()> {
+    let typed = error.downcast_ref::<crate::automation::AgentError>();
+    let mut details = typed
+        .map(|err| err.details.clone())
+        .unwrap_or_else(|| json!({}));
+    let recovery = crate::automation::recovery_details();
+    if !recovery.is_null() {
+        details["recovery"] = recovery;
+    }
+    if let Some(selection) = crate::selection::snapshot() {
+        details["selection"] = selection;
+    }
+    write_document(
+        io::stdout().lock(),
+        &json!({"schema_version": 1, "command": command, "cloud": cloud,
+        "error": {"code": typed.map_or("command_failed", |err| err.code), "message": message, "details": details}}),
     )
 }
 

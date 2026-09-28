@@ -297,9 +297,11 @@ pub(crate) fn resolve_cloud(explicit_cloud: Option<Cloud>, config: &IceConfig) -
     if let Some(cloud) = config.default.cloud {
         return Ok(cloud);
     }
-    bail!(
-        "Missing `--cloud CLOUD`, or set a default with e.g. `ice config set default.cloud=vast.ai` (or `gcp`, `aws`, `local`, etc.)."
-    )
+    Err(crate::automation::error(
+        "missing_configuration",
+        "Supply --cloud or set default.cloud with ice config set.",
+        serde_json::json!({"missing": ["default.cloud"], "required_flags": ["--cloud"]}),
+    ))
 }
 
 pub(crate) fn prompt_theme() -> &'static ColorfulTheme {
@@ -307,6 +309,7 @@ pub(crate) fn prompt_theme() -> &'static ColorfulTheme {
 }
 
 pub(crate) fn prompt_confirm(prompt: &str, default: bool) -> Result<bool> {
+    require_interactive(prompt)?;
     capulus::ui::prompt_confirm(prompt, default).context("Failed to read confirmation")
 }
 
@@ -358,14 +361,17 @@ pub(crate) fn run_command_output(
     command: &mut Command,
     context: &str,
 ) -> Result<std::process::Output> {
+    crate::automation::prepare_command(command);
     capulus::process::run_output(command, context)
 }
 
 pub(crate) fn run_command_json(command: &mut Command, context: &str) -> Result<Value> {
+    crate::automation::prepare_command(command);
     capulus::process::run_json_value(command, context)
 }
 
 pub(crate) fn run_command_text(command: &mut Command, context: &str) -> Result<String> {
+    crate::automation::prepare_command(command);
     capulus::process::run_text(command, context)
 }
 
@@ -374,10 +380,12 @@ pub(crate) fn run_command_status_with_stdin(
     context: &str,
     stdin_data: &str,
 ) -> Result<()> {
+    crate::automation::prepare_command(command);
     capulus::process::run_status_with_input(command, context, stdin_data.as_bytes())
 }
 
 pub(crate) fn run_command_status(command: &mut Command, context: &str) -> Result<()> {
+    crate::automation::prepare_command(command);
     if crate::output::streaming_logs() {
         return crate::output::run_log_command(command, context);
     }
@@ -606,6 +614,7 @@ pub(crate) fn progress_bar(prefix: &str, message: &str, length: u64) -> Progress
 }
 
 pub(crate) fn require_interactive(message: &str) -> Result<()> {
+    crate::automation::require_interactive(message)?;
     capulus::ui::require_interactive(message)
 }
 
