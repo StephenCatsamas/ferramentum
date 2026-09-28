@@ -664,9 +664,8 @@ impl VastClient {
         if daemon_logs {
             body["daemon_logs"] = Value::Bool(true);
         }
-        let parsed = serde_json::from_value::<VastLogsResponse>(self.put_json(
-            &format!("/api/v0/instances/request_logs/{id}"),
-            &body,
+        let parsed = serde_json::from_value::<VastLogsResponse>(self.send_json(
+            || self.build_logs_request(id, &body),
             "request vast.ai instance logs",
         )?)
         .context("Failed to parse vast.ai logs response")?;
@@ -687,6 +686,16 @@ impl VastClient {
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow!("Vast logs response missing `result_url`."))?,
             Duration::from_secs(VAST_LOG_READY_TIMEOUT_SECS),
+        )
+    }
+
+    fn build_logs_request(&self, id: u64, body: &Value) -> RequestBuilder {
+        self.auth(
+            self.http
+                .put(format!(
+                    "{VAST_BASE_URL}/api/v0/instances/request_logs/{id}/"
+                ))
+                .json(body),
         )
     }
 
@@ -2517,6 +2526,31 @@ fn remaining_hours_display(
         "{:.2}h",
         remaining_hours(instance, scheduled_termination_unix).max(0.0)
     )
+}
+
+#[cfg(test)]
+mod logs_tests {
+    use super::*;
+
+    #[test]
+    fn logs_request_uses_canonical_put_route_and_json_body() {
+        let client = VastClient::new("test-api-key").unwrap();
+        let body = json!({"tail": 100, "filter": "sshd", "daemon_logs": true});
+        let request = client.build_logs_request(123, &body).build().unwrap();
+
+        // The slashless route returned HTTP 400 for a valid JSON body. Match
+        // Vast's official CLI route directly instead of depending on redirects.
+        assert_eq!(request.method(), reqwest::Method::PUT);
+        assert_eq!(
+            request.url().as_str(),
+            "https://console.vast.ai/api/v0/instances/request_logs/123/"
+        );
+        assert_eq!(request.headers()["content-type"], "application/json");
+        assert_eq!(
+            serde_json::from_slice::<Value>(request.body().unwrap().as_bytes().unwrap()).unwrap(),
+            body
+        );
+    }
 }
 
 #[cfg(test)]
