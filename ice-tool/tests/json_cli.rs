@@ -930,7 +930,7 @@ fn credential_lookup_errors_do_not_expose_raw_token_responses() {
 
 #[test]
 fn closed_json_pipe_stops_a_log_transport_with_child_processes() {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -946,7 +946,7 @@ fn closed_json_pipe_stops_a_log_transport_with_child_processes() {
         r#"#!/bin/sh
 if [ "$2" = ssh ]; then
     printf 'first'
-    read -r release
+    while [ ! -f "$ICE_TEST_STATE.release" ]; do /bin/sleep 0.01; done
     /bin/sh -c 'printf second; exec /bin/sleep 30' &
     wait
 else
@@ -977,12 +977,7 @@ fi
         "first"
     );
     drop(stdout);
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"continue\n")
-        .unwrap();
+    fs::write(fixture.root.path().join("state.release"), "continue").unwrap();
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -996,6 +991,46 @@ fi
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn connection_and_provider_log_flags_reject_unsupported_uses_before_provider_access() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["shell", "--cloud", "vast.ai", "42", "--no-probe", "--json"],
+        vec![
+            "shell",
+            "--cloud",
+            "vast.ai",
+            "42",
+            "--print-creds",
+            "--no-probe",
+            "--preserve-ephemeral",
+            "--json",
+        ],
+        vec![
+            "shell",
+            "--cloud",
+            "gcp",
+            "42",
+            "--print-creds",
+            "--no-probe",
+            "--json",
+        ],
+        vec!["logs", "--cloud", "gcp", "42", "--provider-logs", "--json"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success(), "{args:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_arguments", "{args:?}");
+    }
+    let output = fixture.run(&["shell", "--help"]);
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("--no-probe")
+    );
 }
 
 #[test]

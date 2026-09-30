@@ -89,7 +89,9 @@ Successful commands other than `logs` write one JSON object and a newline to std
   separately reports the provider's total for the allocated storage when supplied,
   or `null` when absent. AWS disk size is `null` when the AMI determines it.
 - `shell --print-creds` returns instance details and a `connect_command` string.
-  It retains the existing readiness/key setup behavior. It can include a local
+  Vast checks readiness and may attach an existing local key to the selected
+  instance. `--no-probe` prints reported connection details with
+  `readiness: "unchecked"` instead. It can include a local
   identity-file path, but never key contents or provider credentials.
 - `start` and `stop` return the observed instance state and a `changed` boolean,
   distinguishing an already running/stopped instance from a state transition.
@@ -189,9 +191,10 @@ ice delete --cloud vast.ai INSTANCE --non-interactive --json
 ```
 
 Logs remain workload-dependent: shell-only machines have no managed workload
-log. Connection printing requires usable SSH credentials; Vast's existing
-`--preserve-ephemeral` option controls fallback key retention. The current Vast
-key setup flow requires a local SSH keypair to attach when existing access fails.
+log. Verified connection printing requires usable SSH credentials. Vast recovery
+can attach an existing local keypair to the selected instance; it no longer
+creates temporary keys or changes account-wide keys. `--preserve-ephemeral`
+remains accepted for compatibility and reports that it is no longer needed.
 Reuse a suitable instance across short jobs in a work session.
 Use `start` explicitly if it is stopped; connection lookup returns
 `instance_stopped` instead of prompting to start it. Stop preserves storage;
@@ -349,7 +352,56 @@ ice create --ssh --cloud gcp --machine g2-standard-4
 - For `unpack`, logs come from the persisted detached `stdio.log` and `--follow` exits
   automatically after the workload finishes and the final output is drained.
 - For `container` on `vast.ai`, logs use Vast's provider API.
+- `ice logs --cloud vast.ai INSTANCE --provider-logs` requests provider container
+  logs even for an `unpack` workload. This works without SSH and is useful for
+  diagnosing sshd failures. `--daemon` selects provider daemon system logs.
 - `ice shell` opens the workload shell when possible and otherwise falls back to the host shell.
+
+Vast connection recovery uses batch-mode SSH authentication probes (`ssh -N`),
+without running a remote command, before a shell, transfer, or unpack operation.
+It tries the reported SSH endpoint and, if that
+fails, a direct endpoint from the current provider response's `public_ipaddr` and
+`ports["22/tcp"]`. A changed mapped port is read afresh on the next invocation.
+Host-key verification failures stop recovery; exit status 255 alone is not
+treated as evidence of a missing key.
+
+If public-key authentication fails, Ice tries an existing local identity and
+checks the last 200 provider container log lines for explicit sshd ownership/mode
+errors. Such evidence produces `ssh_server_permissions` and stops recovery. Ice
+does not change server permissions or startup scripts, or recycle the container.
+When no such evidence is available, it can attach the existing key to this
+instance once. An already-associated key ends recovery; a newly attached key gets
+up to three propagation probes. No account-wide key changes are attempted.
+
+Recovery has a shared 90-second budget and at most seven probes. Each probe is
+limited to 10 seconds, provider-log diagnostics to 15 seconds, and key attachment
+to 10 seconds, all within the remaining budget. New-instance startup still waits
+for a reachable reported port under the existing startup timeout, separately
+from SSH authentication recovery. Once a probe
+succeeds, the requested operation runs once. A nonzero remote SSH command status
+other than 255 is `ssh_remote_command_failed`; ambiguous SSH or transfer failures
+are `ssh_operation_failed`. Neither replays the operation or changes keys.
+
+JSON connection results include `readiness`, the selected `endpoint`, and `ssh`
+diagnostics. Connection errors include `details.ssh`: ordered probe attempts with
+each endpoint and failure category, elapsed time, budget, key-attachment outcome,
+provider-log diagnosis, and a next diagnostic command. Codes distinguish
+`ssh_transport_failed`, `ssh_authentication_failed`, `ssh_host_key_failed`,
+`ssh_remote_command_failed`, `ssh_local_setup_failed`, `ssh_connection_failed`,
+`ssh_probe_interrupted`, `ssh_server_permissions`, and `ssh_recovery_timeout`.
+Verbose probe output and arbitrary provider logs are not copied into these fields.
+
+To inspect reported endpoints without starting a stopped machine, waiting for
+readiness, probing SSH, reading local keys, or initiating recovery:
+
+```sh
+ice shell --cloud vast.ai INSTANCE --print-creds --no-probe --json
+```
+
+This performs a provider lookup and returns `readiness: "unchecked"`; it does not
+prove the connection works. Its `endpoints` array includes any reported direct
+alternative. `--no-probe` currently applies only to Vast and requires
+`--print-creds`.
 
 ## Notes
 

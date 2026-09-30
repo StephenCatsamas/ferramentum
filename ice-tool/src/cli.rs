@@ -105,6 +105,9 @@ pub(crate) struct LogsArgs {
     pub(crate) filter: Option<String>,
     #[arg(long)]
     pub(crate) daemon: bool,
+    /// Vast only: fetch provider container logs, including for unpack workloads.
+    #[arg(long)]
+    pub(crate) provider_logs: bool,
     #[arg(long)]
     pub(crate) follow: bool,
 }
@@ -160,8 +163,13 @@ pub(crate) struct ConfigUnsetArgs {
 pub(crate) struct ShellArgs {
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
+    /// Print a connection command after readiness checks and any instance-key recovery.
     #[arg(long)]
     pub(crate) print_creds: bool,
+    /// Vast only: print reported endpoints without readiness checks, SSH probes, or key changes.
+    #[arg(long, requires = "print_creds", conflicts_with = "preserve_ephemeral")]
+    pub(crate) no_probe: bool,
+    /// Deprecated for Vast: recovery no longer creates temporary account keys.
     #[arg(long)]
     pub(crate) preserve_ephemeral: bool,
     pub(crate) instance: String,

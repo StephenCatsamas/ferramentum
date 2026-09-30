@@ -14,7 +14,15 @@ use crate::support::{
 };
 
 pub(crate) fn cmd_logs(args: LogsArgs, config: &IceConfig) -> Result<()> {
-    match resolve_cloud(args.cloud, config)? {
+    let cloud = resolve_cloud(args.cloud, config)?;
+    if args.provider_logs && cloud != Cloud::VastAi {
+        return Err(crate::automation::error(
+            "invalid_arguments",
+            "--provider-logs is currently supported only for vast.ai.",
+            json!({"cloud": cloud}),
+        ));
+    }
+    match cloud {
         Cloud::VastAi => run_logs::<vast::Provider>(config, &args),
         Cloud::Gcp => run_logs::<gcp::Provider>(config, &args),
         Cloud::Aws => run_logs::<aws::Provider>(config, &args),
@@ -26,7 +34,15 @@ pub(crate) fn cmd_shell(args: ShellArgs, config: &IceConfig) -> Result<()> {
     if crate::output::is_json() && !args.print_creds {
         bail!("`shell --json` requires `--print-creds`; interactive shells need a terminal.");
     }
-    match resolve_cloud(args.cloud, config)? {
+    let cloud = resolve_cloud(args.cloud, config)?;
+    if args.no_probe && cloud != Cloud::VastAi {
+        return Err(crate::automation::error(
+            "invalid_arguments",
+            "--no-probe is currently supported only for vast.ai.",
+            json!({"cloud": cloud, "flags": ["--no-probe"]}),
+        ));
+    }
+    match cloud {
         Cloud::VastAi => run_shell::<vast::Provider>(config, &args),
         Cloud::Gcp => run_shell::<gcp::Provider>(config, &args),
         Cloud::Aws => run_shell::<aws::Provider>(config, &args),

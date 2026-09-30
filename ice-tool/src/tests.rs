@@ -67,6 +67,8 @@ fn test_vast_instance(end_date: Option<f64>) -> VastInstance {
         end_date,
         ssh_host: None,
         ssh_port: None,
+        public_ipaddr: None,
+        ports: serde_json::Value::Null,
         workload: None,
     }
 }

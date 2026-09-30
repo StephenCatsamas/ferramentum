@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::Path;
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::blocking::{Client, RequestBuilder};
@@ -13,7 +13,6 @@ use serde_json::{Value, json};
 
 use crate::cache::{CloudCacheModel, load_cache_store, persist_instances, upsert_instance};
 use crate::cli::{CreateArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
-use crate::gpu::runtime_provider_data_path;
 use crate::http_retry;
 use crate::listing::{
     ListedInstance, display_name_or_fallback, display_state, list_state_color,
@@ -29,16 +28,13 @@ use crate::provision::{
     print_offer_summary, prompt_adjust_search_filters, prompt_create_search_filters,
     prompt_offer_decision,
 };
-use crate::remote::{
-    RemoteAccess, discover_local_ssh_keypair, run_rsync_download, run_rsync_upload,
-    run_rsync_upload_path,
-};
+use crate::remote::{run_rsync_download, run_rsync_upload, run_rsync_upload_path};
 use crate::support::{
     ICE_LABEL_PREFIX, VAST_DEFAULT_DISK_GB, VAST_DEFAULT_IMAGE,
     VAST_LOG_READY_POLL_INTERVAL_MILLIS, VAST_LOG_READY_TIMEOUT_SECS, VAST_POLL_INTERVAL_SECS,
     build_cloud_instance_name, elapsed_since, extract_api_error_message, format_unix_utc,
     now_unix_secs, now_unix_secs_f64, parse_json_response, prefix_lookup_indices, prompt_confirm,
-    render_command_line, spinner, truncate_ellipsis, visible_instance_name,
+    spinner, truncate_ellipsis, visible_instance_name,
 };
 use crate::ui::{print_stage, print_warning};
 use crate::unpack::{
@@ -51,6 +47,8 @@ use crate::workload::{
 };
 
 const VAST_BASE_URL: &str = "https://console.vast.ai";
+
+mod ssh;
 
 #[derive(Debug, Deserialize)]
 struct VastOffersResponse {
@@ -101,10 +99,6 @@ struct VastHourlyBreakdown {
     total_hour: Option<f64>,
     #[serde(default, rename = "discountedTotalPerHour")]
     discounted_total_per_hour: Option<f64>,
-}
-
-struct AccountSshKey {
-    key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +164,10 @@ pub(crate) struct VastInstance {
     pub(crate) ssh_host: Option<String>,
     #[serde(default)]
     pub(crate) ssh_port: Option<u16>,
+    #[serde(default)]
+    pub(crate) public_ipaddr: Option<String>,
+    #[serde(default)]
+    pub(crate) ports: Value,
     #[serde(skip)]
     pub(crate) workload: Option<InstanceWorkload>,
 }
@@ -225,7 +223,8 @@ pub(crate) struct VastClient {
     api_key: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum InstanceSshKeyAttachStatus {
     Attached,
     AlreadyAssociated,
@@ -555,10 +554,20 @@ impl VastClient {
         &self,
         id: u64,
         ssh_key: &str,
+        timeout: Duration,
     ) -> Result<InstanceSshKeyAttachStatus> {
-        let parsed = serde_json::from_value::<VastSimpleResponse>(self.post_json(
-            &format!("/api/v0/instances/{id}/ssh/"),
-            &json!({ "ssh_key": ssh_key }),
+        // A single bounded mutation: if the response is lost, report uncertainty
+        // instead of repeating the request or escalating to account-wide keys.
+        let response = self
+            .auth(
+                self.http
+                    .post(format!("{VAST_BASE_URL}/api/v0/instances/{id}/ssh/"))
+                    .json(&json!({"ssh_key": ssh_key}))
+                    .timeout(timeout),
+            )
+            .send()?;
+        let parsed = serde_json::from_value::<VastSimpleResponse>(parse_json_response(
+            response,
             "attach ssh key to instance",
         )?)
         .context("Failed to parse attach ssh key response")?;
@@ -575,96 +584,10 @@ impl VastClient {
             }
             bail!("Failed to attach ssh key: {message}");
         }
+        if parsed.success != Some(true) {
+            bail!("Vast did not confirm instance-key attachment");
+        }
         Ok(InstanceSshKeyAttachStatus::Attached)
-    }
-
-    fn list_account_ssh_keys(&self) -> Result<Vec<AccountSshKey>> {
-        let value = self.get_json("/api/v0/ssh/", "list account ssh keys")?;
-        let rows = if let Some(rows) = value.as_array() {
-            rows.clone()
-        } else if let Some(rows) = value.get("keys").and_then(Value::as_array) {
-            rows.clone()
-        } else {
-            Vec::new()
-        };
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| {
-                let key = row
-                    .get("key")
-                    .and_then(Value::as_str)
-                    .or_else(|| row.get("public_key").and_then(Value::as_str))
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)?;
-                Some(AccountSshKey { key })
-            })
-            .collect())
-    }
-
-    fn create_account_ssh_key(&self, ssh_key: &str) -> Result<u64> {
-        let value = self.post_json(
-            "/api/v0/ssh/",
-            &json!({ "ssh_key": ssh_key }),
-            "create account ssh key",
-        )?;
-        if value
-            .get("success")
-            .and_then(Value::as_bool)
-            .is_some_and(|success| !success)
-        {
-            bail!(
-                "Failed to create account ssh key: {}",
-                value
-                    .get("msg")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("error").and_then(Value::as_str))
-                    .unwrap_or("unknown create account ssh key error")
-            );
-        }
-        value
-            .get("key")
-            .and_then(|key| key.get("id"))
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow!("create account ssh key response did not contain a key id"))
-    }
-
-    fn ensure_account_ssh_key(&self, ssh_key: &str) -> Result<bool> {
-        let target = ssh_key.trim();
-        if target.is_empty() {
-            bail!("SSH key cannot be empty.");
-        }
-        if self
-            .list_account_ssh_keys()?
-            .iter()
-            .any(|candidate| candidate.key.trim() == target)
-        {
-            return Ok(false);
-        }
-        let _ = self.create_account_ssh_key(target)?;
-        Ok(true)
-    }
-
-    fn delete_account_ssh_key(&self, ssh_key_id: u64) -> Result<()> {
-        let value = self.delete_json(
-            &format!("/api/v0/ssh/{ssh_key_id}/"),
-            "delete account ssh key",
-        )?;
-        if value
-            .get("success")
-            .and_then(Value::as_bool)
-            .is_some_and(|success| !success)
-        {
-            bail!(
-                "Failed to delete account ssh key {ssh_key_id}: {}",
-                value
-                    .get("msg")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("error").and_then(Value::as_str))
-                    .unwrap_or("unknown delete account ssh key error")
-            );
-        }
-        Ok(())
     }
 
     fn request_logs(
@@ -716,6 +639,46 @@ impl VastClient {
                 ))
                 .json(body),
         )
+    }
+
+    fn ssh_permissions_rejected(&self, id: u64, deadline: Instant) -> Result<bool> {
+        let timeout = || -> Result<Duration> {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                bail!("Provider log diagnostic timed out");
+            }
+            Ok(left)
+        };
+        // sshd runs in the container: daemon system logs are a different source.
+        let response = self
+            .build_logs_request(id, &json!({"tail": 200}))
+            .timeout(timeout()?)
+            .send()?;
+        let parsed: VastLogsResponse = serde_json::from_value(parse_json_response(
+            response,
+            "request SSH diagnostic logs",
+        )?)?;
+        if parsed.success == Some(false) {
+            bail!("Provider rejected log diagnostic request");
+        }
+        let url = parsed
+            .result_url
+            .filter(|url| !url.trim().is_empty())
+            .ok_or_else(|| anyhow!("Provider did not return a log artifact URL"))?;
+        loop {
+            let response = self.http.get(&url).timeout(timeout()?).send()?;
+            if response.status().is_success() {
+                let mut bytes = Vec::new();
+                response.take(128 * 1024).read_to_end(&mut bytes)?;
+                return Ok(ssh::logs_reject_permissions(&String::from_utf8_lossy(
+                    &bytes,
+                )));
+            }
+            if !matches!(response.status().as_u16(), 403 | 404) {
+                bail!("Provider log artifact unavailable");
+            }
+            thread::sleep(Duration::from_millis(250).min(timeout()?));
+        }
     }
 
     fn wait_for_log_download(&self, url: &str, timeout: Duration) -> Result<String> {
@@ -816,6 +779,7 @@ impl CloudInstance for VastInstance {
             "gpu_model": self.gpu_name, "hourly_usd": self.dph_total,
             "image": self.image.as_ref().or(self.image_uuid.as_ref()),
             "ssh_host": self.ssh_host, "ssh_port": self.ssh_port,
+            "ssh_endpoints": ssh::endpoints(self),
             "contract_end_unix": self.end_date,
             "workload": crate::output::workload(self.workload.as_ref()),
         })
@@ -1027,9 +991,13 @@ impl CommandProvider for Provider {
         if matches!(
             instance.workload.as_ref(),
             Some(InstanceWorkload::Unpack(_))
-        ) {
-            if args.filter.is_some() || args.daemon {
-                bail!("`ice logs` filter/daemon flags are not supported for `unpack` workloads.");
+        ) && !args.daemon
+            && !args.provider_logs
+        {
+            if args.filter.is_some() {
+                bail!(
+                    "`ice logs --filter` requires --provider-logs or --daemon for Vast unpack workloads."
+                );
             }
             return stream_unpack_logs_with_auto_key(&client, &instance, args.tail, args.follow);
         }
@@ -1054,6 +1022,15 @@ impl CommandProvider for Provider {
             );
         }
 
+        if args.no_probe {
+            return print_reported_connection(&instance);
+        }
+        if args.preserve_ephemeral {
+            print_warning(
+                "--preserve-ephemeral is no longer needed: Vast SSH recovery only attaches an existing key to the selected instance.",
+            );
+        }
+
         if instance.is_stopped() {
             crate::automation::require_running(instance.id)?;
             if !prompt_confirm("Instance is stopped. Start it before opening shell?", true)? {
@@ -1072,16 +1049,13 @@ impl CommandProvider for Provider {
             )?;
         }
 
-        instance = wait_for_ssh_ready(&client, instance.id, crate::automation::startup_timeout())?;
+        if !instance.is_running() || ssh::endpoints(&instance).is_empty() {
+            instance =
+                wait_for_ssh_ready(&client, instance.id, crate::automation::startup_timeout())?;
+        }
         let remote_command = shell_remote_command(&instance);
         if args.print_creds {
-            print_shell_command_with_auto_key(
-                &client,
-                &instance,
-                remote_command.as_deref(),
-                args.preserve_ephemeral,
-                crate::output::is_json(),
-            )
+            print_shell_command_with_auto_key(&client, &instance, remote_command.as_deref())
         } else if let Some(remote_command) = remote_command.as_deref() {
             open_remote_shell_with_auto_key(
                 &client,
@@ -1610,22 +1584,35 @@ pub(crate) fn wait_for_ssh_ready(
         if let Some(mut instance) = client.get_instance(instance_id)? {
             hydrate_instance_workload(&mut instance);
             upsert_instance::<CacheModel>(&instance);
-            if instance.is_running()
-                && instance.ssh_host.as_deref().is_some()
-                && instance.ssh_port.is_some()
-            {
-                let (host, port) = ssh_target(&instance)?;
-                match crate::support::tcp_port_open(&host, port, Duration::from_secs(3)) {
-                    Ok(()) => {
-                        spinner
-                            .finish_with_message(format!("Instance {instance_id} is SSH-ready."));
-                        return Ok(instance);
-                    }
-                    Err(err) => {
-                        last_issue =
-                            Some(format!("{host}:{port} not accepting connections ({err})"));
+            let endpoints = ssh::endpoints(&instance);
+            if instance.is_running() && !endpoints.is_empty() {
+                // Preserve creation's reachable-port readiness check, but allow
+                // a reported direct endpoint to establish readiness if a relay
+                // is unavailable. Already-running shell commands go straight to
+                // the bounded SSH recovery path instead of this startup wait.
+                for endpoint in endpoints {
+                    match crate::support::tcp_port_open(
+                        &endpoint.host,
+                        endpoint.port,
+                        Duration::from_secs(3),
+                    ) {
+                        Ok(()) => {
+                            spinner.finish_with_message(format!(
+                                "Instance {instance_id} has a reachable SSH port."
+                            ));
+                            return Ok(instance);
+                        }
+                        Err(err) => {
+                            last_issue = Some(format!(
+                                "{}:{} ({}) not accepting connections ({err})",
+                                endpoint.host, endpoint.port, endpoint.kind
+                            ))
+                        }
                     }
                 }
+            } else {
+                last_issue =
+                    Some("Instance is not running or has no reported SSH endpoint".to_owned());
             }
             spinner.set_message(format!(
                 "Waiting for instance {instance_id} to be running with SSH... {}",
@@ -1710,18 +1697,11 @@ pub(crate) fn open_remote_shell_with_auto_key(
     client: &VastClient,
     instance: &VastInstance,
     remote_command: Option<&str>,
-    preserve_ephemeral: bool,
+    _preserve_ephemeral: bool,
 ) -> Result<()> {
-    with_auto_key_behavior(
-        client,
-        instance,
-        if preserve_ephemeral {
-            TemporaryKeyBehavior::Preserve
-        } else {
-            TemporaryKeyBehavior::Cleanup
-        },
-        |identity| run_ssh_command(instance, identity, remote_command, true),
-    )
+    with_ssh_access(client, instance, |connection| {
+        run_ssh_command(connection, remote_command, true)
+    })
 }
 
 fn shell_remote_command(instance: &VastInstance) -> Option<String> {
@@ -1732,71 +1712,67 @@ fn shell_remote_command(instance: &VastInstance) -> Option<String> {
     .then(|| unpack_shell_remote_command(&remote_unpack_dir_for_vast(instance)))
 }
 
+fn reported_connection(instance: &VastInstance) -> Result<Value> {
+    let endpoints = ssh::endpoints(instance);
+    let Some(endpoint) = endpoints.first() else {
+        return Err(crate::automation::error(
+            "ssh_endpoint_unavailable",
+            "Vast has not reported an SSH endpoint for this instance.",
+            json!({"instance_id": instance.id.to_string(), "readiness": "unchecked"}),
+        ));
+    };
+    let command =
+        ssh::connection_command(endpoint, None, shell_remote_command(instance).as_deref());
+    Ok(json!({
+        "instance": instance.json_summary(), "connect_command": command,
+        "readiness": "unchecked", "endpoint": endpoint,
+        "endpoints": endpoints,
+    }))
+}
+
+fn print_reported_connection(instance: &VastInstance) -> Result<()> {
+    let result = reported_connection(instance)?;
+    if crate::output::is_json() {
+        return crate::output::emit("shell", Cloud::VastAi, result);
+    }
+    eprintln!("Reported connection only; readiness and credentials have not been checked.");
+    println!("{}", result["connect_command"].as_str().unwrap());
+    for alternate in ssh::endpoints(instance).iter().skip(1) {
+        eprintln!(
+            "Alternative ({}): {}",
+            alternate.kind,
+            ssh::connection_command(alternate, None, shell_remote_command(instance).as_deref())
+        );
+    }
+    Ok(())
+}
+
 fn print_shell_command_with_auto_key(
     client: &VastClient,
     instance: &VastInstance,
     remote_command: Option<&str>,
-    preserve_ephemeral: bool,
-    json: bool,
 ) -> Result<()> {
-    let command =
-        shell_command_with_auto_key(client, instance, remote_command, preserve_ephemeral, json)?;
-    if json {
-        return crate::output::connection(Cloud::VastAi, instance.json_summary(), &command);
+    let connection = ssh::connect(client, instance)?;
+    let command = connection.command(remote_command);
+    if crate::output::is_json() {
+        return crate::output::emit(
+            "shell",
+            Cloud::VastAi,
+            json!({
+                "instance": instance.json_summary(), "connect_command": command,
+                "readiness": "verified", "endpoint": connection.endpoint,
+                "ssh": connection.diagnostics,
+            }),
+        );
     }
     println!("{command}");
     Ok(())
 }
 
-fn shell_command_with_auto_key(
-    client: &VastClient,
-    instance: &VastInstance,
-    remote_command: Option<&str>,
-    preserve_ephemeral: bool,
-    quiet_probe: bool,
-) -> Result<String> {
-    with_auto_key_behavior(
-        client,
-        instance,
-        if preserve_ephemeral {
-            TemporaryKeyBehavior::Preserve
-        } else {
-            TemporaryKeyBehavior::Reject
-        },
-        |identity| {
-            if quiet_probe {
-                let (host, port) = ssh_target(instance)?;
-                wait_for_ssh_port_preflight(instance.id, &host, port, Duration::from_secs(30))?;
-                let output = Command::new("ssh")
-                    .args(ssh_args(&host, port, identity))
-                    .arg("true")
-                    .stdin(if crate::automation::non_interactive() {
-                        std::process::Stdio::null()
-                    } else {
-                        std::process::Stdio::inherit()
-                    })
-                    .stderr(std::process::Stdio::inherit())
-                    .output()
-                    .context("Failed to run ssh readiness check")?;
-                if !output.status.success() {
-                    bail!("ssh exited with status {}", output.status);
-                }
-            } else {
-                run_ssh_command(instance, identity, Some("true"), false)?;
-            }
-            let (host, port) = ssh_target(instance)?;
-            let mut args = ssh_args(&host, port, identity);
-            if let Some(remote_command) = remote_command {
-                args.push("-t".to_owned());
-                args.push(remote_command.to_owned());
-            }
-            Ok(render_command_line("ssh", args))
-        },
-    )
-}
-
 pub(crate) fn ensure_instance_has_ssh(instance: &VastInstance) -> Result<()> {
-    let _ = ssh_target(instance)?;
+    if ssh::endpoints(instance).is_empty() {
+        bail!("Instance {} has no reported SSH endpoint", instance.id);
+    }
     Ok(())
 }
 
@@ -1806,15 +1782,9 @@ pub(crate) fn run_download_with_auto_key(
     remote_path: &str,
     local_path: Option<&Path>,
 ) -> Result<()> {
-    let (host, port) = ssh_target(instance)?;
-    with_auto_key(client, instance, |identity| {
+    with_ssh_access(client, instance, |connection| {
         run_rsync_download(
-            RemoteAccess {
-                user: "root",
-                host: &host,
-                port: Some(port),
-                identity_file: identity,
-            },
+            connection.access(),
             remote_path,
             local_path,
             &format!("download from vast.ai instance {}", instance.id),
@@ -1828,15 +1798,9 @@ pub(crate) fn run_upload_with_auto_key(
     local_path: &Path,
     remote_path: Option<&str>,
 ) -> Result<()> {
-    let (host, port) = ssh_target(instance)?;
-    with_auto_key(client, instance, |identity| {
+    with_ssh_access(client, instance, |connection| {
         run_rsync_upload_path(
-            RemoteAccess {
-                user: "root",
-                host: &host,
-                port: Some(port),
-                identity_file: identity,
-            },
+            connection.access(),
             local_path,
             remote_path,
             &format!("upload to vast.ai instance {}", instance.id),
@@ -1879,8 +1843,8 @@ pub(crate) fn stream_unpack_logs_with_auto_key(
 ) -> Result<()> {
     let remote_command =
         unpack_logs_remote_command(&remote_unpack_dir_for_vast(instance), tail, follow);
-    with_auto_key(client, instance, |identity| {
-        run_ssh_command(instance, identity, Some(&remote_command), false)
+    with_ssh_access(client, instance, |connection| {
+        run_ssh_command(connection, Some(&remote_command), false)
     })
 }
 
@@ -1935,33 +1899,21 @@ pub(crate) fn deploy_unpack(
     ));
     let bundle = materialize_unpack_bundle(config, source)?;
     let remote_dir = remote_unpack_dir_for_vast(instance);
-    let result = (|| {
+    let result = with_ssh_access(client, instance, |connection| {
         let prepare = unpack_prepare_remote_dir_command(&remote_dir);
         print_stage("Preparing remote unpack directory");
-        with_auto_key(client, instance, |identity| {
-            run_ssh_command(instance, identity, Some(&prepare), false)
-        })?;
-        let (host, port) = ssh_target(instance)?;
+        run_ssh_command(connection, Some(&prepare), false)?;
         print_stage("Uploading unpack bundle");
-        with_auto_key(client, instance, |identity| {
-            run_rsync_upload(
-                RemoteAccess {
-                    user: "root",
-                    host: &host,
-                    port: Some(port),
-                    identity_file: identity,
-                },
-                &bundle.root,
-                &remote_dir,
-                &format!("upload unpack bundle to vast.ai instance {}", instance.id),
-            )
-        })?;
+        run_rsync_upload(
+            connection.access(),
+            &bundle.root,
+            &remote_dir,
+            &format!("upload unpack bundle to vast.ai instance {}", instance.id),
+        )?;
         let start = unpack_start_remote_command(&remote_dir);
         print_stage("Starting unpack workload");
-        with_auto_key(client, instance, |identity| {
-            run_ssh_command(instance, identity, Some(&start), false)
-        })
-    })();
+        run_ssh_command(connection, Some(&start), false)
+    });
     let _ = fs::remove_dir_all(&bundle.root);
     result
 }
@@ -2226,449 +2178,44 @@ fn parse_instance_from_value(value: &Value) -> Result<Option<VastInstance>> {
 }
 
 fn run_ssh_command(
-    instance: &VastInstance,
-    identity_file: Option<&Path>,
+    connection: &ssh::Connection,
     remote_command: Option<&str>,
     allocate_tty: bool,
 ) -> Result<()> {
-    let (host, port) = ssh_target(instance)?;
-    wait_for_ssh_port_preflight(instance.id, &host, port, Duration::from_secs(30))?;
-
     let mut command = Command::new("ssh");
     crate::automation::prepare_command(&mut command);
-    command.args(ssh_args(&host, port, identity_file));
+    command.args(ssh_args(
+        &connection.endpoint.host,
+        connection.endpoint.port,
+        connection.identity.as_deref(),
+    ));
     if let Some(remote_command) = remote_command {
         if allocate_tty {
             command.arg("-t");
         }
         command.arg(remote_command);
     }
-
     if crate::output::streaming_logs() {
         return crate::output::run_log_command(&mut command, "stream vast.ai unpack logs");
     }
-    let status = if crate::output::is_json() {
-        // Capture deployment stdout while preserving diagnostics and the SSH
-        // status wording used by the existing automatic-key retry logic.
-        command
-            .stdin(if crate::automation::non_interactive() {
-                std::process::Stdio::null()
-            } else {
-                std::process::Stdio::inherit()
-            })
-            .stderr(std::process::Stdio::inherit())
-            .output()
-            .map(|output| output.status)
-    } else {
-        command.status()
+    // Preserve the interactive shell's terminal and stream human output. JSON
+    // deployment output must not precede the final machine-readable document.
+    if crate::output::is_json() {
+        command.stdout(std::process::Stdio::null());
     }
-    .with_context(|| format!("Failed to run ssh into instance {}", instance.id))?;
-    if !status.success() {
-        bail!("ssh exited with status {status}");
-    }
-    Ok(())
+    let status = command
+        .status()
+        .context("Failed to run SSH operation on vast.ai instance")?;
+    ssh::command_status(status)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TemporaryKeyBehavior {
-    Cleanup,
-    Preserve,
-    Reject,
-}
-
-fn with_auto_key<T, F>(client: &VastClient, instance: &VastInstance, action: F) -> Result<T>
-where
-    F: FnMut(Option<&Path>) -> Result<T>,
-{
-    with_auto_key_behavior(client, instance, TemporaryKeyBehavior::Cleanup, action)
-}
-
-fn with_auto_key_behavior<T, F>(
+fn with_ssh_access<T>(
     client: &VastClient,
     instance: &VastInstance,
-    temporary_key_behavior: TemporaryKeyBehavior,
-    mut action: F,
-) -> Result<T>
-where
-    F: FnMut(Option<&Path>) -> Result<T>,
-{
-    match action(None) {
-        Ok(value) => Ok(value),
-        Err(first_err) => {
-            let first_err_text = format!("{first_err:#}");
-            if !should_retry_with_auto_key(&first_err_text) {
-                return Err(first_err);
-            }
-            print_stage("SSH access failed with existing keys; attaching a local SSH key");
-            let Some((identity, attach_status)) =
-                attach_local_ssh_key_to_instance(client, instance.id)?
-            else {
-                return Err(first_err.context(
-                    "Initial SSH attempt failed, and no local SSH keypair was found in `~/.ssh` to attach to this instance.",
-                ));
-            };
-
-            if let Ok(value) = retry_with_identity(
-                &mut action,
-                None,
-                AUTO_KEY_RETRY_ATTEMPTS,
-                AUTO_KEY_RETRY_DELAY,
-            ) {
-                return Ok(value);
-            }
-            if let Ok(value) = retry_with_identity(
-                &mut action,
-                Some(identity.as_path()),
-                AUTO_KEY_RETRY_ATTEMPTS,
-                AUTO_KEY_RETRY_DELAY,
-            ) {
-                return Ok(value);
-            }
-
-            print_stage("Syncing the local SSH key to the Vast account");
-            let account_identity = ensure_local_ssh_key_on_account(client)?;
-            if let Ok(value) = retry_with_identity(
-                &mut action,
-                None,
-                AUTO_KEY_RETRY_ATTEMPTS,
-                AUTO_KEY_RETRY_DELAY,
-            ) {
-                return Ok(value);
-            }
-
-            let final_identity = account_identity.as_deref().unwrap_or(identity.as_path());
-            if let Ok(value) = retry_with_identity(
-                &mut action,
-                Some(final_identity),
-                AUTO_KEY_RETRY_ATTEMPTS,
-                AUTO_KEY_RETRY_DELAY,
-            ) {
-                return Ok(value);
-            }
-
-            if temporary_key_behavior == TemporaryKeyBehavior::Reject {
-                let attach_hint = match attach_status {
-                    InstanceSshKeyAttachStatus::Attached => "The key attach call succeeded.",
-                    InstanceSshKeyAttachStatus::AlreadyAssociated => {
-                        "Vast reports an SSH key is already associated with this instance."
-                    }
-                };
-                return Err(first_err.context(format!(
-                    concat!(
-                        "Initial SSH attempt failed: {}. Retried with instance-level key attach ",
-                        "and account-level key sync, but printing SSH credentials would now ",
-                        "require a temporary Vast account key. Re-run with ",
-                        "`--preserve-ephemeral` to keep that key after `ice shell` exits. ",
-                        "Local key: `{}`. {}"
-                    ),
-                    first_err_text,
-                    identity.display(),
-                    attach_hint
-                )));
-            }
-
-            print_stage("Installing a temporary Vast RSA SSH key");
-            let temp_key = TemporarySshKey::generate()?;
-            let temp_key_id = client
-                .create_account_ssh_key(&temp_key.public_key)
-                .context("Failed to create temporary vast.ai account SSH key")?;
-            let temp_result = retry_with_identity(
-                &mut action,
-                Some(temp_key.private_key_path.as_path()),
-                AUTO_KEY_RETRY_ATTEMPTS,
-                AUTO_KEY_RETRY_DELAY,
-            );
-            match temp_result {
-                Ok(value) => {
-                    if temporary_key_behavior == TemporaryKeyBehavior::Preserve {
-                        let preserved_key_path = temp_key
-                            .preserve()
-                            .context("Failed to preserve temporary vast.ai SSH key locally")?;
-                        print_warning(&format!(
-                            concat!(
-                                "Preserved temporary vast.ai SSH key at `{}`. ",
-                                "It remains installed on your vast.ai account until you remove it."
-                            ),
-                            preserved_key_path.display()
-                        ));
-                        return Ok(value);
-                    }
-
-                    if let Err(err) = client.delete_account_ssh_key(temp_key_id) {
-                        print_warning(&format!(
-                            "Failed to delete temporary vast.ai account SSH key {temp_key_id}: {err:#}"
-                        ));
-                    }
-                    Ok(value)
-                }
-                Err(err) => {
-                    if let Err(delete_err) = client.delete_account_ssh_key(temp_key_id) {
-                        print_warning(&format!(
-                            "Failed to delete temporary vast.ai account SSH key {temp_key_id}: {delete_err:#}"
-                        ));
-                    }
-                    Err(err).with_context(|| {
-                        let attach_hint = match attach_status {
-                            InstanceSshKeyAttachStatus::Attached => {
-                                "The key attach call succeeded."
-                            }
-                            InstanceSshKeyAttachStatus::AlreadyAssociated => {
-                                "Vast reports an SSH key is already associated with this instance."
-                            }
-                        };
-                        format!(
-                            "Initial SSH attempt failed: {first_err_text}. Retried with instance-level key attach, account-level key sync, and finally a temporary RSA account key, but authentication still failed. Local key: `{}`. {attach_hint}",
-                            identity.display()
-                        )
-                    })
-                }
-            }
-        }
-    }
-}
-
-const AUTO_KEY_RETRY_ATTEMPTS: usize = 8;
-const AUTO_KEY_RETRY_DELAY: Duration = Duration::from_secs(3);
-
-struct TemporarySshKey {
-    dir: PathBuf,
-    private_key_path: PathBuf,
-    public_key: String,
-}
-
-impl TemporarySshKey {
-    fn generate() -> Result<Self> {
-        let dir = std::env::temp_dir().join(format!(
-            "ice-vast-key-{}-{}",
-            std::process::id(),
-            now_unix_secs()
-        ));
-        fs::create_dir(&dir)
-            .with_context(|| format!("Failed to create temporary key dir {}", dir.display()))?;
-        let private_key_path = dir.join("id_rsa");
-        let mut command = Command::new("ssh-keygen");
-        command
-            .args([
-                "-q",
-                "-t",
-                "rsa",
-                "-b",
-                "4096",
-                "-N",
-                "",
-                "-C",
-                "ice-vast-temp",
-                "-f",
-            ])
-            .arg(&private_key_path);
-        crate::automation::prepare_command(&mut command);
-        let status = command
-            .status()
-            .context("Failed to run `ssh-keygen` for temporary Vast SSH key")?;
-        if !status.success() {
-            bail!(
-                "`ssh-keygen` exited with status {status} while generating a temporary Vast SSH key."
-            );
-        }
-        let public_key_path = private_key_path.with_extension("pub");
-        let public_key = fs::read_to_string(&public_key_path)
-            .with_context(|| format!("Failed to read {}", public_key_path.display()))?
-            .trim()
-            .to_owned();
-        if public_key.is_empty() {
-            bail!(
-                "Temporary Vast SSH public key at {} was empty.",
-                public_key_path.display()
-            );
-        }
-        Ok(Self {
-            dir,
-            private_key_path,
-            public_key,
-        })
-    }
-
-    fn preserve(&self) -> Result<PathBuf> {
-        let root = preserved_ephemeral_key_root_dir()?;
-        fs::create_dir_all(&root)
-            .with_context(|| format!("Failed to create {}", root.display()))?;
-        let preserved_dir = allocate_preserved_ephemeral_key_dir(&root)?;
-        let preserved_private_key_path = preserved_dir.join("id_rsa");
-        let public_key_path = self.private_key_path.with_extension("pub");
-        let preserved_public_key_path = preserved_private_key_path.with_extension("pub");
-
-        fs::copy(&self.private_key_path, &preserved_private_key_path).with_context(|| {
-            format!(
-                "Failed to copy {} to {}",
-                self.private_key_path.display(),
-                preserved_private_key_path.display()
-            )
-        })?;
-        fs::set_permissions(
-            &preserved_private_key_path,
-            fs::metadata(&self.private_key_path)
-                .with_context(|| format!("Failed to read {}", self.private_key_path.display()))?
-                .permissions(),
-        )
-        .with_context(|| format!("Failed to set {}", preserved_private_key_path.display()))?;
-
-        fs::copy(&public_key_path, &preserved_public_key_path).with_context(|| {
-            format!(
-                "Failed to copy {} to {}",
-                public_key_path.display(),
-                preserved_public_key_path.display()
-            )
-        })?;
-        fs::set_permissions(
-            &preserved_public_key_path,
-            fs::metadata(&public_key_path)
-                .with_context(|| format!("Failed to read {}", public_key_path.display()))?
-                .permissions(),
-        )
-        .with_context(|| format!("Failed to set {}", preserved_public_key_path.display()))?;
-
-        Ok(preserved_private_key_path)
-    }
-}
-
-fn preserved_ephemeral_key_root_dir() -> Result<PathBuf> {
-    let path = runtime_provider_data_path(Cloud::VastAi, "ephemeral-ssh")?;
-    Ok(path)
-}
-
-fn allocate_preserved_ephemeral_key_dir(root: &Path) -> Result<PathBuf> {
-    let timestamp = now_unix_secs();
-    let pid = std::process::id();
-    for attempt in 0..256 {
-        let dir = root.join(format!("key-{timestamp}-{pid}-{attempt}"));
-        match fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("Failed to create {}", dir.display()));
-            }
-        }
-    }
-    bail!(
-        "Failed to allocate a preserved ephemeral SSH key directory in {}.",
-        root.display()
-    );
-}
-
-impl Drop for TemporarySshKey {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-fn retry_with_identity<T, F>(
-    action: &mut F,
-    identity: Option<&Path>,
-    attempts: usize,
-    delay: Duration,
-) -> Result<T>
-where
-    F: FnMut(Option<&Path>) -> Result<T>,
-{
-    let mut last_error = None;
-    for attempt in 0..attempts {
-        match action(identity) {
-            Ok(value) => return Ok(value),
-            Err(err) => {
-                let error_text = format!("{err:#}");
-                if !should_retry_with_auto_key(&error_text) || attempt + 1 == attempts {
-                    return Err(err);
-                }
-                last_error = Some(err);
-                thread::sleep(delay);
-            }
-        }
-    }
-    Err(last_error.expect("retry_with_identity must record an error before exhausting attempts"))
-}
-
-fn should_retry_with_auto_key(error_text: &str) -> bool {
-    [
-        "Permission denied",
-        "permission denied",
-        "publickey",
-        "connection refused",
-        "Connection refused",
-        "Connection reset",
-        "No route to host",
-        "timed out",
-        "ssh exited with status exit status: 255",
-        "command exited with status exit status: 255",
-        "Failed to run ssh",
-    ]
-    .iter()
-    .any(|needle| error_text.contains(needle))
-}
-
-fn wait_for_ssh_port_preflight(
-    instance_id: u64,
-    host: &str,
-    port: u16,
-    timeout: Duration,
-) -> Result<()> {
-    let start = SystemTime::now();
-    let mut last_error = None;
-    loop {
-        if elapsed_since(start)? >= timeout {
-            bail!(
-                "SSH endpoint for instance {instance_id} is not accepting connections yet ({host}:{port}). Last issue: {}",
-                last_error.unwrap_or_else(|| "unknown network error".to_owned())
-            );
-        }
-
-        match crate::support::tcp_port_open(host, port, Duration::from_secs(3)) {
-            Ok(()) => return Ok(()),
-            Err(err) => last_error = Some(err.to_string()),
-        }
-
-        thread::sleep(Duration::from_secs(2));
-    }
-}
-
-fn attach_local_ssh_key_to_instance(
-    client: &VastClient,
-    instance_id: u64,
-) -> Result<Option<(PathBuf, InstanceSshKeyAttachStatus)>> {
-    let Some((private_key_path, public_key)) = discover_local_ssh_keypair()? else {
-        return Ok(None);
-    };
-    Ok(Some((
-        private_key_path,
-        client
-            .attach_instance_ssh_key(instance_id, &public_key)
-            .with_context(|| {
-                format!("Failed to attach local SSH key to vast.ai instance {instance_id}")
-            })?,
-    )))
-}
-
-fn ensure_local_ssh_key_on_account(client: &VastClient) -> Result<Option<PathBuf>> {
-    let Some((private_key_path, public_key)) = discover_local_ssh_keypair()? else {
-        return Ok(None);
-    };
-    client
-        .ensure_account_ssh_key(&public_key)
-        .context("Failed to ensure local SSH key is present on vast.ai account")?;
-    Ok(Some(private_key_path))
-}
-
-fn ssh_target(instance: &VastInstance) -> Result<(String, u16)> {
-    let host = instance
-        .ssh_host
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("Instance {} has no ssh_host", instance.id))?
-        .to_owned();
-    let port = instance
-        .ssh_port
-        .ok_or_else(|| anyhow!("Instance {} has no ssh_port", instance.id))?;
-    Ok((host, port))
+    action: impl FnOnce(&ssh::Connection) -> Result<T>,
+) -> Result<T> {
+    let connection = ssh::connect(client, instance)?;
+    ssh::operation(&connection, action)
 }
 
 fn workload_completed(instance: &VastInstance) -> bool {
@@ -2738,6 +2285,38 @@ fn remaining_hours_display(
         "{:.2}h",
         remaining_hours(instance, scheduled_termination_unix).max(0.0)
     )
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[test]
+    fn unchecked_details_allow_stopped_instances_and_require_no_ssh_identity() {
+        let instance: VastInstance = serde_json::from_value(json!({
+            "id": 42, "label": "ice-test", "cur_state": "stopped", "image_runtype": "ssh",
+            "ssh_host": "ssh1.vast.ai", "ssh_port": 1234,
+            "public_ipaddr": "203.0.113.42", "ports": {"22/tcp": [{"HostPort": "4321"}]}
+        }))
+        .unwrap();
+        let details = reported_connection(&instance).unwrap();
+        assert_eq!(details["readiness"], "unchecked");
+        assert_eq!(details["instance"]["state"], "stopped");
+        assert_eq!(details["endpoints"][1]["port"], 4321);
+        assert!(details.get("ssh").is_none());
+        let command = details["connect_command"].as_str().unwrap();
+        assert!(command.contains("root@ssh1.vast.ai"));
+        assert!(!command.contains(" -i "));
+    }
+
+    #[test]
+    fn missing_reported_endpoint_is_an_error_instead_of_an_invented_command() {
+        let instance: VastInstance = serde_json::from_value(json!({"id": 42})).unwrap();
+        let err = reported_connection(&instance).unwrap_err();
+        let typed = err.downcast_ref::<crate::automation::AgentError>().unwrap();
+        assert_eq!(typed.code, "ssh_endpoint_unavailable");
+        assert_eq!(typed.details["readiness"], "unchecked");
+    }
 }
 
 #[cfg(test)]
