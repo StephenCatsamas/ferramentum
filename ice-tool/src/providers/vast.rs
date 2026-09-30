@@ -48,6 +48,7 @@ use crate::workload::{
 
 const VAST_BASE_URL: &str = "https://console.vast.ai";
 
+mod autostop;
 mod ssh;
 
 #[derive(Debug, Deserialize)]
@@ -97,8 +98,6 @@ pub(crate) struct VastOffer {
 struct VastHourlyBreakdown {
     #[serde(default, rename = "totalHour")]
     total_hour: Option<f64>,
-    #[serde(default, rename = "discountedTotalPerHour")]
-    discounted_total_per_hour: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,8 +171,10 @@ pub(crate) struct VastInstance {
     pub(crate) workload: Option<InstanceWorkload>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct VastScheduledJob {
+    #[serde(default)]
+    pub(crate) id: Option<u64>,
     #[serde(default)]
     pub(crate) instance_id: Option<u64>,
     #[serde(default)]
@@ -184,6 +185,20 @@ pub(crate) struct VastScheduledJob {
     pub(crate) request_body: Option<Value>,
     #[serde(default)]
     pub(crate) start_time: Option<f64>,
+    #[serde(default)]
+    pub(crate) end_time: Option<f64>,
+    #[serde(default)]
+    pub(crate) frequency: Option<String>,
+    #[serde(default)]
+    pub(crate) day_of_the_week: Option<u32>,
+    #[serde(default)]
+    pub(crate) hour_of_the_day: Option<u32>,
+    #[serde(default)]
+    pub(crate) min_of_the_hour: Option<u32>,
+    #[serde(default)]
+    pub(crate) last_executed_around: Option<f64>,
+    #[serde(default)]
+    pub(crate) status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,25 +268,16 @@ pub(crate) struct CacheStore {
 
 impl VastOffer {
     pub(crate) fn hourly_price(&self) -> f64 {
-        if let Some(value) = self.dph_total {
-            return value;
-        }
-        if let Some(search) = &self.search {
-            if let Some(value) = search.total_hour {
-                return value;
-            }
-            if let Some(value) = search.discounted_total_per_hour {
-                return value;
-            }
-        }
-        f64::INFINITY
+        // Search is made with the same allocated_storage as the create request.
+        // Do not fall back to an ambiguous base rate or a reserved-price discount.
+        self.quoted_total_hourly_price().unwrap_or(f64::INFINITY)
     }
 
     pub(crate) fn quoted_total_hourly_price(&self) -> Option<f64> {
         self.search
             .as_ref()
             .and_then(|quote| quote.total_hour)
-            .filter(|price| price.is_finite() && *price >= 0.0)
+            .filter(|price| price.is_finite() && *price > 0.0)
     }
 
     pub(crate) fn gpu_name(&self) -> &str {
@@ -405,17 +411,7 @@ impl VastClient {
 
     fn list_scheduled_jobs(&self) -> Result<Vec<VastScheduledJob>> {
         let value = self.get_json("/api/v0/commands/schedule_job/", "list scheduled jobs")?;
-        let rows = if let Some(rows) = value.as_array() {
-            rows.clone()
-        } else if let Some(rows) = value.get("results").and_then(Value::as_array) {
-            rows.clone()
-        } else {
-            Vec::new()
-        };
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| serde_json::from_value::<VastScheduledJob>(row).ok())
-            .collect())
+        autostop::parse_jobs(value)
     }
 
     fn get_instance(&self, id: u64) -> Result<Option<VastInstance>> {
@@ -501,50 +497,6 @@ impl VastClient {
                     .msg
                     .or(parsed.error)
                     .unwrap_or_else(|| "unknown delete error".to_owned())
-            );
-        }
-        Ok(())
-    }
-
-    pub(crate) fn schedule_instance_stop(
-        &self,
-        id: u64,
-        stop_at_unix: u64,
-        schedule_end_unix: u64,
-    ) -> Result<()> {
-        if schedule_end_unix <= stop_at_unix {
-            bail!(
-                "Invalid auto-stop schedule for instance {id}: end ({schedule_end_unix}) must be greater than stop time ({stop_at_unix})."
-            );
-        }
-
-        let value = self.post_json(
-            "/api/v0/commands/schedule_job/",
-            &json!({
-                "start_time": stop_at_unix as f64,
-                "end_time": schedule_end_unix as f64,
-                "api_endpoint": format!("/api/v0/instances/{id}/"),
-                "request_method": "PUT",
-                "request_body": { "state": "stopped" },
-                "day_of_the_week": Value::Null,
-                "hour_of_the_day": Value::Null,
-                "frequency": "HOURLY",
-                "instance_id": id
-            }),
-            "schedule vast.ai instance auto-stop",
-        )?;
-        if value
-            .get("success")
-            .and_then(Value::as_bool)
-            .is_some_and(|success| !success)
-        {
-            bail!(
-                "Failed to schedule instance auto-stop: {}",
-                value
-                    .get("msg")
-                    .and_then(Value::as_str)
-                    .or_else(|| value.get("error").and_then(Value::as_str))
-                    .unwrap_or("unknown schedule error")
             );
         }
         Ok(())
@@ -1126,6 +1078,8 @@ impl CreateProvider for Provider {
     fn create(config: &mut IceConfig, args: &CreateArgs) -> Result<()> {
         let client = client_from_config(config)?;
         let hours = resolve_deploy_hours(config, args.hours)?;
+        // Reject unsupported schedule windows before accepting a paid offer.
+        build_vast_autostop_plan(now_unix_secs(), hours)?;
         let workload = resolve_deploy_workload(&args.target_request())?;
         let label = build_cloud_instance_name(&collect_existing_visible_names(&client)?)?;
         let create_body = build_create_request(config, &label, &workload)?;
@@ -1140,27 +1094,30 @@ impl CreateProvider for Provider {
         }
 
         let mut rejected_offer_ids = HashSet::new();
-        let (instance_id, selected_offer, mut selected_cost) = loop {
+        let (instance_id, selected_offer, mut selected_cost, available_until) = loop {
             crate::selection::record(&search);
+            let planning_start = now_unix_secs();
+            let plan = build_vast_autostop_plan(planning_start, hours)?;
             let offer = find_cheapest_offer(
                 &client,
                 &search,
-                hours,
+                plan.runtime_hours,
                 args.machine.as_deref(),
                 &rejected_offer_ids,
             )?;
             let price = offer.hourly_price();
+            let available_until =
+                planning_start.saturating_add(offer.duration.unwrap_or(0.0) as u64);
             if !price.is_finite() {
                 bail!("Vast returned an offer without usable hourly price.");
             }
-            let cost = apply_vast_autostop_cost_estimate(estimate_runtime_cost(
-                Cloud::VastAi,
-                price,
-                hours,
-            )?)?;
+            let cost = apply_vast_autostop_cost_estimate(
+                estimate_runtime_cost(Cloud::VastAi, price, hours)?,
+                planning_start,
+            )?;
 
             if !crate::output::is_json() {
-                print_offer_summary(&offer, &cost, &search);
+                print_offer_summary(&offer, &cost, &search, plan.stop_at_unix);
             }
 
             if cost.hourly_usd > search.max_price_per_hr {
@@ -1187,7 +1144,6 @@ impl CreateProvider for Provider {
 
             if args.dry_run {
                 if crate::output::is_json() {
-                    let stop = build_vast_autostop_plan(now_unix_secs(), hours)?;
                     return crate::output::emit(
                         "create",
                         Cloud::VastAi,
@@ -1195,11 +1151,14 @@ impl CreateProvider for Provider {
                             "status": "preview", "dry_run": true,
                             "offer": crate::output::vast_offer(&offer),
                             "cost": crate::output::cost(&cost),
-                            "cost_scope": "provider_rate",
+                            "cost_scope": "compute_and_allocated_storage",
+                            "bandwidth_included": false,
                             "quoted_total_hourly_usd": offer.quoted_total_hourly_price(),
                             "allocated_disk_gb": config.default.vast_ai.disk_gb.unwrap_or(VAST_DEFAULT_DISK_GB as u32),
                             "image": create_body.get("image"),
-                            "scheduled_stop_unix": stop.stop_at_unix,
+                            "scheduled_stop_unix": plan.stop_at_unix,
+                            "auto_stop": {"verification": "planned", "frequency": "WEEKLY"},
+                            "storage_charges_continue_after_stop": true,
                             "workload": crate::output::workload(Some(&workload)),
                         }),
                     );
@@ -1258,7 +1217,7 @@ impl CreateProvider for Provider {
                             );
                             create_spinner
                                 .finish_with_message(format!("Created instance {instance_id}."));
-                            break (instance_id, offer, cost);
+                            break (instance_id, offer, cost, available_until);
                         }
                         Err(err) => {
                             create_spinner.finish_and_clear();
@@ -1288,26 +1247,18 @@ impl CreateProvider for Provider {
         };
 
         print_stage("Scheduling instance auto-stop");
-        let auto_stop_plan = build_vast_autostop_plan(now_unix_secs(), hours)?;
         let auto_stop_spinner = spinner("Scheduling instance auto-stop...");
-        client
-            .schedule_instance_stop(
-                instance_id,
-                auto_stop_plan.stop_at_unix,
-                auto_stop_plan.schedule_end_unix,
-            )
-            .with_context(|| {
-                format!("Failed to schedule auto-stop for vast.ai instance {instance_id}.")
-            })?;
+        let (auto_stop_plan, auto_stop_receipt) =
+            autostop::schedule(&client, instance_id, hours, available_until)?;
         auto_stop_spinner.finish_with_message(format!(
-            "Auto-stop scheduled for {} ({:.3}h planned runtime).",
+            "Auto-stop configuration verified for {} ({:.3}h planned runtime).",
             format_unix_utc(auto_stop_plan.stop_at_unix),
             auto_stop_plan.runtime_hours
         ));
 
         crate::automation::recovery(
             "waiting_for_startup",
-            json!({"scheduled_stop_unix": auto_stop_plan.stop_at_unix}),
+            json!({"scheduled_stop_unix": auto_stop_plan.stop_at_unix, "auto_stop": auto_stop_receipt}),
         );
         if crate::output::is_json() || crate::automation::non_interactive() || args.yes {
             let timeout = crate::automation::startup_timeout();
@@ -1339,11 +1290,13 @@ impl CreateProvider for Provider {
                     "status": "created", "instance": instance.json_summary(),
                     "offer": crate::output::vast_offer(&selected_offer),
                     "cost": crate::output::cost(&selected_cost),
-                    "cost_scope": "provider_rate",
+                    "cost_scope": "compute_and_allocated_storage",
+                    "bandwidth_included": false,
                     "quoted_total_hourly_usd": selected_offer.quoted_total_hourly_price(),
                     "allocated_disk_gb": config.default.vast_ai.disk_gb.unwrap_or(VAST_DEFAULT_DISK_GB as u32),
                     "image": create_body.get("image"),
                     "scheduled_stop_unix": auto_stop_plan.stop_at_unix,
+                    "auto_stop": auto_stop_receipt,
                     "storage_charges_continue_after_stop": true,
                 }),
             );
@@ -2285,6 +2238,30 @@ fn remaining_hours_display(
         "{:.2}h",
         remaining_hours(instance, scheduled_termination_unix).max(0.0)
     )
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_allocated_storage_quotes_never_fall_back_to_a_base_rate() {
+        let mut offer: VastOffer = serde_json::from_value(json!({
+            "id": 123, "dph_total": 0.01, "search": {"totalHour": 0.15}
+        }))
+        .unwrap();
+        for invalid in [
+            None,
+            Some(0.0),
+            Some(-0.1),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ] {
+            offer.search.as_mut().unwrap().total_hour = invalid;
+            assert!(offer.quoted_total_hourly_price().is_none());
+            assert!(!offer.hourly_price().is_finite());
+        }
+    }
 }
 
 #[cfg(test)]

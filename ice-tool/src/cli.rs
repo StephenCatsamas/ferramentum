@@ -241,7 +241,7 @@ pub(crate) struct CreateArgs {
     /// Clear the saved GPU model filter. Use --gpu-count 0 to require CPU-only.
     #[arg(long, conflicts_with = "gpus")]
     pub(crate) no_gpu: bool,
-    /// Override the maximum hourly price filter in USD/hr.
+    /// Maximum USD/hr: compute + allocated storage on Vast; compute on GCP/AWS. Excludes bandwidth.
     #[arg(long, value_name = "USD")]
     pub(crate) max_price_per_hr: Option<f64>,
     /// Runtime duration in hours. Defaults to `default.runtime_hours`, then `1.0`.
