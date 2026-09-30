@@ -367,6 +367,15 @@ impl GcpInstance {
 impl CloudInstance for GcpInstance {
     type ListContext = ();
 
+    fn json_summary(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.name, "name": self.name, "state": self.status,
+            "zone": self.zone, "machine_type": self.machine_type,
+            "created_at": self.creation_timestamp, "last_started_at": self.last_start_timestamp,
+            "workload": crate::output::workload(self.workload.as_ref()),
+        })
+    }
+
     fn cache_key(&self) -> String {
         format!("{}/{}", self.zone, self.name)
     }
@@ -2774,6 +2783,7 @@ fn registry_access_token(config: &IceConfig) -> Result<String> {
         configured_credentials_path: config.auth.gcp.service_account_json.as_deref(),
         cache_path: &cache_path,
     })
+    .context("Failed to obtain GCP registry credentials")
 }
 
 fn service_account_email(config: &IceConfig) -> Result<Option<String>> {

@@ -1141,6 +1141,9 @@ fn local_stream_unpack_logs(instance: &LocalInstance, tail: u32, follow: bool) -
     let dir = local_unpack_instance_dir(&instance.name)?;
     let log_path = dir.join(ICE_UNPACK_LOG_FILE);
     let exit_code_path = dir.join(ICE_UNPACK_EXIT_CODE_FILE);
+    if crate::output::streaming_logs() {
+        return json_local_unpack_logs(&log_path, &exit_code_path, tail, follow);
+    }
     if !log_path.is_file() {
         if exit_code_path.is_file() {
             println!(
@@ -1172,6 +1175,53 @@ fn local_stream_unpack_logs(instance: &LocalInstance, tail: u32, follow: bool) -
         );
     }
     Ok(())
+}
+
+fn json_local_unpack_logs(
+    log_path: &Path,
+    exit_code_path: &Path,
+    tail: u32,
+    follow: bool,
+) -> Result<()> {
+    let mut printed_bytes = None;
+    // Keep incomplete UTF-8 between polls so an append cannot split a character
+    // into replacement characters in separate records.
+    let mut decoder = crate::output::LogDecoder::default();
+    loop {
+        // Observe completion before reading, so the final read includes writes
+        // made immediately before the workload recorded its exit status.
+        let exited = exit_code_path.is_file();
+        if log_path.is_file() {
+            let bytes = fs::read(log_path)
+                .with_context(|| format!("Failed to read {}", log_path.display()))?;
+            let reset = printed_bytes.is_some_and(|count| bytes.len() < count);
+            let start = if reset {
+                decoder = crate::output::LogDecoder::default();
+                crate::output::log_text("combined", "", true)?;
+                0
+            } else {
+                printed_bytes.unwrap_or_else(|| tail_start_offset(&bytes, tail))
+            };
+            decoder.feed(&bytes[start..], false, |text| {
+                crate::output::log_text("combined", text, false)
+            })?;
+            printed_bytes = Some(bytes.len());
+        }
+        if !follow || exited {
+            decoder.feed(&[], true, |text| {
+                crate::output::log_text("combined", text, false)
+            })?;
+            if exited {
+                let code = fs::read_to_string(exit_code_path)
+                    .with_context(|| format!("Failed to read {}", exit_code_path.display()))?;
+                crate::output::log_event(serde_json::json!({
+                    "event": "workload_exit", "exit_code": code.trim().parse::<i32>().ok(),
+                }))?;
+            }
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
 }
 
 fn follow_local_unpack_logs(log_path: &Path, exit_code_path: &Path, tail: u32) -> Result<()> {
