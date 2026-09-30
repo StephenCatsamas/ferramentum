@@ -47,6 +47,17 @@ fn lifecycle(path: &Path, kind: &str, turn: &str) {
     .unwrap();
 }
 
+fn tokens(path: &Path, thread: &str, total: u64) {
+    writeln!(
+        fs::OpenOptions::new().append(true).open(path).unwrap(),
+        "{}",
+        json!({"type":"token_usage_record", "payload":{"thread_id":thread,
+            "thread_token_usage":{"input_tokens":total-500, "output_tokens":500,
+                "total_tokens":total, "cached_input_tokens":600, "reasoning_output_tokens":100}}})
+    )
+    .unwrap();
+}
+
 #[test]
 fn watches_existing_windows_through_completion_new_work_and_exit() {
     let root = tempdir().unwrap();
@@ -74,6 +85,8 @@ fn watches_existing_windows_through_completion_new_work_and_exit() {
         "id":"fixture-child", "source":{"subagent":{"thread_spawn":{"parent_thread_id":"fixture-thread"}}}
     }}))).unwrap();
     lifecycle(&child_log, "task_started", "child-turn");
+    tokens(&log, "fixture-thread", 1500);
+    tokens(&child_log, "fixture-child", 900000);
     let codex = root.path().join("codex");
     fs::write(
         &codex,
@@ -139,7 +152,7 @@ while :; do /bin/sleep 1; done
             }
         }
     });
-    let wait_for = |state: &str, running: u64| -> Value {
+    let wait_for = |state: &str, running: u64, total: u64| -> Value {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             let snapshot = receiver
@@ -154,21 +167,24 @@ while :; do /bin/sleep 1; done
                     .any(|row| row["pid"] == watcher.0.id())
             );
             if let Some(row) = snapshot["windows"].as_array().unwrap().iter().find(|row| {
-                row["pid"] == pid && row["state"] == state && row["agents"]["running"] == running
+                row["pid"] == pid
+                    && row["state"] == state
+                    && row["agents"]["running"] == running
+                    && row["token_usage"]["total_tokens"] == total
             }) {
                 return row.clone();
             }
         }
     };
-    let working = wait_for("working", 1);
+    let working = wait_for("working", 1, 1500);
     assert_eq!(working["thread_id"], "fixture-thread");
     assert_eq!(working["thread_name"], "Test dashboard");
     assert!(working["run_time_ms"].is_u64());
     lifecycle(&log, "task_complete", "first");
-    let done = wait_for("ready", 1);
+    let done = wait_for("ready", 1, 1500);
     assert!(done["last_finished_at"].is_i64());
     lifecycle(&child_log, "task_complete", "child-turn");
-    let children_done = wait_for("ready", 0);
+    let children_done = wait_for("ready", 0, 1500);
     assert_eq!(children_done["agents"]["ready"], 1);
     fs::write(
         root.path().join("session_index.jsonl"),
@@ -176,13 +192,14 @@ while :; do /bin/sleep 1; done
     )
     .unwrap();
     lifecycle(&log, "task_started", "second");
+    tokens(&log, "fixture-thread", 1750);
     writeln!(
         fs::OpenOptions::new().append(true).open(&log).unwrap(),
         "{}",
         json!({"type":"compacted", "payload":{"message":"x".repeat(1024 * 1024 + 100)}})
     )
     .unwrap();
-    let working = wait_for("working", 0);
+    let working = wait_for("working", 0, 1750);
     assert_eq!(working["last_finished_at"], done["last_finished_at"]);
     assert_eq!(working["thread_name"], "Renamed dashboard");
     // An ending immediately followed by exit must not leave a stale/history row.

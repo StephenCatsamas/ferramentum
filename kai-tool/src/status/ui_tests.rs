@@ -29,6 +29,7 @@ fn snapshot() -> Snapshot {
                     complete: true,
                     ..super::super::agents::Summary::default()
                 }),
+                token_usage: None,
                 state: if i == 0 {
                     TurnState::Working
                 } else {
@@ -99,6 +100,10 @@ fn search_navigation_and_refresh_keep_the_selected_window() {
     assert_eq!(view.visible.len(), 1);
     view.key(key(KeyCode::Right), &snapshot);
     assert_eq!(view.visible.len(), 20);
+    view.key(key(KeyCode::Left), &snapshot);
+    assert_eq!(view.visible.len(), 1);
+    view.key(key(KeyCode::Left), &snapshot);
+    assert_eq!(view.visible.len(), 20);
     assert!(view.key(
         KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         &snapshot
@@ -107,7 +112,15 @@ fn search_navigation_and_refresh_keep_the_selected_window() {
 
 #[test]
 fn layouts_show_name_runtime_and_navigation_without_disclaimer_text() {
-    let snapshot = snapshot();
+    let mut snapshot = snapshot();
+    snapshot.windows[0].token_usage = Some(super::super::tokens::Usage {
+        input_tokens: 1_000_000,
+        output_tokens: 24000,
+        total_tokens: 1_024_000,
+        cached_input_tokens: 500_000,
+        cache_write_input_tokens: 0,
+        reasoning_output_tokens: 1000,
+    });
     for (width, height) in [(120, 24), (70, 12), (38, 12)] {
         let mut view = view();
         view.reconcile(&snapshot);
@@ -115,6 +128,10 @@ fn layouts_show_name_runtime_and_navigation_without_disclaimer_text() {
         let text = contents(&terminal);
         assert!(text.contains("Prepare release"), "{text}");
         assert!(text.contains("1m 05s"), "{text}");
+        if width >= 70 {
+            assert!(text.contains("Tokens") && text.contains("1.0M"), "{text}");
+            assert!(text.contains("Active agents"), "{text}");
+        }
         assert!(text.contains("esc quit"), "{text}");
         assert!(text.contains("enter focus"), "{text}");
         assert!(text.contains("ctrl+o comfortable"), "{text}");
@@ -203,26 +220,6 @@ fn tiny_windows_unicode_and_pastes_do_not_break_rendering() {
 }
 
 #[test]
-fn recent_filter_uses_recorded_turn_endings_and_expires_them() {
-    let mut snapshot = snapshot();
-    snapshot.windows.truncate(6);
-    snapshot.windows[0].last_finished_at = Some(101); // 14m 59s ago, active again.
-    snapshot.windows[1].last_finished_at = Some(100); // Exactly 15m, outside.
-    snapshot.windows[2].last_finished_at = Some(1001); // Future timestamps don't qualify.
-    snapshot.windows[3].last_finished_at = None;
-    snapshot.windows[4].last_finished_at = Some(999);
-    snapshot.windows[4].state = TurnState::Interrupted;
-    snapshot.windows[5].last_finished_at = Some(-1);
-    let mut view = view();
-    view.filter = Filter::Recent;
-    view.reconcile(&snapshot);
-    assert_eq!(view.visible, vec![4, 0]);
-    snapshot.observed_at += 1;
-    view.reconcile(&snapshot);
-    assert_eq!(view.visible, vec![2, 4]);
-}
-
-#[test]
 fn expanded_details_expose_actual_errors_even_without_rows_and_can_scroll() {
     let mut snapshot = snapshot();
     let mut view = view();
@@ -281,7 +278,7 @@ fn agents_column_and_active_filter_include_work_after_the_parent_is_ready() {
     for width in [50, 70, 120] {
         let text = contents(&render(&mut view, &snapshot, width, 24));
         assert!(
-            text.contains("Agents") && text.contains("2 run ?"),
+            text.contains("Active agents") && text.contains("2 ?"),
             "{text}"
         );
         assert!(text.contains("Ready"), "{text}");
@@ -299,4 +296,36 @@ fn agents_column_and_active_filter_include_work_after_the_parent_is_ready() {
     snapshot.windows[0].agents.as_mut().unwrap().running = 0;
     view.reconcile(&snapshot);
     assert!(view.visible.is_empty());
+}
+
+#[test]
+fn token_details_show_exact_usage_and_do_not_confuse_missing_counts_with_zero() {
+    let mut snapshot = snapshot();
+    snapshot.windows.truncate(1);
+    let mut view = view();
+    view.expanded = true;
+    view.reconcile(&snapshot);
+    assert!(contents(&render(&mut view, &snapshot, 90, 40)).contains("Tokens: unavailable"));
+    snapshot.windows[0].token_usage = Some(super::super::tokens::Usage {
+        input_tokens: 1000,
+        output_tokens: 240,
+        total_tokens: 1240,
+        cached_input_tokens: 500,
+        cache_write_input_tokens: 100,
+        reasoning_output_tokens: 80,
+    });
+    let text = contents(&render(&mut view, &snapshot, 90, 40));
+    assert!(text.contains("1.2K"), "{text}");
+    assert!(
+        text.contains("1240 total · 1000 input · 240 output"),
+        "{text}"
+    );
+    assert!(text.contains("500 cached · 100 cache write"), "{text}");
+    assert!(text.contains("80 (included in output)"), "{text}");
+    snapshot.windows[0]
+        .token_usage
+        .as_mut()
+        .unwrap()
+        .total_tokens = 0;
+    assert_eq!(snapshot.windows[0].token_usage.unwrap().label(), "0");
 }

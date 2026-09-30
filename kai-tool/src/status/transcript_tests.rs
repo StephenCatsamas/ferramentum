@@ -303,3 +303,95 @@ fn subagents_read_their_own_turns_and_ignore_inherited_activity_and_input_calls(
     append(&mut file, &event("turn_aborted", "own"), &mut transcript);
     assert_eq!(transcript.view.state, TurnState::Interrupted);
 }
+
+fn usage(input: i64, output: i64) -> Value {
+    json!({"input_tokens":input, "output_tokens":output, "total_tokens":input + output,
+        "cached_input_tokens":input / 2, "reasoning_output_tokens":output / 2})
+}
+
+#[test]
+fn token_counters_are_not_summed_and_matching_native_records_take_precedence() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_started", "one"), &mut transcript);
+    assert!(transcript.view.token_usage.is_none());
+    let legacy = |usage| {
+        json!({"type":"event_msg", "payload":{"type":"token_count",
+        "info":{"total_token_usage":usage}}})
+        .to_string()
+            + "\n"
+    };
+    let native = |id, usage| {
+        json!({"type":"token_usage_record", "payload":{
+        "thread_id":id, "thread_token_usage":usage}})
+        .to_string()
+            + "\n"
+    };
+    for _ in 0..2 {
+        append(&mut file, &legacy(usage(1000, 500)), &mut transcript);
+        assert_eq!(transcript.view.token_usage.unwrap().total_tokens, 1500);
+    }
+    append(
+        &mut file,
+        &native("another-thread", usage(9000, 9000)),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view.token_usage.unwrap().total_tokens, 1500);
+    append(
+        &mut file,
+        &native("thread", usage(1500, 500)),
+        &mut transcript,
+    );
+    append(&mut file, &legacy(usage(8000, 9000)), &mut transcript);
+    append(
+        &mut file,
+        &native("another-thread", usage(9000, 9000)),
+        &mut transcript,
+    );
+    let tokens = transcript.view.token_usage.unwrap();
+    assert_eq!(tokens.total_tokens, 2000);
+    assert_eq!(tokens.cached_input_tokens, 750);
+    assert_eq!(tokens.reasoning_output_tokens, 250);
+    assert_eq!(transcript.view.state, TurnState::Working);
+    append(&mut file, &event("task_complete", "one"), &mut transcript);
+    assert_eq!(transcript.view.token_usage, Some(tokens));
+    assert_eq!(transcript.view.state, TurnState::Ready);
+    append(&mut file, &event("task_started", "two"), &mut transcript);
+    assert_eq!(transcript.view.token_usage, Some(tokens));
+    append(
+        &mut file,
+        &native("thread", usage(1600, 600)),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view.token_usage.unwrap().total_tokens, 2200);
+}
+
+#[test]
+fn compaction_can_restore_usage_and_invalid_counts_do_not_change_turn_state() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_complete", "one"), &mut transcript);
+    let compacted = json!({"type":"compacted", "payload":{
+        "message":"x".repeat(MAX_LINE_BYTES as usize + 10),
+        "latest_token_usage_record":{"thread_id":"thread", "thread_token_usage":usage(1000, 250)}
+    }})
+    .to_string()
+        + "\n";
+    append(&mut file, &compacted, &mut transcript);
+    assert_eq!(transcript.view.token_usage.unwrap().total_tokens, 1250);
+    assert_eq!(transcript.view.state, TurnState::Ready);
+    let invalid = json!({"type":"token_usage_record", "payload":{
+        "thread_id":"thread", "thread_token_usage":usage(-1, 250)
+    }})
+    .to_string()
+        + "\n";
+    append(&mut file, &invalid, &mut transcript);
+    assert!(transcript.view.token_usage.is_none());
+    assert_eq!(transcript.view.state, TurnState::Ready);
+    append(&mut file, &compacted, &mut transcript);
+    fs::write(file.path(), header(json!("cli"))).unwrap();
+    transcript.refresh(file.path()).unwrap();
+    assert!(transcript.view.token_usage.is_none());
+}

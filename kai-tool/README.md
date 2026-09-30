@@ -32,14 +32,14 @@ Install with `cargo install --path kai-tool --locked --force`.
 `kai status --watch` shows the current user's local Kai launcher processes, including windows
 opened before the dashboard started. Its Ratatui interface follows the `kai r` session picker:
 blue selection, a `›` marker, subdued metadata, type-to-search, and keyboard hints below the list.
-Rows show thread names and **Turn time**, an **Agents** column from 50 columns wide,
-and **Last ended** on wider terminals. Turn time
+Rows show thread names and **Turn time**, an **Active agents** column from 50 columns wide,
+**Tokens** from 70 columns, and **Last ended** from 110 columns. Turn time
 is elapsed time for the current turn, or the final duration of the most recent ended turn;
 it is not the age of the whole session.
 Names come from Codex's `session_index.jsonl`, including subsequent renames.
 
-Agents shows the number of subagents with an active recorded turn, including nested descendants
-(`3 run`). It follows currently open subagent logs, using root/parent thread IDs to associate
+Active agents shows the number of subagents with an active recorded turn, including nested descendants.
+It follows currently open subagent logs, using root/parent thread IDs to associate
 them with the main conversation and excluding inherited parent history where marked. The main
 State and Turn time remain those of the parent; a Ready parent can still have running agents.
 The Active filter includes either kind of running work. Ctrl-E shows running, ready, interrupted,
@@ -48,9 +48,16 @@ Below 50 columns, agent counts remain available in Ctrl-E details. Subagent logs
 the counts on the next refresh. This does not keep historical agent totals or add an input flow:
 the current agent runtime restricts user-input requests to the root conversation.
 
-Use ↑/↓, Page Up/Down, or Home/End to browse; ←/→ switches All/Active/Recent 15m. Recent 15m
-shows open windows with a recorded turn ending in the last fifteen minutes, newest first, including
-errors and interruptions. A window can appear there after starting another turn. Closed windows
+Tokens shows the main thread's latest reported cumulative input-plus-output total, abbreviated
+with K/M/B/T suffixes. Ctrl-E provides exact input, output, cached-input, cache-write, and reasoning
+counts, including on narrow terminals. Cached input is included in input; reasoning is included
+in output. The column does not add subagent usage or measure current context occupancy. It uses
+matching per-thread usage records (including compaction checkpoints), falling back to the legacy
+`token_count` total when per-thread records are unavailable. Counters replace previous snapshots
+and persist across turns, so refreshes and duplicate records cannot double count. `—` means usage
+is unavailable, while `0` means a reported zero. Counts update when usage is written to the log.
+
+Use ↑/↓, Page Up/Down, or Home/End to browse; ←/→ switches between All and Active. Closed windows
 are removed on the next refresh that confirms their process has exited. Type to filter
 by name, state, terminal, directory, PID, or conversation ID. Ctrl-O toggles dense/comfortable
 rows, and Ctrl-E opens details with the selected row's terminal, directory, PID, last turn ending,
@@ -140,7 +147,7 @@ messages are not included in output. LLM progress summaries are a separate featu
 For scripts, `kai status --json` emits one snapshot; `kai status --watch --json` emits one JSON
 object per line, including when output is piped. Snapshot `version` is `1`, `observed_at` is Unix
 seconds, and `windows` contains `pid`, `tty`, `cwd`, `thread_id`, `thread_name`, `run_time_ms`,
-`state`, `agents`, `last_finished_at`, `exited_at`, and `detail`. Unavailable values are null, timestamps
+`state`, `agents`, `token_usage`, `last_finished_at`, `exited_at`, and `detail`. Unavailable values are null, timestamps
 are Unix seconds, run time is milliseconds, and state names
 are `working`, `ready`, `needs_input`, `interrupted`, `error`, or `unknown`. `warnings`
 reports incomplete process discovery. No terminal escape sequences are emitted in JSON mode.
@@ -153,6 +160,9 @@ The additive `agents` object contains `total`, `running`, `ready`, `interrupted`
 some could not be reliably associated with this root. Unknown states have a separate count, so
 `running: 0` does not assert that all work ended when `unknown` is nonzero or `complete` is false.
 `agents: null` means discovery could not establish the main session or its open logs.
+The additive `token_usage` object contains exact `total_tokens`, `input_tokens`, `output_tokens`,
+`cached_input_tokens`, `cache_write_input_tokens`, and `reasoning_output_tokens` for the main thread.
+It is null when no valid usage is available; it does not change the main state or active-agent count.
 
 ## Credential provider
 

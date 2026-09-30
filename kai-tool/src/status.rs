@@ -22,6 +22,8 @@ mod process_linux;
 #[cfg(target_os = "macos")]
 mod process_macos;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod tokens;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod transcript;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod ui;
@@ -100,6 +102,7 @@ mod observer {
         pub(super) run_time_ms: Option<u64>,
         pub(super) state: TurnState,
         pub(super) agents: Option<super::agents::Summary>,
+        pub(super) token_usage: Option<super::tokens::Usage>,
         pub(super) last_finished_at: Option<i64>,
         // Retained as null for JSON v1 compatibility; exited processes are removed.
         pub(super) exited_at: Option<u64>,
@@ -195,6 +198,7 @@ mod observer {
                     run_time_ms: None,
                     state: TurnState::Unknown,
                     agents: None,
+                    token_usage: None,
                     last_finished_at: None,
                     exited_at: None,
                     detail: None,
@@ -216,6 +220,7 @@ mod observer {
                         row.last_finished_at = root.last_finished_at;
                         row.detail.clone_from(&root.detail);
                         row.agents = Some(super::agents::summarize(&root.id, children, true));
+                        row.token_usage = root.token_usage;
                     }
                     [] => row.detail = Some(
                         "No readable main session log (starting, recovering, or unsupported build)"
@@ -238,6 +243,7 @@ mod observer {
                     row.state = TurnState::Unknown;
                     row.run_time_ms = None;
                     row.agents = None;
+                    row.token_usage = None;
                     row.detail = Some(warning);
                 }
                 self.windows.insert(window.identity, row);
@@ -250,6 +256,7 @@ mod observer {
                     row.state = TurnState::Unknown;
                     row.run_time_ms = None;
                     row.agents = None;
+                    row.token_usage = None;
                     row.detail = Some("Window could not be inspected during this refresh".into());
                 }
                 true
@@ -342,8 +349,15 @@ mod observer {
         });
         let mut lines = vec![format!("Kai windows: {} open", snapshot.windows.len(),)];
         lines.push(format!(
-            "{:<11} {:<8} {:<9} {:<10} {:<10} {:<14} {}",
-            "STATE", "PID", "TTY", "TURN TIME", "AGENTS", "LAST ENDED", "THREAD / DIRECTORY"
+            "{:<11} {:<8} {:<9} {:<10} {:<15} {:<10} {:<14} {}",
+            "STATE",
+            "PID",
+            "TTY",
+            "TURN TIME",
+            "ACTIVE AGENTS",
+            "TOKENS",
+            "LAST ENDED",
+            "THREAD / DIRECTORY"
         ));
         if snapshot.windows.is_empty() {
             lines.push("No Kai windows found for this user.".into());
@@ -353,7 +367,7 @@ mod observer {
                 .last_finished_at
                 .map_or_else(|| "—".into(), |at| age(snapshot.observed_at, at));
             lines.push(format!(
-                "{:<11} {:<8} {:<9} {:<10} {:<10} {:<14} {}  {}",
+                "{:<11} {:<8} {:<9} {:<10} {:<15} {:<10} {:<14} {}  {}",
                 row.state.label(),
                 row.pid,
                 row.tty.as_deref().unwrap_or("—"),
@@ -361,6 +375,9 @@ mod observer {
                 row.agents
                     .as_ref()
                     .map_or_else(|| "?".into(), super::agents::Summary::label),
+                row.token_usage
+                    .as_ref()
+                    .map_or_else(|| "—".into(), super::tokens::Usage::label),
                 finished,
                 row.thread_name.as_deref().unwrap_or("Unnamed thread"),
                 row.cwd.as_deref().unwrap_or("?"),

@@ -49,6 +49,7 @@ pub(super) struct View {
     pub started_at: Option<i64>,
     pub duration_ms: Option<u64>,
     pub detail: Option<String>,
+    pub token_usage: Option<super::tokens::Usage>,
 }
 
 impl View {
@@ -75,6 +76,7 @@ pub(super) struct Transcript {
     turn: Option<String>,
     input_requests: HashSet<String>,
     skipped_line: bool,
+    native_usage: bool,
 }
 
 // Deserialize only observation metadata. Prompts, auth data, tool arguments and output
@@ -118,6 +120,14 @@ struct Payload {
     call_id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    thread_token_usage: Option<super::tokens::Usage>,
+    #[serde(default)]
+    latest_token_usage_record: Option<super::tokens::Record>,
+    #[serde(default)]
+    info: Option<super::tokens::Info>,
 }
 
 // Avoid retaining or displaying upstream error text, which can include arbitrary content.
@@ -324,6 +334,25 @@ impl Transcript {
             .map(OffsetDateTime::unix_timestamp);
         let payload = record.payload;
         match (record.kind.as_str(), payload.kind.as_str()) {
+            ("token_usage_record", _) if payload.thread_id.as_deref() == Some(&self.view.id) => {
+                if let Some(usage) = payload.thread_token_usage {
+                    self.native_usage = true;
+                    self.view.token_usage = usage.validated();
+                }
+            }
+            ("compacted", _) => {
+                if let Some(usage) = payload.latest_token_usage_record
+                    && usage.thread_id == self.view.id
+                {
+                    self.native_usage = true;
+                    self.view.token_usage = usage.thread_token_usage.validated();
+                }
+            }
+            ("event_msg", "token_count") if !self.native_usage => {
+                if let Some(info) = payload.info {
+                    self.view.token_usage = info.total_token_usage.validated();
+                }
+            }
             ("event_msg", "task_started" | "turn_started") => {
                 self.turn = payload.turn_id;
                 self.input_requests.clear();

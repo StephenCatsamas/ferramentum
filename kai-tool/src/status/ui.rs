@@ -157,38 +157,29 @@ enum Filter {
     #[default]
     All,
     Active,
-    Recent,
 }
 impl Filter {
-    const ALL: [Self; 3] = [Self::All, Self::Active, Self::Recent];
+    const ALL: [Self; 2] = [Self::All, Self::Active];
     fn label(self) -> &'static str {
         match self {
             Self::All => "All",
             Self::Active => "Active",
-            Self::Recent => "Recent 15m",
         }
     }
-    fn includes(self, row: &Row, observed_at: u64) -> bool {
+    fn includes(self, row: &Row) -> bool {
         match self {
             Self::All => true,
             Self::Active => {
                 matches!(row.state, TurnState::Working | TurnState::NeedsInput)
                     || row.agents.as_ref().is_some_and(|agents| agents.running > 0)
             }
-            // Only recorded turn endings qualify, including errors/interruptions.
-            // Only open windows are present; a new turn may already be active.
-            Self::Recent => row
-                .last_finished_at
-                .and_then(|at| u64::try_from(at).ok())
-                .is_some_and(|at| at <= observed_at && observed_at - at < 15 * 60),
         }
     }
-    fn cycle(self, backwards: bool) -> Self {
-        let index = Self::ALL
-            .iter()
-            .position(|filter| *filter == self)
-            .unwrap_or_default();
-        Self::ALL[(index + if backwards { 2 } else { 1 }) % 3]
+    fn cycle(self) -> Self {
+        match self {
+            Self::All => Self::Active,
+            Self::Active => Self::All,
+        }
     }
 }
 
@@ -293,7 +284,7 @@ impl View {
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                self.filter.includes(row, snapshot.observed_at)
+                self.filter.includes(row)
                     && (query.is_empty()
                         || [
                             row.thread_name.as_deref().unwrap_or("Unnamed thread"),
@@ -308,10 +299,6 @@ impl View {
             })
             .map(|(index, _)| index)
             .collect();
-        if self.filter == Filter::Recent {
-            self.visible
-                .sort_by_key(|index| std::cmp::Reverse(snapshot.windows[*index].last_finished_at));
-        }
         let index = self
             .visible
             .iter()
@@ -380,9 +367,7 @@ impl View {
             }
             KeyCode::Home => self.select(0, snapshot),
             KeyCode::End => self.select(last, snapshot),
-            KeyCode::Left | KeyCode::Right => {
-                self.filter = self.filter.cycle(key.code == KeyCode::Left)
-            }
+            KeyCode::Left | KeyCode::Right => self.filter = self.filter.cycle(),
             KeyCode::Backspace => {
                 self.query.pop();
             }
@@ -525,7 +510,7 @@ impl View {
         let compact = area.width < 62;
         let cols = Columns::new(area.width);
         let agents = if cols.agents > 0 {
-            format!("{:width$}", "Agents", width = cols.agents)
+            format!("{:width$}", "Active agents", width = cols.agents)
         } else {
             String::new()
         };
@@ -534,9 +519,14 @@ impl View {
         } else {
             String::new()
         };
+        let tokens = if cols.tokens > 0 {
+            format!("{:width$}", "Tokens", width = cols.tokens)
+        } else {
+            String::new()
+        };
         frame.render_widget(
             Line::from(format!(
-                "  {:state_width$}{:time_width$}{agents}{last_finished}Thread",
+                "  {:state_width$}{:time_width$}{agents}{tokens}{last_finished}Thread",
                 "State",
                 "Turn time",
                 state_width = cols.state,
@@ -681,8 +671,8 @@ impl View {
         } else {
             row.state.label()
         };
-        let title_width =
-            usize::from(width).saturating_sub(cols.state + cols.time + cols.agents + cols.finished);
+        let title_width = usize::from(width)
+            .saturating_sub(cols.state + cols.time + cols.agents + cols.tokens + cols.finished);
         let mut summary = vec![
             Span::styled(format!("{state:width$}", width = cols.state), state_style),
             Span::styled(
@@ -704,6 +694,20 @@ impl View {
                     "{:width$}",
                     clip(&agents, cols.agents - 1),
                     width = cols.agents
+                ),
+                normal,
+            ));
+        }
+        if cols.tokens > 0 {
+            let tokens = row
+                .token_usage
+                .as_ref()
+                .map_or_else(|| "—".into(), super::tokens::Usage::label);
+            summary.push(Span::styled(
+                format!(
+                    "{:width$}",
+                    clip(&tokens, cols.tokens - 1),
+                    width = cols.tokens
                 ),
                 normal,
             ));
@@ -796,6 +800,11 @@ impl View {
                     super::agents::Summary::description
                 )
             ));
+            if let Some(usage) = &row.token_usage {
+                messages.extend(usage.details());
+            } else {
+                messages.push("Tokens: unavailable".into());
+            }
         }
         messages
             .into_iter()
@@ -850,6 +859,7 @@ struct Columns {
     state: usize,
     time: usize,
     agents: usize,
+    tokens: usize,
     finished: usize,
 }
 impl Columns {
@@ -857,8 +867,9 @@ impl Columns {
         Self {
             state: if width < 62 { 6 } else { 12 },
             time: if width < 62 { 10 } else { 11 },
-            agents: if width >= 50 { 10 } else { 0 },
-            finished: if width >= 100 { 14 } else { 0 },
+            agents: if width >= 50 { 15 } else { 0 },
+            tokens: if width >= 70 { 10 } else { 0 },
+            finished: if width >= 110 { 14 } else { 0 },
         }
     }
 }
