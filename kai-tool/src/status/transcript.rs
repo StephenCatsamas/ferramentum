@@ -29,7 +29,7 @@ pub(super) enum TurnState {
 impl TurnState {
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Working => "Working",
+            Self::Working => "Active",
             Self::NeedsInput => "Needs input",
             Self::Ready => "Ready",
             Self::Interrupted => "Interrupted",

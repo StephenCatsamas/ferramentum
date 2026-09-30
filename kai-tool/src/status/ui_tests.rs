@@ -94,7 +94,7 @@ fn search_navigation_and_refresh_keep_the_selected_window() {
     view.key(key(KeyCode::Right), &snapshot);
     assert_eq!(view.visible.len(), 1);
     view.key(key(KeyCode::Right), &snapshot);
-    assert_eq!(view.visible.len(), 19);
+    assert_eq!(view.visible.len(), 20);
     assert!(view.key(
         KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         &snapshot
@@ -177,7 +177,7 @@ fn comfortable_view_and_expansion_show_terminal_directory_and_thread_id() {
     let terminal = render(&mut view, &snapshot, 90, 24);
     let text = contents(&terminal);
     assert!(text.contains("pts/0  ·  /workspace/kai"));
-    assert!(text.contains("Last finished 1m ago  ·  PID 10"));
+    assert!(text.contains("Last ended 1m ago  ·  PID 10"));
     assert!(text.contains("Thread thread-0"));
     assert!(text.contains("ctrl+o dense"));
 }
@@ -194,4 +194,64 @@ fn tiny_windows_unicode_and_pastes_do_not_break_rendering() {
     assert_eq!(clip("界界界", 5), "界界…");
     view.add_query(&"x".repeat(2000));
     assert_eq!(view.query.len(), 1024);
+}
+
+#[test]
+fn recent_filter_uses_recorded_turn_endings_and_expires_them() {
+    let mut snapshot = snapshot();
+    snapshot.windows.truncate(6);
+    snapshot.windows[0].last_finished_at = Some(101); // 14m 59s ago, active again.
+    snapshot.windows[1].last_finished_at = Some(100); // Exactly 15m, outside.
+    snapshot.windows[2].last_finished_at = Some(1001); // Future timestamps don't qualify.
+    snapshot.windows[3].last_finished_at = None;
+    snapshot.windows[3].exited_at = Some(999); // Exiting is not a turn ending.
+    snapshot.windows[4].last_finished_at = Some(999);
+    snapshot.windows[4].state = TurnState::Interrupted;
+    snapshot.windows[5].last_finished_at = Some(-1);
+    let mut view = view();
+    view.filter = Filter::Recent;
+    view.reconcile(&snapshot);
+    assert_eq!(view.visible, vec![4, 0]);
+    snapshot.observed_at += 1;
+    view.reconcile(&snapshot);
+    assert_eq!(view.visible, vec![2, 4]);
+}
+
+#[test]
+fn expanded_details_expose_actual_errors_even_without_rows_and_can_scroll() {
+    let mut snapshot = snapshot();
+    let mut view = view();
+    snapshot.windows.truncate(1);
+    snapshot.windows[0].state = TurnState::Unknown;
+    snapshot.windows[0].detail = Some("Cannot read the selected session log".into());
+    view.reconcile(&snapshot);
+    assert!(!contents(&render(&mut view, &snapshot, 70, 24)).contains("Cannot read"));
+    view.key(
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        &snapshot,
+    );
+    assert!(
+        contents(&render(&mut view, &snapshot, 70, 24))
+            .contains("Cannot read the selected session log")
+    );
+    snapshot.windows.clear();
+    snapshot.warnings = vec!["Some process metadata could not be read".into()];
+    view.refresh_error = Some("Refresh failed: permission denied".into());
+    view.reconcile(&snapshot);
+    let text = contents(&render(&mut view, &snapshot, 80, 24));
+    assert!(text.contains("Stale · Ctrl+E details"));
+    assert!(text.contains("permission denied"));
+    assert!(text.contains("Some process metadata could not be read"));
+    snapshot.warnings = (0..20).map(|i| format!("Warning {i}")).collect();
+    render(&mut view, &snapshot, 40, 16);
+    view.key(key(KeyCode::PageDown), &snapshot);
+    assert!(view.detail_scroll > 0);
+    let text = contents(&render(&mut view, &snapshot, 40, 16));
+    assert!(text.contains("Warning"));
+    assert!(!text.contains("Refresh failed: permission denied"));
+    assert!(
+        wrap_notice(&"界".repeat(20), 5)
+            .iter()
+            .all(|line| line.width() <= 5)
+    );
 }

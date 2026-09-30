@@ -3,6 +3,7 @@ use super::{
     command,
     macos_data::{self, Arguments},
     process::{Ancestor, ProcessIdentity, Window, is_launch},
+    worker::Cancellation,
 };
 use anyhow::{Result, ensure};
 use std::{
@@ -108,7 +109,10 @@ pub(super) fn ancestry(expected: ProcessIdentity) -> Result<Vec<Ancestor>> {
     Ok(chain)
 }
 
-pub(super) fn files(pids: &[u32]) -> Result<HashMap<u32, macos_data::Files>> {
+pub(super) fn files(
+    pids: &[u32],
+    cancel: &Cancellation,
+) -> Result<HashMap<u32, macos_data::Files>> {
     if pids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -117,15 +121,19 @@ pub(super) fn files(pids: &[u32]) -> Result<HashMap<u32, macos_data::Files>> {
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let output = command::run(
+    let output = command::capture(
         "/usr/sbin/lsof",
         &["-n", "-P", "-F0pfn", "-p", &pids],
         Duration::from_secs(3),
+        cancel,
     )?;
-    macos_data::open_files(&output)
+    macos_data::file_result(output)
 }
 
-pub(super) fn discover(observer_pid: u32) -> Result<(Vec<Window>, Vec<String>)> {
+pub(super) fn discover(
+    observer_pid: u32,
+    cancel: &Cancellation,
+) -> Result<(Vec<Window>, Vec<String>)> {
     // PROC_UID_ONLY: ask only for this user's PIDs. An explicit cap bounds each refresh.
     let mut pids = vec![0_u32; 65536];
     // SAFETY: the PID buffer has the provided byte capacity; geteuid has no preconditions.
@@ -150,6 +158,7 @@ pub(super) fn discover(observer_pid: u32) -> Result<(Vec<Window>, Vec<String>)> 
         .into_iter()
         .filter(|pid| *pid != 0 && *pid != observer_pid)
     {
+        cancel.check()?;
         if let Ok(item) = info(pid)
             && item.pbi_uid == uid
         {
@@ -161,6 +170,7 @@ pub(super) fn discover(observer_pid: u32) -> Result<(Vec<Window>, Vec<String>)> 
         .values()
         .filter(|item| name(item) == "kai" && item.pbi_status != libc::SZOMB)
     {
+        cancel.check()?;
         let args = match process_arguments(item.pbi_pid) {
             Ok(args) => args,
             Err(_) => {
@@ -189,19 +199,26 @@ pub(super) fn discover(observer_pid: u32) -> Result<(Vec<Window>, Vec<String>)> 
         })
         .collect();
     let mut read_error = None;
-    let mut files = files(&pids).unwrap_or_else(|_| {
-        read_error = Some("Cannot inspect open session logs with lsof".to_owned());
+    let mut files = files(&pids, cancel).unwrap_or_else(|error| {
+        read_error = Some(format!("Cannot inspect open session logs: {error:#}"));
         HashMap::new()
     });
     let mut windows = Vec::new();
     for (item, children) in candidates {
+        cancel.check()?;
         let mut warning = read_error.clone();
-        let launcher = files.remove(&item.pbi_pid).unwrap_or_default();
+        let launcher = macos_data::take_files(&mut files, item.pbi_pid).unwrap_or_else(|error| {
+            warning.get_or_insert_with(|| error.to_string());
+            macos_data::Files::default()
+        });
         let mut transcripts = BTreeSet::new();
         for child in children {
             if matches!(same_process(identity(child)), Ok(true)) {
-                if let Some(files) = files.remove(&child.pbi_pid) {
-                    transcripts.extend(files.transcripts);
+                match macos_data::take_files(&mut files, child.pbi_pid) {
+                    Ok(files) => transcripts.extend(files.transcripts),
+                    Err(error) => {
+                        warning.get_or_insert_with(|| error.to_string());
+                    }
                 }
             } else {
                 warning =

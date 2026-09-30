@@ -23,8 +23,11 @@ pub(super) struct Ancestor {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn discover(observer_pid: u32) -> anyhow::Result<(Vec<Window>, Vec<String>)> {
-    super::process_linux::discover(std::path::Path::new("/proc"), observer_pid)
+pub(super) fn discover(
+    observer_pid: u32,
+    cancel: &super::worker::Cancellation,
+) -> anyhow::Result<(Vec<Window>, Vec<String>)> {
+    super::process_linux::discover(std::path::Path::new("/proc"), observer_pid, cancel)
 }
 #[cfg(target_os = "linux")]
 pub(super) fn same_process(identity: ProcessIdentity) -> std::io::Result<bool> {

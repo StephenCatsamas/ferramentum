@@ -2,13 +2,14 @@
 use super::command;
 use super::process::{Ancestor, ProcessIdentity};
 use super::process_linux as process;
+use super::worker::Cancellation;
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{ffi::OsString, path::Path, time::Duration};
 
 const DETAILS: &str = "Press Ctrl+E for terminal details.";
-const PANE_MESSAGE: &str = "This terminal needs a tab/pane integration before Kai can switch to it. Press Ctrl+E for terminal details.";
+const PANE_MESSAGE: &str = "This terminal needs a tab/pane integration before Kai can switch to it. Linux switching currently supports separate Foot, Alacritty, xterm, st, or urxvt windows. Press Ctrl+E for terminal details to switch manually.";
 const CHANGED: &str = "The session or terminal changed. Refresh and try again.";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -51,7 +52,8 @@ impl Backend {
     }
 }
 
-pub(super) fn focus(identity: ProcessIdentity) -> Result<()> {
+pub(super) fn focus(identity: ProcessIdentity, cancel: &Cancellation) -> Result<()> {
+    cancel.check()?;
     let backend = Backend::detect(
         std::env::var_os("SWAYSOCK"),
         &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
@@ -62,13 +64,13 @@ pub(super) fn focus(identity: ProcessIdentity) -> Result<()> {
     )?;
     match backend {
         Backend::Sway => focus_sway(Path::new("/proc"), identity, |kind, payload| {
-            let reply = command::run("swaymsg", &["-r", "-t", if kind == 4 { "get_tree" } else { "command" }, payload], Duration::from_secs(2))
+            let reply = command::run("swaymsg", &["-r", "-t", if kind == 4 { "get_tree" } else { "command" }, payload], Duration::from_secs(2), cancel)
                     .context("Cannot contact Sway. Check that swaymsg is installed and run the dashboard inside Sway.")?;
             Ok(serde_json::from_slice(&reply)?)
         }),
-        Backend::Hyprland => focus_hyprland(identity),
-        Backend::Gnome => focus_gnome(identity),
-        Backend::X11 => focus_x11(identity),
+        Backend::Hyprland => focus_hyprland(identity, cancel),
+        Backend::Gnome => focus_gnome(identity, cancel),
+        Backend::X11 => focus_x11(identity, cancel),
     }
 }
 
@@ -178,9 +180,9 @@ fn recheck(identity: ProcessIdentity, chain: &[Ancestor]) -> Result<()> {
     Ok(())
 }
 
-fn focus_hyprland(identity: ProcessIdentity) -> Result<()> {
+fn focus_hyprland(identity: ProcessIdentity, cancel: &Cancellation) -> Result<()> {
     focus_hyprland_with(Path::new("/proc"), identity, |args: &[&str]| {
-        command::run("hyprctl", args, Duration::from_secs(2))
+        command::run("hyprctl", args, Duration::from_secs(2), cancel)
         .context("Cannot contact Hyprland. Check that hyprctl is installed and run the dashboard inside Hyprland.")
     })
 }
@@ -270,10 +272,10 @@ fn hyprland_tree(bytes: &[u8]) -> Result<Node> {
     ))
 }
 
-fn focus_x11(identity: ProcessIdentity) -> Result<()> {
+fn focus_x11(identity: ProcessIdentity, cancel: &Cancellation) -> Result<()> {
     let chain = checked_chain(Path::new("/proc"), identity)?;
     let run = |args: &[&str]| {
-        command::run("wmctrl", args, Duration::from_secs(2))
+        command::run("wmctrl", args, Duration::from_secs(2), cancel)
         .context("Cannot switch X11 windows. Install wmctrl and check that the desktop supports EWMH window activation.")
     };
     let tree = x11_tree(&run(&["-lp"])?)?;
@@ -286,6 +288,7 @@ fn focus_x11(identity: ProcessIdentity) -> Result<()> {
             "xprop",
             &["-root", "_NET_ACTIVE_WINDOW"],
             Duration::from_secs(1),
+            cancel,
         )
         .context("Cannot confirm X11 focus. Install xprop to verify window activation.")?;
         if std::str::from_utf8(&active)?
@@ -315,7 +318,7 @@ fn x11_tree(bytes: &[u8]) -> Result<Node> {
     Ok(root(nodes))
 }
 
-fn focus_gnome(identity: ProcessIdentity) -> Result<()> {
+fn focus_gnome(identity: ProcessIdentity, cancel: &Cancellation) -> Result<()> {
     let chain = checked_chain(Path::new("/proc"), identity)?;
     let terminal = chain
         .iter()
@@ -327,7 +330,7 @@ fn focus_gnome(identity: ProcessIdentity) -> Result<()> {
         "--object-path", "/org/gnome/Shell/Extensions/KaiWindowFocus",
         "--method", "org.gnome.Shell.Extensions.KaiWindowFocus.Focus",
         &terminal.identity.pid.to_string(), &terminal.identity.start_ticks.to_string(),
-    ], Duration::from_secs(2)).context(
+    ], Duration::from_secs(2), cancel).context(
         "GNOME Wayland needs the Kai Window Focus extension. Install and enable kai-tool/integrations/gnome; ensure gdbus is installed. Press Ctrl+E for terminal details.",
     )?;
     match response.trim_ascii() {

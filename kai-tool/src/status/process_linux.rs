@@ -74,13 +74,18 @@ pub(super) fn needs_pane_integration(
     }))
 }
 
-pub(super) fn discover(proc_root: &Path, observer_pid: u32) -> Result<(Vec<Window>, Vec<String>)> {
+pub(super) fn discover(
+    proc_root: &Path,
+    observer_pid: u32,
+    cancel: &super::worker::Cancellation,
+) -> Result<(Vec<Window>, Vec<String>)> {
     let owner = fs::metadata(proc_root.join("self"))
         .context("cannot inspect this process in /proc")?
         .uid();
     let mut processes = HashMap::new();
     let mut warnings = Vec::new();
     for entry in fs::read_dir(proc_root).context("cannot enumerate Linux processes")? {
+        cancel.check()?;
         let entry = entry?;
         let Some(pid) = entry
             .file_name()
@@ -113,6 +118,7 @@ pub(super) fn discover(proc_root: &Path, observer_pid: u32) -> Result<(Vec<Windo
         .filter(|process| process.name == "kai" && !process.zombie)
     {
         let dir = proc_root.join(process.identity.pid.to_string());
+        cancel.check()?;
         let command = match read_bounded(&dir.join("cmdline"), 64 * 1024) {
             Ok(command) => command,
             Err(_) => {
@@ -134,6 +140,7 @@ pub(super) fn discover(proc_root: &Path, observer_pid: u32) -> Result<(Vec<Windo
             match fs::read_dir(&fd_dir) {
                 Ok(entries) => {
                     for entry in entries.flatten() {
+                        cancel.check()?;
                         let Ok(path) = fs::read_link(entry.path()) else {
                             continue;
                         };

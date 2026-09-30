@@ -37,6 +37,7 @@ impl Drop for Watcher {
     }
 }
 
+#[track_caller]
 fn wait(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !condition() {
@@ -84,6 +85,16 @@ fn focused(tree: &Value, pid: u32) -> bool {
 #[test]
 #[ignore = "requires headless Sway and Foot; run explicitly on Linux"]
 fn enter_focuses_selected_window_without_leaving_the_dashboard() {
+    exercise_focus(false);
+}
+
+#[test]
+#[ignore = "requires headless Sway and Foot; run explicitly on Linux"]
+fn slow_focus_keeps_keys_responsive_and_escape_or_quit_reaps_helpers() {
+    exercise_focus(true);
+}
+
+fn exercise_focus(slow: bool) {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime");
     fs::create_dir(&runtime).unwrap();
@@ -186,6 +197,18 @@ fn enter_focuses_selected_window_without_leaving_the_dashboard() {
     cmd.env("XDG_CURRENT_DESKTOP", "sway");
     cmd.env("WAYLAND_DISPLAY", &display);
     cmd.env("XDG_RUNTIME_DIR", &runtime);
+    let helper_pid = root.path().join("helper-pid");
+    if slow {
+        let helper = root.path().join("swaymsg");
+        fs::write(
+            &helper,
+            "#!/bin/sh\necho $$ > \"$KAI_HELPER_PID\"\n/bin/sleep 30\n",
+        )
+        .unwrap();
+        fs::set_permissions(helper, fs::Permissions::from_mode(0o700)).unwrap();
+        cmd.env("PATH", root.path());
+        cmd.env("KAI_HELPER_PID", &helper_pid);
+    }
     let mut watcher = Watcher(pair.slave.spawn_command(cmd).unwrap());
     let mut input = pair.master.take_writer().unwrap();
     let mut output = pair.master.try_clone_reader().unwrap();
@@ -206,11 +229,67 @@ fn enter_focuses_selected_window_without_leaving_the_dashboard() {
     input.write_all(title.as_bytes()).unwrap();
     input.write_all(b"\r").unwrap();
     input.flush().unwrap();
-    wait(|| focused(&tree(&ipc), first.0.id()));
-    assert!(watcher.0.try_wait().unwrap().is_none());
-    input.write_all(&[3]).unwrap();
-    input.flush().unwrap();
-    wait(|| watcher.0.try_wait().unwrap().is_some());
+    if slow {
+        let await_helper = || {
+            let mut pid = None;
+            wait(|| {
+                pid = fs::read_to_string(&helper_pid)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i32>().ok());
+                pid.is_some()
+            });
+            pid.unwrap()
+        };
+        let pid = await_helper();
+        let began = Instant::now();
+        input.write_all(&[5]).unwrap(); // Ctrl-E must work while swaymsg is sleeping.
+        input.flush().unwrap();
+        wait(|| {
+            screen.extend(recv.try_iter().flatten());
+            String::from_utf8_lossy(&screen).contains("Thread focus-fixture")
+        });
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "details blocked behind focus helper"
+        );
+        input.write_all(&[27]).unwrap(); // Esc cancels without quitting or clearing search.
+        input.flush().unwrap();
+        wait(|| {
+            // SAFETY: signal 0 only checks whether the cancelled helper is still alive.
+            unsafe { libc::kill(pid, 0) == -1 }
+        });
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "cancellation waited for helper timeout"
+        );
+        assert!(watcher.0.try_wait().unwrap().is_none());
+        assert!(focused(&tree(&ipc), second.0.id()));
+        fs::remove_file(&helper_pid).unwrap();
+        // Allow one UI poll to collect the cancelled operation before starting the next.
+        thread::sleep(Duration::from_millis(100));
+        input.write_all(b"\r").unwrap();
+        input.flush().unwrap();
+        let pid = await_helper();
+        let began = Instant::now();
+        input.write_all(&[3]).unwrap();
+        input.flush().unwrap();
+        wait(|| watcher.0.try_wait().unwrap().is_some());
+        assert!(
+            began.elapsed() < Duration::from_secs(1),
+            "quit waited for helper timeout"
+        );
+        // SAFETY: the helper should have been reaped before Kai exited.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert!(focused(&tree(&ipc), second.0.id()));
+    } else {
+        wait(|| focused(&tree(&ipc), first.0.id()));
+    }
+    if !slow {
+        assert!(watcher.0.try_wait().unwrap().is_none());
+        input.write_all(&[3]).unwrap();
+        input.flush().unwrap();
+        wait(|| watcher.0.try_wait().unwrap().is_some());
+    }
     drop(pair.slave);
     drop(watcher);
     drop(input);

@@ -46,11 +46,26 @@ pub(super) fn arguments(bytes: &[u8]) -> Result<Arguments> {
     })
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct Files {
     pub cwd: Option<PathBuf>,
     pub tty: Option<String>,
     pub transcripts: BTreeSet<PathBuf>,
+}
+
+pub(super) fn file_result(output: super::command::Output) -> Result<HashMap<u32, Files>> {
+    ensure!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "lsof could not inspect session files ({})",
+        output.status
+    );
+    // Exit 1 can mean that just one requested process disappeared. Preserve every
+    // returned process and let discovery identify missing PIDs individually.
+    open_files(&output.stdout)
+}
+
+pub(super) fn take_files(files: &mut HashMap<u32, Files>, pid: u32) -> Result<Files> {
+    files.remove(&pid).with_context(|| format!("lsof returned no file records for process {pid}; it may have exited or access was denied"))
 }
 
 pub(super) fn open_files(bytes: &[u8]) -> Result<HashMap<u32, Files>> {
@@ -62,6 +77,7 @@ pub(super) fn open_files(bytes: &[u8]) -> Result<HashMap<u32, Files>> {
         match field.first() {
             Some(b'p') => {
                 pid = Some(std::str::from_utf8(&field[1..])?.parse::<u32>()?);
+                files.entry(pid.unwrap()).or_default();
                 fd = b"";
             }
             Some(b'f') => fd = &field[1..],
@@ -113,5 +129,35 @@ mod tests {
         assert_eq!(files[&11].transcripts.len(), 1);
         let files = open_files(b"p10\0\nfcwd\0n/dir with spaces\0\n").unwrap();
         assert_eq!(files[&10].cwd, Some(PathBuf::from("/dir with spaces")));
+    }
+
+    #[test]
+    fn partial_lsof_failure_preserves_other_processes_and_only_marks_missing_pids() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut files = file_result(super::super::command::Output {
+            stdout: b"p10\0\nfcwd\0n/valid\0\np11\0\nf3\0n/tmp/rollout-main.jsonl\0\np12\0\n"
+                .to_vec(),
+            status: std::process::ExitStatus::from_raw(1 << 8),
+        })
+        .unwrap();
+        assert!(
+            take_files(&mut files, 99)
+                .unwrap_err()
+                .to_string()
+                .contains("99")
+        );
+        assert_eq!(
+            take_files(&mut files, 10).unwrap().cwd,
+            Some(PathBuf::from("/valid"))
+        );
+        assert_eq!(take_files(&mut files, 11).unwrap().transcripts.len(), 1);
+        assert!(take_files(&mut files, 12).unwrap().transcripts.is_empty());
+        assert!(
+            file_result(super::super::command::Output {
+                stdout: Vec::new(),
+                status: std::process::ExitStatus::from_raw(libc::SIGKILL),
+            })
+            .is_err()
+        );
     }
 }

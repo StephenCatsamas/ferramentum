@@ -3,6 +3,7 @@
 use super::observer::{Observer, Row, Snapshot, age, now, safe_text};
 use super::process::ProcessIdentity;
 use super::transcript::TurnState;
+use super::worker::Worker;
 use anyhow::Result;
 use crossterm::{
     cursor,
@@ -29,30 +30,82 @@ use std::{
 use unicode_width::UnicodeWidthStr;
 
 pub(super) fn watch(interval: Duration) -> Result<()> {
+    let mut observer = Observer::default();
+    let mut observation = Worker::new(move |(), cancel| observer.snapshot(now(), cancel));
+    let mut focusing = Worker::new(super::focus::focus);
+    // Restore the terminal before joining cancelled workers during shutdown.
     let _screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut observer = Observer::default();
-    let mut snapshot = observer.snapshot(now())?;
+    let mut snapshot = Snapshot {
+        version: 1,
+        observed_at: now(),
+        windows: Vec::new(),
+        warnings: Vec::new(),
+    };
     let mut view = View::new(Palette::from_env());
+    view.loading = true;
     view.reconcile(&snapshot);
-    let mut next_refresh = Instant::now() + interval;
+    let mut next_refresh = Instant::now();
     let mut dirty = true;
     loop {
-        if Instant::now() >= next_refresh {
-            snapshot = observer.snapshot(now())?;
-            view.reconcile(&snapshot);
+        if let Some(result) = observation.poll() {
+            view.loading = false;
+            match result {
+                Ok(update) => {
+                    snapshot = update;
+                    view.refresh_error = None;
+                    view.reconcile(&snapshot);
+                }
+                Err(error) => view.refresh_error = Some(format!("Refresh failed: {error:#}")),
+            }
             next_refresh = Instant::now() + interval;
+            dirty = true;
+        }
+        if !observation.busy() && Instant::now() >= next_refresh {
+            observation.start(())?;
+        }
+        if let Some(result) = focusing.poll() {
+            let target = view.focusing;
+            view.focusing = None;
+            view.notice = result.err().map(|error| {
+                safe_text(
+                    &format!(
+                        "PID {}: {error:#}",
+                        target.map_or(0, |identity| identity.pid)
+                    ),
+                    2048,
+                )
+            });
+            view.focus_error.clone_from(&view.notice);
             dirty = true;
         }
         if dirty {
             terminal.draw(|frame| view.draw(frame, &snapshot, interval))?;
             dirty = false;
         }
-        if event::poll(next_refresh.saturating_duration_since(Instant::now()))? {
+        let tick = Duration::from_millis(50);
+        let wait = if observation.busy() {
+            tick
+        } else {
+            tick.min(next_refresh.saturating_duration_since(Instant::now()))
+        };
+        if event::poll(wait)? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if key.code == KeyCode::Enter && key.modifiers.is_empty() {
-                        view.focus_selected(&snapshot, super::focus::focus);
+                    if key.code == KeyCode::Esc && focusing.busy() {
+                        focusing.cancel();
+                        view.focusing = None;
+                        view.notice = Some("Window switching cancelled.".into());
+                    } else if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                        if !focusing.busy() {
+                            let mut target = None;
+                            view.focus_selected(&snapshot, |identity| {
+                                focusing.start(identity)?;
+                                target = Some(identity);
+                                Ok(())
+                            });
+                            view.focusing = target;
+                        }
                     } else if view.key(key, &snapshot) {
                         break;
                     }
@@ -103,26 +156,28 @@ impl Drop for Screen {
 enum Filter {
     #[default]
     All,
-    Working,
-    Finished,
+    Active,
+    Recent,
 }
 impl Filter {
-    const ALL: [Self; 3] = [Self::All, Self::Working, Self::Finished];
+    const ALL: [Self; 3] = [Self::All, Self::Active, Self::Recent];
     fn label(self) -> &'static str {
         match self {
             Self::All => "All",
-            Self::Working => "Working",
-            Self::Finished => "Finished",
+            Self::Active => "Active",
+            Self::Recent => "Recent 15m",
         }
     }
-    fn includes(self, row: &Row) -> bool {
+    fn includes(self, row: &Row, observed_at: u64) -> bool {
         match self {
             Self::All => true,
-            Self::Working => matches!(row.state, TurnState::Working | TurnState::NeedsInput),
-            Self::Finished => matches!(
-                row.state,
-                TurnState::Ready | TurnState::Interrupted | TurnState::Error | TurnState::Exited
-            ),
+            Self::Active => matches!(row.state, TurnState::Working | TurnState::NeedsInput),
+            // Only recorded turn endings qualify, including errors/interruptions.
+            // A process exit alone is not a completed turn; a new turn may already be active.
+            Self::Recent => row
+                .last_finished_at
+                .and_then(|at| u64::try_from(at).ok())
+                .is_some_and(|at| at <= observed_at && observed_at - at < 15 * 60),
         }
     }
     fn cycle(self, backwards: bool) -> Self {
@@ -196,6 +251,13 @@ struct View {
     page_size: usize,
     palette: Palette,
     notice: Option<String>,
+    focus_error: Option<String>,
+    loading: bool,
+    focusing: Option<ProcessIdentity>,
+    refresh_error: Option<String>,
+    detail_scroll: usize,
+    detail_max: usize,
+    detail_page: usize,
 }
 
 impl View {
@@ -211,6 +273,13 @@ impl View {
             page_size: 1,
             palette,
             notice: None,
+            focus_error: None,
+            loading: false,
+            focusing: None,
+            refresh_error: None,
+            detail_scroll: 0,
+            detail_max: 0,
+            detail_page: 1,
         }
     }
 
@@ -221,7 +290,7 @@ impl View {
             .iter()
             .enumerate()
             .filter(|(_, row)| {
-                self.filter.includes(row)
+                self.filter.includes(row, snapshot.observed_at)
                     && (query.is_empty()
                         || [
                             row.thread_name.as_deref().unwrap_or("Unnamed thread"),
@@ -236,6 +305,10 @@ impl View {
             })
             .map(|(index, _)| index)
             .collect();
+        if self.filter == Filter::Recent {
+            self.visible
+                .sort_by_key(|index| std::cmp::Reverse(snapshot.windows[*index].last_finished_at));
+        }
         let index = self
             .visible
             .iter()
@@ -250,11 +323,15 @@ impl View {
     }
 
     fn select(&mut self, index: usize, snapshot: &Snapshot) {
+        let previous = self.selected;
         self.selected = self
             .visible
             .get(index)
             .map(|index| snapshot.windows[*index].identity);
         self.list.select(self.selected.map(|_| index));
+        if self.selected != previous {
+            self.detail_scroll = 0;
+        }
     }
 
     fn add_query(&mut self, text: &str) {
@@ -278,10 +355,22 @@ impl View {
             KeyCode::Esc if self.query.is_empty() => return true,
             KeyCode::Esc => self.query.clear(),
             KeyCode::Char('o') if control => self.dense = !self.dense,
-            KeyCode::Char('e') if control => self.expanded = !self.expanded,
+            KeyCode::Char('e') if control => {
+                self.expanded = !self.expanded;
+                self.detail_scroll = 0;
+            }
             KeyCode::Char('u') if control => self.query.clear(),
             KeyCode::Up => self.select(index.saturating_sub(1), snapshot),
             KeyCode::Down => self.select(index.saturating_add(1).min(last), snapshot),
+            KeyCode::PageUp if self.expanded => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(self.detail_page)
+            }
+            KeyCode::PageDown if self.expanded => {
+                self.detail_scroll = self
+                    .detail_scroll
+                    .saturating_add(self.detail_page)
+                    .min(self.detail_max)
+            }
             KeyCode::PageUp => self.select(index.saturating_sub(self.page_size), snapshot),
             KeyCode::PageDown => {
                 self.select(index.saturating_add(self.page_size).min(last), snapshot)
@@ -309,6 +398,7 @@ impl View {
         focus: impl FnOnce(ProcessIdentity) -> Result<()>,
     ) {
         self.notice = None;
+        self.focus_error = None;
         let Some(row) = snapshot
             .windows
             .iter()
@@ -321,20 +411,35 @@ impl View {
         } else {
             focus(row.identity)
                 .err()
-                .map(|error| safe_text(&error.to_string(), 512))
+                .map(|error| safe_text(&format!("{error:#}"), 2048))
         };
+        self.focus_error.clone_from(&self.notice);
     }
 
     fn draw(&mut self, frame: &mut Frame, snapshot: &Snapshot, interval: Duration) {
         let area = frame.area();
         // Match the resume picker's collapsing vertical gaps and one-column chrome inset.
         let gap = u16::from(area.height >= 18);
+        let focus_message = self
+            .focusing
+            .map(|identity| format!("Focusing PID {}…  Esc cancels", identity.pid));
         let notice_lines = wrap_notice(
-            self.notice.as_deref().unwrap_or_default(),
+            focus_message
+                .as_deref()
+                .or(self.notice.as_deref())
+                .unwrap_or_default(),
             area.width.saturating_sub(2).into(),
         );
-        let notice_height = notice_lines.len().min(area.height.saturating_sub(4).into()) as u16;
+        let notice_height = notice_lines.len().min(usize::from(area.height / 3)) as u16;
         let notice = Paragraph::new(notice_lines.into_iter().map(Line::from).collect::<Vec<_>>());
+        let details = if self.expanded {
+            self.details(snapshot, area.width.saturating_sub(2).into())
+        } else {
+            Vec::new()
+        };
+        let detail_height = details
+            .len()
+            .min(usize::from(area.height.saturating_sub(8) / 2)) as u16;
         let [
             header,
             _,
@@ -344,6 +449,7 @@ impl View {
             message,
             columns,
             list,
+            detail_area,
             footer,
         ] = Layout::vertical([
             Constraint::Length(1),
@@ -354,6 +460,7 @@ impl View {
             Constraint::Length(notice_height),
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(detail_height),
             Constraint::Length(3),
         ])
         .areas(area);
@@ -365,7 +472,7 @@ impl View {
                 rect.height,
             )
         };
-        let header_text = format!(
+        let mut header_text = format!(
             "Kai windows  ·  {} open",
             snapshot
                 .windows
@@ -373,8 +480,30 @@ impl View {
                 .filter(|row| row.exited_at.is_none())
                 .count()
         );
+        if self.loading {
+            header_text = "Kai windows  ·  Loading…".into();
+        } else if self.refresh_error.is_some() {
+            header_text.push_str("  ·  Stale · Ctrl+E details");
+        } else if !snapshot.warnings.is_empty() {
+            header_text.push_str("  ·  Discovery warnings · Ctrl+E details");
+        }
         frame.render_widget(Line::from(header_text).bold(), inset(header));
         frame.render_widget(notice, inset(message));
+        self.detail_page = usize::from(detail_height).max(1);
+        self.detail_max = details.len().saturating_sub(self.detail_page);
+        self.detail_scroll = self.detail_scroll.min(self.detail_max);
+        frame.render_widget(
+            Paragraph::new(
+                details
+                    .into_iter()
+                    .skip(self.detail_scroll)
+                    .take(self.detail_page)
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            )
+            .style(self.palette.secondary),
+            inset(detail_area),
+        );
         let mut tabs = vec![Span::styled("Filter: ", self.palette.secondary)];
         for filter in Filter::ALL {
             let style = if self.filter == filter {
@@ -404,7 +533,7 @@ impl View {
         let compact = area.width < 62;
         let cols = Columns::new(area.width);
         let last_finished = if cols.finished > 0 {
-            format!("{:width$}", "Last finished", width = cols.finished)
+            format!("{:width$}", "Last ended", width = cols.finished)
         } else {
             String::new()
         };
@@ -412,7 +541,7 @@ impl View {
             Line::from(format!(
                 "  {:state_width$}{:time_width$}{last_finished}Thread",
                 "State",
-                "Run time",
+                "Turn time",
                 state_width = cols.state,
                 time_width = cols.time
             ))
@@ -423,7 +552,11 @@ impl View {
         let list = inset(list);
         self.page_size = (usize::from(list.height) / if self.dense { 1 } else { 3 }).max(1);
         if self.visible.is_empty() {
-            let message = if snapshot.windows.is_empty() {
+            let message = if self.loading {
+                "Looking for Kai windows…"
+            } else if self.refresh_error.is_some() && snapshot.windows.is_empty() {
+                "Discovery failed · Ctrl+E details"
+            } else if snapshot.windows.is_empty() {
                 "No Kai windows"
             } else {
                 "No matching windows"
@@ -468,7 +601,9 @@ impl View {
                     Rect::new(rule.right() - width - 1, rule.y, width, 1),
                 );
             }
-            let quit = if self.notice.is_some() {
+            let quit = if self.focusing.is_some() {
+                "cancel focus"
+            } else if self.notice.is_some() {
                 "dismiss"
             } else if self.query.is_empty() {
                 "quit"
@@ -506,7 +641,7 @@ impl View {
                         &[
                             ("ctrl+o", density),
                             ("ctrl+e", "details"),
-                            ("pgup/pgdn", "page"),
+                            ("pgup/pgdn", if self.expanded { "details" } else { "page" }),
                         ],
                         self.palette.secondary,
                         inset(footer).width,
@@ -582,7 +717,7 @@ impl View {
             },
         ));
         let mut lines = vec![Line::from(summary)];
-        if !self.dense || (selected && self.expanded) {
+        if !self.dense {
             lines.push(
                 Line::from(clip(
                     &format!(
@@ -599,16 +734,7 @@ impl View {
                 .map_or_else(|| "—".into(), |at| age(observed_at, at));
             lines.push(
                 Line::from(clip(
-                    &format!("Last finished {finished}  ·  PID {}", row.pid),
-                    width.into(),
-                ))
-                .style(normal),
-            );
-        }
-        if selected && self.expanded {
-            lines.push(
-                Line::from(clip(
-                    &format!("Thread {}", row.thread_id.as_deref().unwrap_or("—")),
+                    &format!("Last ended {finished}  ·  PID {}", row.pid),
                     width.into(),
                 ))
                 .style(normal),
@@ -616,9 +742,53 @@ impl View {
         }
         ListItem::new(lines)
     }
+
+    fn details(&self, snapshot: &Snapshot, width: usize) -> Vec<String> {
+        let mut messages = vec!["Details · PgUp/PgDn scroll".to_owned()];
+        if let Some(error) = &self.focus_error {
+            messages.push(format!("Window switching: {error}"));
+        }
+        if let Some(error) = &self.refresh_error {
+            messages.push(error.clone());
+        }
+        for warning in &snapshot.warnings {
+            messages.push(format!("Discovery: {warning}"));
+        }
+        if let Some(row) = snapshot
+            .windows
+            .iter()
+            .find(|row| Some(row.identity) == self.selected)
+        {
+            if let Some(detail) = &row.detail {
+                messages.push(format!("{}: {detail}", row.state.label()));
+            }
+            messages.push(format!(
+                "{}  ·  {}",
+                row.tty.as_deref().unwrap_or("no tty"),
+                row.cwd.as_deref().unwrap_or("—")
+            ));
+            messages.push(format!(
+                "Last ended {}  ·  PID {}",
+                row.last_finished_at
+                    .map_or_else(|| "—".into(), |at| age(snapshot.observed_at, at)),
+                row.pid
+            ));
+            messages.push(format!(
+                "Thread {}",
+                row.thread_id.as_deref().unwrap_or("—")
+            ));
+        }
+        messages
+            .into_iter()
+            .flat_map(|message| wrap_notice(&safe_text(&message, 4096), width))
+            .collect()
+    }
 }
 
 fn wrap_notice(message: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
     let mut lines = Vec::new();
     let mut line = String::new();
     for word in message.split_whitespace() {
@@ -628,7 +798,16 @@ fn wrap_notice(message: &str, width: usize) -> Vec<String> {
         if !line.is_empty() {
             line.push(' ');
         }
-        line.push_str(word);
+        for ch in word.chars() {
+            let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if ch_width > width {
+                continue;
+            }
+            if line.width() + ch_width > width {
+                lines.push(std::mem::take(&mut line));
+            }
+            line.push(ch);
+        }
     }
     if !line.is_empty() {
         lines.push(line);
@@ -638,9 +817,9 @@ fn wrap_notice(message: &str, width: usize) -> Vec<String> {
 
 fn short_state(state: TurnState) -> &'static str {
     match state {
-        TurnState::Working => "Run",
+        TurnState::Working => "Act",
         TurnState::NeedsInput => "Input",
-        TurnState::Ready => "Done",
+        TurnState::Ready => "Ready",
         TurnState::Interrupted => "Stop",
         TurnState::Error => "Err",
         TurnState::Unknown => "?",
@@ -658,7 +837,7 @@ impl Columns {
     fn new(width: u16) -> Self {
         Self {
             state: if width < 62 { 6 } else { 12 },
-            time: if width < 62 { 9 } else { 11 },
+            time: if width < 62 { 10 } else { 11 },
             finished: if width >= 88 { 14 } else { 0 },
         }
     }

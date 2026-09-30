@@ -23,6 +23,8 @@ mod process_macos;
 mod transcript;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod ui;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod worker;
 
 use anyhow::{Result, bail};
 use clap::Args;
@@ -70,6 +72,7 @@ mod observer {
     use super::names::Names;
     use super::process::{ProcessIdentity, Window, discover, same_process};
     use super::transcript::{Transcript, TurnState};
+    use super::worker::Cancellation;
     use super::*;
     use crossterm::terminal;
     use serde::Serialize;
@@ -115,27 +118,49 @@ mod observer {
     }
 
     impl Observer {
-        pub(super) fn snapshot(&mut self, now: u64) -> Result<Snapshot> {
-            let (windows, warnings) = discover(std::process::id())?;
-            Ok(self.observe(windows, warnings, now, same_process))
+        pub(super) fn snapshot(&mut self, now: u64, cancel: &Cancellation) -> Result<Snapshot> {
+            let (windows, warnings) = discover(std::process::id(), cancel)?;
+            self.observe_with_cancel(windows, warnings, now, same_process, cancel)
         }
 
+        #[cfg(test)]
         fn observe(
+            &mut self,
+            windows: Vec<Window>,
+            warnings: Vec<String>,
+            now: u64,
+            still_alive: impl FnMut(ProcessIdentity) -> io::Result<bool>,
+        ) -> Snapshot {
+            self.observe_with_cancel(
+                windows,
+                warnings,
+                now,
+                still_alive,
+                &Cancellation::default(),
+            )
+            .unwrap()
+        }
+
+        fn observe_with_cancel(
             &mut self,
             windows: Vec<Window>,
             mut warnings: Vec<String>,
             now: u64,
             mut still_alive: impl FnMut(ProcessIdentity) -> io::Result<bool>,
-        ) -> Snapshot {
+            cancel: &Cancellation,
+        ) -> Result<Snapshot> {
+            cancel.check()?;
             let mut live = HashSet::new();
             let mut paths = HashSet::new();
             self.names
                 .refresh(windows.iter().flat_map(|window| window.transcripts.iter()));
             for window in windows {
+                cancel.check()?;
                 live.insert(window.identity);
                 let mut roots = Vec::new();
                 let mut errors = Vec::new();
                 for path in &window.transcripts {
+                    cancel.check()?;
                     paths.insert(path.clone());
                     let transcript = self.transcripts.entry(path.clone()).or_default();
                     match transcript.refresh(path) {
@@ -231,12 +256,12 @@ mod observer {
             });
             warnings.sort();
             warnings.dedup();
-            Snapshot {
+            Ok(Snapshot {
                 version: 1,
                 observed_at: now,
                 windows: rows,
                 warnings,
-            }
+            })
         }
     }
 
@@ -263,7 +288,7 @@ mod observer {
         let mut observer = Observer::default();
         loop {
             let started = Instant::now();
-            let snapshot = observer.snapshot(now())?;
+            let snapshot = observer.snapshot(now(), &Cancellation::default())?;
             if args.json {
                 let mut stdout = io::stdout().lock();
                 serde_json::to_writer(&mut stdout, &snapshot)?;
@@ -309,7 +334,7 @@ mod observer {
         )];
         lines.push(format!(
             "{:<11} {:<8} {:<9} {:<10} {:<14} {}",
-            "STATE", "PID", "TTY", "RUN TIME", "LAST FINISHED", "THREAD / DIRECTORY"
+            "STATE", "PID", "TTY", "TURN TIME", "LAST ENDED", "THREAD / DIRECTORY"
         ));
         if snapshot.windows.is_empty() {
             lines.push("No Kai windows found for this user.".into());

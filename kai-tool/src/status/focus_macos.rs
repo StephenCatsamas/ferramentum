@@ -1,9 +1,10 @@
 //! Beta macOS activation. Match the session's exact tty, including inactive tabs/panes.
-use super::{command, process::ProcessIdentity, process_macos as process};
+use super::{command, process::ProcessIdentity, process_macos as process, worker::Cancellation};
 use anyhow::{Context, Result, bail, ensure};
 use std::time::Duration;
 
-pub(super) fn focus(identity: ProcessIdentity) -> Result<()> {
+pub(super) fn focus(identity: ProcessIdentity, cancel: &Cancellation) -> Result<()> {
+    cancel.check()?;
     let chain =
         process::ancestry(identity).context("The session changed. Refresh and try again.")?;
     let args = process::process_arguments(identity.pid)?;
@@ -31,7 +32,7 @@ pub(super) fn focus(identity: ProcessIdentity) -> Result<()> {
             "Window switching on macOS currently supports Terminal and iTerm2. Press Ctrl+E for terminal details."
         ),
     };
-    let mut files = process::files(&[identity.pid])?;
+    let mut files = process::files(&[identity.pid], cancel)?;
     let tty = files
         .remove(&identity.pid)
         .and_then(|files| files.tty)
@@ -40,7 +41,7 @@ pub(super) fn focus(identity: ProcessIdentity) -> Result<()> {
         process::ancestry(identity)? == chain,
         "The session changed. Refresh and try again."
     );
-    let reply = command::run("/usr/bin/osascript", &["-e", script, &tty], Duration::from_secs(8))
+    let reply = command::run("/usr/bin/osascript", &["-e", script, &tty], Duration::from_secs(8), cancel)
         .context("Cannot switch terminal windows. Allow terminal automation in System Settings > Privacy & Security > Automation, then try again.")?;
     match reply.trim_ascii() {
         b"focused" => Ok(()),
