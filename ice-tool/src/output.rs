@@ -268,6 +268,8 @@ pub(crate) fn vast_offer(offer: &VastOffer) -> Value {
         "download_usd_per_gb": offer.inet_down_cost, "upload_usd_per_gb": offer.inet_up_cost,
         "num_gpus": offer.num_gpus, "cpu_cores": offer.cpu_cores_effective,
         "ram_mb": offer.cpu_ram, "hourly_usd": offer.hourly_price(),
+        "provider_hourly_usd": offer.dph_total,
+        "quoted_total_hourly_usd": offer.quoted_total_hourly_price(),
         "available_seconds": offer.duration, "location": offer.geolocation,
         "verification": offer.verification, "reliability": offer.reliability,
     })
@@ -411,6 +413,9 @@ mod tests {
         let value = vast_offer(&offer);
         assert_eq!(value["offer_id"], 123);
         assert_eq!(value["num_gpus"], 1);
+        assert_eq!(value["hourly_usd"], 0.15);
+        assert_eq!(value["provider_hourly_usd"], 0.12);
+        assert_eq!(value["quoted_total_hourly_usd"], 0.15);
         assert_eq!(offer.quoted_total_hourly_price(), Some(0.15));
         assert!(!value.to_string().contains("secret-"));
         let incomplete: VastOffer = serde_json::from_value(json!({"id": 456})).unwrap();

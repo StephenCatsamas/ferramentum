@@ -257,7 +257,7 @@ pub(crate) struct CreateArgs {
     /// Clear the saved GPU model filter. Use --gpu-count 0 to require CPU-only.
     #[arg(long, conflicts_with = "gpus")]
     pub(crate) no_gpu: bool,
-    /// Maximum USD/hr. Verda includes compute + OS disk; bandwidth/taxes are separate.
+    /// Maximum USD/hr: compute + allocated disk on Vast/Verda; compute on GCP/AWS. Excludes bandwidth/taxes.
     #[arg(long, value_name = "USD")]
     pub(crate) max_price_per_hr: Option<f64>,
     /// Runtime hours (Verda: cost estimate only, no enforced deadline). Defaults to saved value, then 1.

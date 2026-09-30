@@ -16,8 +16,7 @@ use crate::model::{
 };
 use crate::providers::{aws, gcp, vast::VastClient, vast::VastOffer};
 use crate::support::{
-    now_unix_secs, prompt_f64, prompt_theme, prompt_u32, require_interactive,
-    required_runtime_seconds, spinner,
+    prompt_f64, prompt_theme, prompt_u32, require_interactive, required_runtime_seconds, spinner,
 };
 
 const VAST_DEFAULT_SEARCH_LIMIT: u64 = 200;
@@ -110,13 +109,24 @@ pub(crate) fn find_cheapest_offer(
     let duration_seconds = required_runtime_seconds(hours) as f64;
     let query = vast_search_query(req, hours, machine_override);
     let spinner = spinner("Searching vast.ai offers...");
-    let mut offers = client.search_offers(&query)?;
+    let offers = client.search_offers(&query)?;
     spinner.finish_with_message(format!("Found {} matching offers.", offers.len()));
 
+    select_vast_offer(offers, req, duration_seconds, excluded_offer_ids)
+}
+
+fn select_vast_offer(
+    mut offers: Vec<VastOffer>,
+    req: &CreateSearchRequirements,
+    duration_seconds: f64,
+    excluded_offer_ids: &HashSet<u64>,
+) -> Result<VastOffer> {
     offers.retain(|offer| {
         vast_offer_matches(offer, req)
             && !excluded_offer_ids.contains(&offer.id)
-            && offer.hourly_price().is_finite()
+            && offer
+                .quoted_total_hourly_price()
+                .is_some_and(|price| price <= req.max_price_per_hr)
             && offer_duration_seconds(offer)
                 .map(|duration| duration >= duration_seconds)
                 .unwrap_or(false)
@@ -124,8 +134,9 @@ pub(crate) fn find_cheapest_offer(
     if offers.is_empty() {
         return Err(crate::automation::error(
             "no_matching_offers",
-            "No Vast offers satisfy the effective filters and required availability.",
-            json!({"excluded_offer_ids": excluded_offer_ids}),
+            "No Vast offers satisfy the filters, availability and compute-plus-storage price ceiling with a valid on-demand quote.",
+            json!({"excluded_offer_ids": excluded_offer_ids, "max_price_per_hr": req.max_price_per_hr,
+                "cost_scope": "compute_and_allocated_storage", "required_quote": "search.totalHour"}),
         ));
     }
 
@@ -202,8 +213,9 @@ fn estimated_billed_hours(cloud: Cloud, requested_hours: f64) -> f64 {
 
 pub(crate) fn apply_vast_autostop_cost_estimate(
     cost: RuntimeCostEstimate,
+    start_unix: u64,
 ) -> Result<RuntimeCostEstimate> {
-    let plan = build_vast_autostop_plan(now_unix_secs(), cost.requested_hours)?;
+    let plan = build_vast_autostop_plan(start_unix, cost.requested_hours)?;
     let total_usd = cost.hourly_usd * plan.runtime_hours;
     Ok(RuntimeCostEstimate {
         requested_hours: cost.requested_hours,
@@ -228,6 +240,17 @@ pub(crate) fn build_vast_autostop_plan(
         .saturating_sub(start_unix)
         .max(min_runtime_secs)
         .max(1);
+
+    // Vast's recorded HOURLY job ran before its start_time in the trial.
+    // A pinned weekly calendar must have no earlier occurrence even if that
+    // boundary is ignored. Do not accept a rental that cannot meet this guard.
+    if runtime_secs >= 7 * 24 * 3600 {
+        return Err(crate::automation::error(
+            "auto_stop_window_unsupported",
+            "Vast auto-stop must fall less than seven days ahead after rounding to a UTC hour; shorten --hours.",
+            json!({"requested_hours": requested_hours, "scheduled_hours": runtime_secs as f64 / 3600.0}),
+        ));
+    }
 
     Ok(VastAutoStopPlan {
         stop_at_unix,
@@ -316,6 +339,7 @@ pub(crate) fn print_offer_summary(
     offer: &VastOffer,
     cost: &RuntimeCostEstimate,
     req: &CreateSearchRequirements,
+    stop_at_unix: u64,
 ) {
     let cpu = offer.cpu_cores_effective.unwrap_or(0.0);
     let ram_gb = offer.cpu_ram.unwrap_or(0.0) / 1000.0;
@@ -329,7 +353,14 @@ pub(crate) fn print_offer_summary(
     println!("Best matching offer:");
     let mut entries = vec![
         ("Offer ID".to_owned(), offer.id.to_string()),
-        ("Price".to_owned(), format!("${:.4}/hr", cost.hourly_usd)),
+        (
+            "Compute + allocated storage".to_owned(),
+            format!("${:.4}/hr", cost.hourly_usd),
+        ),
+        (
+            "Planned stop (UTC)".to_owned(),
+            crate::support::format_unix_utc(stop_at_unix),
+        ),
         ("GPU".to_owned(), format!("{gpu} x{num_gpus}{gpu_relative}")),
         ("CPU".to_owned(), format!("{cpu:.1} vCPU")),
         ("RAM".to_owned(), format!("{ram_gb:.1} GB")),
@@ -350,8 +381,23 @@ pub(crate) fn print_offer_summary(
         ));
     }
     entries.push((
-        "Estimated compute cost".to_owned(),
+        "Estimated cost (excluding bandwidth)".to_owned(),
         format!("${:.4}", cost.total_usd),
+    ));
+    for (name, rate) in [
+        ("Download", offer.inet_down_cost),
+        ("Upload", offer.inet_up_cost),
+    ] {
+        entries.push((
+            format!("{name} bandwidth"),
+            rate.filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| format!("${v:.6}/GB extra"))
+                .unwrap_or_else(|| "unknown; billed separately".to_owned()),
+        ));
+    }
+    entries.push((
+        "After stop".to_owned(),
+        "Storage billing continues until deletion".to_owned(),
     ));
     if let Some(location) = offer.geolocation.as_deref() {
         entries.push(("Location".to_owned(), location.to_owned()));
@@ -819,6 +865,84 @@ mod filter_tests {
     fn offer() -> Value {
         json!({"id": 123, "num_gpus": 1, "gpu_ram": 24000, "disk_space": 80,
             "inet_down": 500, "inet_up": 100, "dph_total": 0.4})
+    }
+
+    #[test]
+    fn selection_ranks_and_limits_the_allocated_storage_quote() {
+        let make = |id, base, total| {
+            serde_json::from_value(json!({
+                "id": id, "dph_total": base, "search": {"totalHour": total}, "duration": 7200
+            }))
+            .unwrap()
+        };
+        let req = CreateSearchRequirements {
+            max_price_per_hr: 0.5,
+            ..Default::default()
+        };
+        let selected = select_vast_offer(
+            vec![make(1, 0.1, 0.7), make(2, 0.3, 0.4), make(3, 0.2, 0.45)],
+            &req,
+            3600.0,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(selected.id, 2);
+        assert_eq!(selected.hourly_price(), 0.4);
+        let err =
+            select_vast_offer(vec![make(1, 0.1, 0.7)], &req, 3600.0, &HashSet::new()).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<crate::automation::AgentError>()
+                .unwrap()
+                .code,
+            "no_matching_offers"
+        );
+    }
+
+    #[test]
+    fn an_unquoted_or_discount_only_offer_cannot_bypass_the_ceiling() {
+        for search in [
+            Value::Null,
+            json!({"discountedTotalPerHour": 0.01}),
+            json!({"totalHour": 0}),
+            json!({"totalHour": -1}),
+        ] {
+            let offer = serde_json::from_value(json!({"id": 1, "dph_total": 0.01,
+                "search": search, "duration": 7200}))
+            .unwrap();
+            assert!(
+                select_vast_offer(
+                    vec![offer],
+                    &CreateSearchRequirements {
+                        max_price_per_hr: 0.5,
+                        ..Default::default()
+                    },
+                    3600.0,
+                    &HashSet::new()
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn offer_availability_must_cover_the_rounded_stop_deadline() {
+        let start = 1_790_571_601; // Just after a UTC hour boundary.
+        let plan = build_vast_autostop_plan(start, 0.25).unwrap();
+        let offer = serde_json::from_value(json!({"id": 1, "duration": 1800,
+            "dph_total": 0.1, "search": {"totalHour": 0.1}}))
+        .unwrap();
+        assert!(
+            select_vast_offer(
+                vec![offer],
+                &CreateSearchRequirements {
+                    max_price_per_hr: 0.5,
+                    ..Default::default()
+                },
+                plan.runtime_hours * 3600.0,
+                &HashSet::new()
+            )
+            .is_err()
+        );
     }
 
     #[test]

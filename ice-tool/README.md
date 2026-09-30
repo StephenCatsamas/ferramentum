@@ -94,10 +94,14 @@ Successful commands other than `logs` write one JSON object and a newline to std
   includes the instance ID. Vast results include allocated disk, the requested
   image reference and the scheduled UTC stop time as Unix seconds. An automatic
   image reference is not a verified image digest or installed toolkit version.
-- Cost values have explicit units. GCP/AWS estimates cover compute. Vast
-  `cost` uses the same provider rate as normal output; `quoted_total_hourly_usd`
-  separately reports the provider's total for the allocated storage when supplied,
-  or `null` when absent. AWS disk size is `null` when the AMI determines it.
+- Cost values have explicit units. GCP/AWS estimates cover compute. Vast selection,
+  `--max-price-per-hr`, `cost` and offer `hourly_usd` use the on-demand quote for
+  compute plus the requested storage (`search.totalHour`). Offers without a finite,
+  positive quote are excluded. `quoted_total_hourly_usd` reports that same value;
+  `offer.provider_hourly_usd` preserves the provider's separate `dph_total` field.
+  Vast results set `cost_scope: "compute_and_allocated_storage"` and
+  `bandwidth_included: false`; transfer rates appear separately in the offer.
+  AWS disk size is `null` when the AMI determines it.
 - `shell --print-creds` returns instance details and a `connect_command` string.
   Vast checks readiness and may attach an existing local key to the selected
   instance. `--no-probe` prints reported connection details with
@@ -226,10 +230,41 @@ leave its outcome uncertain.
 Errors retain a nonzero exit status and the JSON envelope. Codes include
 `invalid_arguments`, `missing_configuration`, `unsupported_filter`,
 `confirmation_required`, `authentication_required`, `interaction_required`,
-`instance_stopped`, `no_matching_offers`, `startup_timeout`, and `startup_failed`.
+`instance_stopped`, `no_matching_offers`, `startup_timeout`, `startup_failed`,
+`auto_stop_window_unsupported`, and `auto_stop_unverified`.
 Other provider failures use `command_failed`. `details` supplies relevant missing
 settings, unsupported filters, or recovery information. Partial log output can
 precede an error record.
+
+### Vast auto-stop verification
+
+Vast deadlines still round up to the next UTC hour, so a short requested runtime
+can have a longer scheduled runtime. Preview both durations and the UTC deadline.
+Ice now pins the schedule to that UTC weekday and hour (`WEEKLY`) with a one-minute
+start/end window. This avoids wildcard `HOURLY` matches before the deadline: a
+previous trial recorded a stop at 02:00 for a requested 05:00 start. The provider's
+root cause remains unconfirmed. Weekdays use Vast's Sunday-zero convention.
+
+The rounded deadline must be less than seven days ahead, so there is no earlier
+weekly match even if the provider ignores the start boundary. Longer requests
+return `auto_stop_window_unsupported` before rental. Offer availability must cover
+the rounded deadline, including a check after creation if setup delays cross an
+hour boundary.
+
+After scheduling, Ice reads back the provider job and checks its instance, action,
+start/end times, UTC calendar, and recorded execution state. JSON creation results
+include `auto_stop` with the stored job ID, schedule fields and
+`verification: "read_back"`; previews instead say `verification: "planned"`.
+This verifies stored configuration, not future execution by Vast. The change
+requires a controlled live trial before relying on provider scheduling alone.
+
+If scheduling or verification fails, Ice requests a stop for the just-created
+instance and returns `auto_stop_unverified` before proceeding with upload or
+workload setup. Error details retain the instance ID, requested schedule, any
+observed jobs, and `stop_request` (`accepted` or `failed_or_unknown`). A stop request
+is not confirmation of the stopped state. Inspect the instance and delete it when
+no longer needed; storage billing continues after stop. Existing provider jobs
+are not migrated or removed automatically.
 
 ## Config
 
@@ -326,10 +361,11 @@ Behavior:
 - GPU memory uses Vast's reported GB convention (API memory / 1000), consistent
   with its official CLI. Network units are megabits per second. JSON offers expose
   `gpu_memory_gb`, `download_mbps`, `upload_mbps`, and upload/download USD per GB.
-- Price scope remains unchanged: GCP/AWS caps and estimates cover compute; Vast
-  uses the provider rate and reports the allocation-adjusted total separately as
-  `quoted_total_hourly_usd`. Neither is a total spending cap; bandwidth charges
-  are separate. Changing that pricing contract is outside this change.
+- `--max-price-per-hr` caps the allocation-adjusted compute-plus-storage quote on
+  Vast. Selection and estimates use the same quote and disk allocation as creation;
+  base-price and reserved-discount fallbacks cannot bypass the ceiling. GCP/AWS
+  caps and estimates cover compute. These are hourly limits, not total spending
+  caps; bandwidth is billed separately and storage billing continues after stop.
 - `--machine` pins a specific marketplace machine type.
 - `--dry-run` reports the chosen machine and exits before provisioning.
 
