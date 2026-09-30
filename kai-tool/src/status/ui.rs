@@ -1,6 +1,6 @@
 //! Session-picker conventions used by `kai r`: compact chrome, blue selection,
 //! type-to-search, arrow navigation, Ctrl-O density, and a ruled shortcut footer.
-use super::observer::{Observer, Row, Snapshot, age, now, safe_text};
+use super::observer::{DISCOVERY_TIMEOUT, Observer, Row, Snapshot, age, now, safe_text};
 use super::process::ProcessIdentity;
 use super::transcript::TurnState;
 use super::worker::Worker;
@@ -33,7 +33,7 @@ pub(super) fn watch(interval: Duration) -> Result<()> {
     let mut observer = Observer::default();
     let mut observation = Worker::new(move |(), cancel| observer.snapshot(now(), cancel));
     let mut focusing = Worker::new(super::focus::focus);
-    // Restore the terminal before joining cancelled workers during shutdown.
+    // Restore the terminal before bounded worker/helper cleanup during shutdown.
     let _screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut snapshot = Snapshot {
@@ -62,7 +62,7 @@ pub(super) fn watch(interval: Duration) -> Result<()> {
             dirty = true;
         }
         if !observation.busy() && Instant::now() >= next_refresh {
-            observation.start(())?;
+            observation.start((), DISCOVERY_TIMEOUT)?;
         }
         if let Some(result) = focusing.poll() {
             let target = view.focusing;
@@ -100,7 +100,7 @@ pub(super) fn watch(interval: Duration) -> Result<()> {
                         if !focusing.busy() {
                             let mut target = None;
                             view.focus_selected(&snapshot, |identity| {
-                                focusing.start(identity)?;
+                                focusing.start(identity, Duration::from_secs(15))?;
                                 target = Some(identity);
                                 Ok(())
                             });
@@ -173,7 +173,7 @@ impl Filter {
             Self::All => true,
             Self::Active => matches!(row.state, TurnState::Working | TurnState::NeedsInput),
             // Only recorded turn endings qualify, including errors/interruptions.
-            // A process exit alone is not a completed turn; a new turn may already be active.
+            // Only open windows are present; a new turn may already be active.
             Self::Recent => row
                 .last_finished_at
                 .and_then(|at| u64::try_from(at).ok())
@@ -234,7 +234,7 @@ impl Palette {
             TurnState::Ready => Color::Green,
             TurnState::NeedsInput | TurnState::Interrupted => Color::Yellow,
             TurnState::Error => Color::Red,
-            TurnState::Unknown | TurnState::Exited => Color::Reset,
+            TurnState::Unknown => Color::Reset,
         };
         Style::new().fg(color).bold()
     }
@@ -406,13 +406,9 @@ impl View {
         else {
             return;
         };
-        self.notice = if row.exited_at.is_some() {
-            Some("This session has exited; its window is no longer available.".into())
-        } else {
-            focus(row.identity)
-                .err()
-                .map(|error| safe_text(&format!("{error:#}"), 2048))
-        };
+        self.notice = focus(row.identity)
+            .err()
+            .map(|error| safe_text(&format!("{error:#}"), 2048));
         self.focus_error.clone_from(&self.notice);
     }
 
@@ -472,14 +468,7 @@ impl View {
                 rect.height,
             )
         };
-        let mut header_text = format!(
-            "Kai windows  ·  {} open",
-            snapshot
-                .windows
-                .iter()
-                .filter(|row| row.exited_at.is_none())
-                .count()
-        );
+        let mut header_text = format!("Kai windows  ·  {} open", snapshot.windows.len());
         if self.loading {
             header_text = "Kai windows  ·  Loading…".into();
         } else if self.refresh_error.is_some() {
@@ -823,7 +812,6 @@ fn short_state(state: TurnState) -> &'static str {
         TurnState::Interrupted => "Stop",
         TurnState::Error => "Err",
         TurnState::Unknown => "?",
-        TurnState::Exited => "Exit",
     }
 }
 

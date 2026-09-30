@@ -4,18 +4,14 @@ use anyhow::{Context, Result, ensure};
 use std::{
     io::{self, Read},
     os::{fd::AsRawFd, unix::process::CommandExt},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     time::{Duration, Instant},
 };
 
-struct ChildGuard(Child, bool);
-impl Drop for ChildGuard {
+struct ChildGuard<'a>(&'a Cancellation);
+impl Drop for ChildGuard<'_> {
     fn drop(&mut self) {
-        if !self.1 {
-            // SAFETY: this is our unreaped child in a new, private process group.
-            unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) };
-            let _ = self.0.wait();
-        }
+        self.0.stop_helper();
     }
 }
 
@@ -48,7 +44,7 @@ pub(super) fn capture(
     cancel: &Cancellation,
 ) -> Result<Output> {
     cancel.check()?;
-    let child = Command::new(program)
+    let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -56,8 +52,10 @@ pub(super) fn capture(
         .process_group(0)
         .spawn()
         .with_context(|| format!("Cannot start {program}; check that it is installed."))?;
-    let mut child = ChildGuard(child, false);
-    let mut stdout = child.0.stdout.take().context("Missing helper output")?;
+    let stdout = child.stdout.take();
+    cancel.track_helper(child)?;
+    let _child = ChildGuard(cancel);
+    let mut stdout = stdout.context("Missing helper output")?;
     // SAFETY: stdout owns the fd for this scope; only its nonblocking flag is changed.
     let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
     ensure!(
@@ -85,8 +83,7 @@ pub(super) fn capture(
             Err(error) if error.kind() != io::ErrorKind::WouldBlock => return Err(error.into()),
             _ => (),
         }
-        if let Some(status) = child.0.try_wait()? {
-            child.1 = true;
+        if let Some(status) = cancel.helper_status()? {
             // Once reaped, drain bytes that arrived between the read and try_wait.
             loop {
                 match stdout.read(&mut buffer) {

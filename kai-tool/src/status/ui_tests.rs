@@ -152,9 +152,11 @@ fn focus_uses_the_filtered_selection_and_reports_errors_only_on_request() {
     view.focus_selected(&snapshot, |_| Ok(()));
     assert!(view.notice.is_none());
     assert_eq!(view.selected, Some(expected));
-    snapshot.windows.last_mut().unwrap().exited_at = Some(999);
-    view.focus_selected(&snapshot, |_| panic!("cannot focus exited window"));
-    assert!(view.notice.as_deref().unwrap().contains("exited"));
+    snapshot.windows.pop();
+    view.reconcile(&snapshot);
+    assert!(view.selected.is_none());
+    view.focus_selected(&snapshot, |_| panic!("cannot focus a removed window"));
+    assert!(view.notice.is_none());
     view.add_query("no match");
     view.reconcile(&snapshot);
     view.focus_selected(&snapshot, |_| panic!("no selection"));
@@ -204,7 +206,6 @@ fn recent_filter_uses_recorded_turn_endings_and_expires_them() {
     snapshot.windows[1].last_finished_at = Some(100); // Exactly 15m, outside.
     snapshot.windows[2].last_finished_at = Some(1001); // Future timestamps don't qualify.
     snapshot.windows[3].last_finished_at = None;
-    snapshot.windows[3].exited_at = Some(999); // Exiting is not a turn ending.
     snapshot.windows[4].last_finished_at = Some(999);
     snapshot.windows[4].state = TurnState::Interrupted;
     snapshot.windows[5].last_finished_at = Some(-1);

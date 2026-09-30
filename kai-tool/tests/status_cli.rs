@@ -172,8 +172,23 @@ while :; do /bin/sleep 1; done
     let working = wait_for("working");
     assert_eq!(working["last_finished_at"], done["last_finished_at"]);
     assert_eq!(working["thread_name"], "Renamed dashboard");
+    // An ending immediately followed by exit must not leave a stale/history row.
+    lifecycle(&log, "task_complete", "second");
     launcher.stop();
-    assert!(wait_for("exited")["exited_at"].is_u64());
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let snapshot = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        let rows = snapshot["windows"].as_array().unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| row["exited_at"].is_null() && row["state"] != "exited")
+        );
+        if !rows.iter().any(|row| row["pid"] == pid) {
+            break;
+        }
+    }
     watcher.stop();
     reading.join().unwrap();
 }

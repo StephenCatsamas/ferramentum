@@ -23,7 +23,6 @@ pub(super) enum TurnState {
     Error,
     #[default]
     Unknown,
-    Exited,
 }
 
 impl TurnState {
@@ -35,7 +34,6 @@ impl TurnState {
             Self::Interrupted => "Interrupted",
             Self::Error => "Error",
             Self::Unknown => "Unknown",
-            Self::Exited => "Exited",
         }
     }
 }
@@ -59,7 +57,7 @@ impl View {
                 .and_then(|at| u64::try_from(at).ok())
                 .map(|at| now.saturating_sub(at).saturating_mul(1000)),
             TurnState::Ready | TurnState::Interrupted | TurnState::Error => self.duration_ms,
-            TurnState::Unknown | TurnState::Exited => None,
+            TurnState::Unknown => None,
         }
     }
 }

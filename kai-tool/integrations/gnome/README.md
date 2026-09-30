@@ -3,7 +3,9 @@
 Internal status: **beta**. This companion extension supplies GNOME Wayland window activation
 for `kai status --watch`. It exports one narrow D-Bus method; it does not enable Shell.Eval.
 The code targets GNOME Shell 45–51's ES module API. Native GNOME testing is still required;
-the activation logic has fixture tests.
+the activation logic has fixture tests. Activation waits asynchronously for the requested window
+to receive focus, for up to one second. Closing the window, locking the session, or disabling the
+extension ends pending confirmation and removes its signal handlers and timer.
 
 From this directory, package and install it for your user:
 

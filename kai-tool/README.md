@@ -38,9 +38,9 @@ it is not the age of the whole session.
 Names come from Codex's `session_index.jsonl`, including subsequent renames.
 
 Use ↑/↓, Page Up/Down, or Home/End to browse; ←/→ switches All/Active/Recent 15m. Recent 15m
-shows windows with a recorded turn ending in the last fifteen minutes, newest first, including
-errors and interruptions. A window can appear there after starting another turn. A process exit
-alone does not qualify. Type to filter
+shows open windows with a recorded turn ending in the last fifteen minutes, newest first, including
+errors and interruptions. A window can appear there after starting another turn. Closed windows
+are removed on the next refresh that confirms their process has exited. Type to filter
 by name, state, terminal, directory, PID, or conversation ID. Ctrl-O toggles dense/comfortable
 rows, and Ctrl-E opens details with the selected row's terminal, directory, PID, last turn ending,
 full conversation ID, and the reason for an Unknown state. Details also expose discovery and
@@ -53,13 +53,17 @@ across live refreshes. `--interval SECONDS` sets the refresh rate (1–3600 seco
 Discovery and activation use separate workers, keeping search, navigation, and quitting responsive
 while desktop helpers are slow. Repeated Enter presses cannot queue delayed activations. Cancellation
 stops subsequent helper calls and kills/reaps a running helper's process group; a focus request
-already delivered to the desktop cannot be undone. The terminal is restored before worker cleanup
-on exit. A failed refresh preserves the previous snapshot with a **Stale** marker and its actual
-error under Ctrl-E; the next successful refresh clears the marker automatically.
+already delivered to the desktop cannot be undone. Each discovery attempt has a five-second deadline.
+A failed or timed-out refresh preserves the previous snapshot with a **Stale** marker and its actual
+error under Ctrl-E; the next successful refresh clears the marker automatically. If a filesystem
+read remains blocked, no replacement threads or refreshes are queued: retry waits for that read to
+return, and its late result is discarded. Quitting restores the terminal and stops running helpers
+without waiting for a blocked worker. Helper cleanup waits at most 50 ms before handing any
+kernel-blocked child to a background reaper. Plain and JSON modes return an error on discovery timeout.
 
 Development status: **beta**. This designation is kept in documentation and source, not in the
 dashboard. Switching failures appear only after pressing Enter, with a suggested next step;
-Ctrl-E exposes terminal details for manual switching. Exited rows cannot be activated.
+Ctrl-E exposes terminal details for manual switching.
 
 Focus support requires both a desktop backend and a supported terminal arrangement:
 
@@ -95,11 +99,10 @@ GNOME extension fixture tests: `node --test kai-tool/integrations/gnome/focus.te
 | Interrupted | The latest recorded turn was aborted. |
 | Error | The latest recorded turn completion contains an error. |
 | Unknown | There is insufficient evidence to identify the main conversation or its state. |
-| Exited | The dashboard observed the window process exit. Its exit result is unavailable. |
 
 “Last ended” refers to a turn ending, including interruptions and errors; it does not mean
-the overall task was accomplished. Exited windows stay visible for ten minutes while the watcher
-runs. Windows closed before observation are not included, and history is not saved between runs.
+the overall task was accomplished. Only open windows are listed; closed-window history is not kept.
+If a process cannot be inspected, it remains Unknown until a refresh can confirm its state or exit.
 
 Discovery uses Linux `/proc` or macOS `libproc` plus `lsof`. It reads same-user Kai/Codex process
 metadata and the session logs held open by a direct Codex child. It does not require a Codex binary on PATH,
@@ -125,11 +128,12 @@ object per line, including when output is piped. Snapshot `version` is `1`, `obs
 seconds, and `windows` contains `pid`, `tty`, `cwd`, `thread_id`, `thread_name`, `run_time_ms`,
 `state`, `last_finished_at`, `exited_at`, and `detail`. Unavailable values are null, timestamps
 are Unix seconds, run time is milliseconds, and state names
-are `working`, `ready`, `needs_input`, `interrupted`, `error`, `unknown`, or `exited`. `warnings`
+are `working`, `ready`, `needs_input`, `interrupted`, `error`, or `unknown`. `warnings`
 reports incomplete process discovery. No terminal escape sequences are emitted in JSON mode.
 The existing JSON names `working`, `run_time_ms`, and `last_finished_at` remain unchanged;
 they correspond to the UI's Active, Turn time, and Last ended. UI filters do not remove rows
-from JSON output.
+from JSON output. The legacy `exited_at` field remains present as null for version 1 compatibility;
+exited rows are no longer emitted.
 
 ## Credential provider
 

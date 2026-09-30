@@ -84,7 +84,7 @@ mod observer {
     };
     use unicode_width::UnicodeWidthChar;
 
-    const EXIT_RETENTION_SECONDS: u64 = 600;
+    pub(super) const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[derive(Clone, Serialize)]
     pub(super) struct Row {
@@ -98,6 +98,7 @@ mod observer {
         pub(super) run_time_ms: Option<u64>,
         pub(super) state: TurnState,
         pub(super) last_finished_at: Option<i64>,
+        // Retained as null for JSON v1 compatibility; exited processes are removed.
         pub(super) exited_at: Option<u64>,
         pub(super) detail: Option<String>,
     }
@@ -225,30 +226,21 @@ mod observer {
                 }
                 self.windows.insert(window.identity, row);
             }
-            for (identity, row) in &mut self.windows {
-                if !live.contains(identity) && row.exited_at.is_none() {
+            self.windows.retain(|identity, row| {
+                if !live.contains(identity) {
                     if matches!(still_alive(*identity), Ok(false)) {
-                        row.exited_at = Some(now);
-                        row.state = TurnState::Exited;
-                        row.detail =
-                            Some("Window process exited; exit result is not available".into());
-                    } else {
-                        row.state = TurnState::Unknown;
-                        row.run_time_ms = None;
-                        row.detail =
-                            Some("Window could not be inspected during this refresh".into());
+                        return false;
                     }
+                    row.state = TurnState::Unknown;
+                    row.run_time_ms = None;
+                    row.detail = Some("Window could not be inspected during this refresh".into());
                 }
-            }
-            self.windows.retain(|_, row| {
-                row.exited_at
-                    .is_none_or(|at| now.saturating_sub(at) < EXIT_RETENTION_SECONDS)
+                true
             });
             self.transcripts.retain(|path, _| paths.contains(path));
             let mut rows: Vec<_> = self.windows.values().cloned().collect();
             rows.sort_by_key(|row| {
                 (
-                    row.exited_at.is_some(),
                     state_order(row.state),
                     std::cmp::Reverse(row.last_finished_at),
                     row.pid,
@@ -272,7 +264,6 @@ mod observer {
             TurnState::Ready => 2,
             TurnState::Interrupted | TurnState::Error => 3,
             TurnState::Unknown => 4,
-            TurnState::Exited => 5,
         }
     }
 
@@ -286,9 +277,17 @@ mod observer {
             return super::ui::watch(Duration::from_secs(args.interval));
         }
         let mut observer = Observer::default();
+        let mut observation =
+            super::worker::Worker::new(move |(), cancel| observer.snapshot(now(), cancel));
         loop {
             let started = Instant::now();
-            let snapshot = observer.snapshot(now(), &Cancellation::default())?;
+            observation.start((), DISCOVERY_TIMEOUT)?;
+            let snapshot = loop {
+                if let Some(result) = observation.poll() {
+                    break result?;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
             if args.json {
                 let mut stdout = io::stdout().lock();
                 serde_json::to_writer(&mut stdout, &snapshot)?;
@@ -324,14 +323,7 @@ mod observer {
         let width = size.map_or(usize::MAX, |(width, _)| {
             usize::from(width).saturating_sub(1)
         });
-        let mut lines = vec![format!(
-            "Kai windows: {} open",
-            snapshot
-                .windows
-                .iter()
-                .filter(|row| row.exited_at.is_none())
-                .count(),
-        )];
+        let mut lines = vec![format!("Kai windows: {} open", snapshot.windows.len(),)];
         lines.push(format!(
             "{:<11} {:<8} {:<9} {:<10} {:<14} {}",
             "STATE", "PID", "TTY", "TURN TIME", "LAST ENDED", "THREAD / DIRECTORY"
@@ -408,7 +400,7 @@ mod observer {
         }
 
         #[test]
-        fn exits_require_evidence_and_pid_reuse_does_not_inherit_state() {
+        fn exits_are_removed_and_pid_reuse_does_not_inherit_state() {
             let mut observer = Observer::default();
             observer.observe(vec![window(1)], vec![], 100, |_| Ok(true));
             let unavailable = observer.observe(vec![], vec![], 101, |_| {
@@ -417,11 +409,11 @@ mod observer {
             assert_eq!(unavailable.windows[0].state, TurnState::Unknown);
             assert_eq!(unavailable.windows[0].exited_at, None);
             let reused = observer.observe(vec![window(2)], vec![], 102, |_| Ok(false));
-            assert_eq!(reused.windows.len(), 2);
+            assert_eq!(reused.windows.len(), 1);
             assert_eq!(reused.windows[0].state, TurnState::Unknown);
-            assert_eq!(reused.windows[1].state, TurnState::Exited);
-            let expired = observer.observe(vec![window(2)], vec![], 702, |_| Ok(true));
-            assert_eq!(expired.windows.len(), 1);
+            assert_eq!(reused.windows[0].identity.start_ticks, 2);
+            let closed = observer.observe(vec![], vec![], 103, |_| Ok(false));
+            assert!(closed.windows.is_empty());
         }
 
         #[test]
