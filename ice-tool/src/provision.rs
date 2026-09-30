@@ -24,6 +24,7 @@ const VAST_DEFAULT_SEARCH_LIMIT: u64 = 200;
 
 fn cloud_search_key_prefix(cloud: Cloud) -> &'static str {
     match cloud {
+        Cloud::Verda => "default.verda",
         Cloud::VastAi => "default.vast_ai",
         Cloud::Gcp => "default.gcp",
         Cloud::Aws => "default.aws",
@@ -41,6 +42,12 @@ fn cloud_search_defaults(
     &Option<f64>,
 ) {
     match cloud {
+        Cloud::Verda => (
+            &config.default.verda.min_cpus,
+            &config.default.verda.min_ram_gb,
+            &config.default.verda.allowed_gpus,
+            &config.default.verda.max_price_per_hr,
+        ),
         Cloud::VastAi => (
             &config.default.vast_ai.min_cpus,
             &config.default.vast_ai.min_ram_gb,
@@ -73,6 +80,7 @@ pub(crate) fn build_search_requirements(
         json!({"missing": [format!("{}.max_price_per_hr", cloud_search_key_prefix(cloud))], "required_flags": ["--max-price-per-hr"]})))?;
     let raw = serde_json::to_value(config)?;
     let key = match cloud {
+        Cloud::Verda => "verda",
         Cloud::VastAi => "vast_ai",
         Cloud::Gcp => "gcp",
         Cloud::Aws => "aws",
@@ -188,7 +196,7 @@ fn estimated_billed_hours(cloud: Cloud, requested_hours: f64) -> f64 {
     match cloud {
         Cloud::VastAi => requested_hours,
         Cloud::Gcp | Cloud::Aws => required_runtime_seconds(requested_hours) as f64 / 3600.0,
-        Cloud::Local => requested_hours,
+        Cloud::Local | Cloud::Verda => requested_hours,
     }
 }
 
@@ -630,7 +638,7 @@ pub(crate) fn estimated_machine_hourly_price(cloud: Cloud, machine: &str) -> Opt
     match cloud {
         Cloud::Gcp => gcp::cached_machine_hourly_price(machine),
         Cloud::Aws => aws::cached_machine_hourly_price(machine),
-        Cloud::VastAi | Cloud::Local => None,
+        Cloud::VastAi | Cloud::Local | Cloud::Verda => None,
     }
 }
 
@@ -643,7 +651,9 @@ pub(crate) fn find_cheapest_cloud_machine(
     match cloud {
         Cloud::Gcp => gcp::find_cheapest_machine_candidate(config, req, machine_override),
         Cloud::Aws => aws::find_cheapest_machine_candidate(config, req, machine_override),
-        Cloud::VastAi | Cloud::Local => bail!("No machine catalog for cloud `{cloud}`"),
+        Cloud::VastAi | Cloud::Local | Cloud::Verda => {
+            bail!("No machine catalog for cloud `{cloud}`")
+        }
     }
 }
 

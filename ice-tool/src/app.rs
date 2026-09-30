@@ -22,6 +22,7 @@ use crate::model::{
 };
 use crate::providers::{
     CloudInstance, CloudProvider, CreateProvider, MarketCreateProvider, aws, gcp, local, vast,
+    verda,
 };
 use crate::provision::{
     build_accept_prompt, build_search_requirements, estimate_runtime_cost,
@@ -177,6 +178,8 @@ pub(crate) fn main() -> ExitCode {
                 // excerpts, including credentials from a malformed config file.
                 let mut message = redact_cli_assignments(err.to_string());
                 for secret in [
+                    &config.auth.verda.client_id,
+                    &config.auth.verda.client_secret,
                     &config.auth.vast_ai.api_key,
                     &config.auth.aws.access_key_id,
                     &config.auth.aws.secret_access_key,
@@ -202,6 +205,8 @@ pub(crate) fn main() -> ExitCode {
 
 fn redact_cli_assignments(mut message: String) -> String {
     for key in [
+        "VERDA_CLIENT_ID",
+        "VERDA_CLIENT_SECRET",
         "VAST_API_KEY",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
@@ -227,6 +232,9 @@ fn redact_cli_assignments(mut message: String) -> String {
 
 fn run(command: Commands, config: &mut IceConfig) -> Result<()> {
     match command {
+        Commands::Catalog(args) => {
+            verda::catalog_command(resolve_cloud(args.cloud, config)?, config)
+        }
         Commands::Login(args) => cmd_login(args, config),
         Commands::Config(args) => cmd_config(args, config),
         Commands::List(args) => crate::listing::cmd_list(args, config),
@@ -237,7 +245,7 @@ fn run(command: Commands, config: &mut IceConfig) -> Result<()> {
         Commands::Stop(args) => crate::commands::cmd_stop(args, config),
         Commands::Start(args) => crate::commands::cmd_start(args, config),
         Commands::Delete(args) => crate::commands::cmd_delete(args, config),
-        Commands::Create(args) => cmd_create(args, config),
+        Commands::Create(args) => cmd_create(*args, config),
         Commands::RefreshCatalog(args) => cmd_refresh_catalog(args, config),
     }
 }
@@ -248,6 +256,7 @@ fn cmd_login(args: LoginArgs, config: &mut IceConfig) -> Result<()> {
     let cloud = resolve_cloud(args.cloud, config)?;
     ensure_provider_cli_installed(cloud)?;
     let outcome = match cloud {
+        Cloud::Verda => verda::login(config)?,
         Cloud::VastAi => login_vast(config, args.force)?,
         Cloud::Gcp => login_gcp(config, args.force)?,
         Cloud::Aws => login_aws(config, args.force)?,
@@ -366,6 +375,9 @@ fn print_login_outcome(cloud: Cloud, outcome: &LoginOutcome) {
 
 fn cmd_create(args: CreateArgs, config: &mut IceConfig) -> Result<()> {
     let cloud = resolve_cloud(args.cloud, config)?;
+    if cloud == Cloud::Verda {
+        verda::validate_create(&args)?;
+    }
     let mut effective = crate::selection::resolve(config, cloud, &args)?;
     resolve_deploy_workload(&args.target_request())?;
     resolve_deploy_hours(&effective, args.hours)?;
@@ -378,6 +390,7 @@ fn cmd_create(args: CreateArgs, config: &mut IceConfig) -> Result<()> {
     }
     let config = &mut effective;
     match cloud {
+        Cloud::Verda => create_for::<verda::Provider>(config, &args),
         Cloud::VastAi => create_for::<vast::Provider>(config, &args),
         Cloud::Local => create_for::<local::Provider>(config, &args),
         Cloud::Gcp => create_market_machine::<gcp::Provider>(config, &args),
@@ -604,8 +617,23 @@ pub(crate) fn apply_create_search_overrides(
     cloud: Cloud,
     args: &CreateArgs,
 ) -> Result<()> {
-    let gpu_override = create_gpu_override(args)?;
+    let gpu_override = if cloud == Cloud::Verda && !args.gpus.is_empty() {
+        if args.gpus.iter().any(|gpu| gpu.trim().is_empty()) {
+            bail!("--gpu does not accept empty values.");
+        }
+        Some(args.gpus.iter().map(|gpu| gpu.trim().to_owned()).collect())
+    } else {
+        create_gpu_override(args)?
+    };
     match cloud {
+        Cloud::Verda => apply_cloud_search_overrides(
+            &mut config.default.verda.min_cpus,
+            &mut config.default.verda.min_ram_gb,
+            &mut config.default.verda.allowed_gpus,
+            &mut config.default.verda.max_price_per_hr,
+            args,
+            gpu_override,
+        ),
         Cloud::VastAi => apply_cloud_search_overrides(
             &mut config.default.vast_ai.min_cpus,
             &mut config.default.vast_ai.min_ram_gb,
@@ -1092,7 +1120,7 @@ fn machine_candidate_project(config: &IceConfig, cloud: Cloud) -> Result<Option<
         Cloud::Gcp => detect_gcp_project(config, true).map(Some).ok_or_else(|| {
             anyhow!("No GCP project configured. Run `ice login --cloud gcp` first.")
         }),
-        Cloud::Aws | Cloud::Local | Cloud::VastAi => Ok(None),
+        Cloud::Aws | Cloud::Local | Cloud::VastAi | Cloud::Verda => Ok(None),
     }
 }
 

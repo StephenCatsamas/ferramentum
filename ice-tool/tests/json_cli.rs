@@ -128,6 +128,8 @@ esac
             .env("ICE_TEST_STATE", self.root.path().join("state"))
             .env("ICE_TEST_ACTIONS", self.root.path().join("actions"))
             .env_remove("VAST_API_KEY")
+            .env_remove("VERDA_CLIENT_ID")
+            .env_remove("VERDA_CLIENT_SECRET")
             .env_remove("AWS_ACCESS_KEY_ID")
             .env_remove("AWS_SECRET_ACCESS_KEY")
             .env_remove("AWS_SESSION_TOKEN");
@@ -1308,4 +1310,166 @@ fn remote_log_failure_keeps_partial_records_and_ends_with_error() {
             .iter()
             .any(|record| record["result"]["event"] == "complete")
     );
+}
+
+#[test]
+fn verda_missing_credentials_and_cleanup_are_structured() {
+    let fixture = Fixture::new();
+    for command in ["login", "list", "catalog"] {
+        let value =
+            failed(fixture.run(&[command, "--cloud", "verda", "--non-interactive", "--json"]));
+        assert_eq!(value["cloud"], "verda");
+        assert_eq!(value["error"]["code"], "missing_credentials");
+    }
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "verda",
+        "--ssh",
+        "--yes",
+        "--max-price-per-hr",
+        "1",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "cleanup_acknowledgement_required");
+    assert_eq!(value["error"]["details"]["automatic_delete"], false);
+}
+
+#[test]
+fn verda_unsupported_workloads_fail_before_credentials_or_rentals() {
+    let fixture = Fixture::new();
+    for mode in [
+        vec!["--container", "example.invalid/image"],
+        vec!["--unpack", "image.tar"],
+        vec!["--arca", "fixture"],
+    ] {
+        let mut args = vec!["create", "--cloud", "verda", "--dry-run", "--json"];
+        args.extend(mode);
+        let value = failed(fixture.run(&args));
+        assert_eq!(value["error"]["code"], "unsupported_workload");
+    }
+}
+
+#[test]
+fn verda_filters_and_provider_options_preserve_provenance() {
+    let fixture = Fixture::new();
+    fixture.config("[default.verda]\nmin_cpus = 10\nmin_ram_gb = 32.0\ndisk_gb = 200\nimage = 'saved-image'\nlocation = 'FIN-01'\nssh_key_id = 'saved-key'\n");
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "verda",
+        "--ssh",
+        "--dry-run",
+        "--json",
+        "--no-defaults",
+        "--gpu-count",
+        "1",
+        "--min-gpu-memory-gb",
+        "48",
+        "--gpu",
+        "Future GPU Model",
+        "--max-price-per-hr",
+        "1",
+        "--image",
+        "ubuntu-26.04-cuda-13.2-open",
+    ]));
+    assert_eq!(value["error"]["code"], "missing_credentials");
+    let selection = &value["error"]["details"]["selection"];
+    assert_eq!(selection["filters"]["disk_gb"]["value"], 100);
+    assert_eq!(selection["filters"]["min_cpus"]["value"], Value::Null);
+    assert_eq!(selection["filters"]["gpu_count"]["value"], 1);
+    assert_eq!(selection["price_scope"], "compute_and_os_storage");
+    assert_eq!(
+        selection["provider_options"]["image"]["source"],
+        "command_line"
+    );
+    assert_eq!(
+        selection["provider_options"]["location"]["value"],
+        Value::Null
+    );
+    assert_eq!(
+        selection["provider_options"]["ssh_key_id"]["value"],
+        "saved-key"
+    );
+    let unsupported = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "verda",
+        "--ssh",
+        "--dry-run",
+        "--json",
+        "--min-download-mbps",
+        "100",
+        "--max-price-per-hr",
+        "1",
+    ]));
+    assert_eq!(unsupported["error"]["code"], "unsupported_filter");
+}
+
+#[test]
+fn verda_configuration_round_trips_and_redacts_credentials() {
+    let fixture = Fixture::new();
+    for assignment in [
+        "default.cloud=verda",
+        "default.verda.gpu_count=1",
+        "default.verda.disk_gb=100",
+        "default.verda.max_price_per_hr=0.8",
+        "default.verda.allowed_gpus=RTX A6000,H100",
+        "default.verda.location=FIN-01",
+        "auth.verda.client_id=verda-test-id",
+        "auth.verda.client_secret=verda-test-secret",
+    ] {
+        let output = fixture.run(&["config", "set", assignment, "--json"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("verda-test-secret"));
+    }
+    let output = fixture.run(&["config", "list", "--json"]);
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["result"]["values"]["auth.verda.client_id"],
+        "<redacted>"
+    );
+    assert_eq!(
+        value["result"]["values"]["auth.verda.client_secret"],
+        "<redacted>"
+    );
+    assert_eq!(
+        value["result"]["values"]["default.verda.allowed_gpus"],
+        json!(["RTX A6000", "H100"])
+    );
+    assert!(
+        fixture
+            .run(&["config", "unset", "auth.verda.client_secret", "--json"])
+            .status
+            .success()
+    );
+    assert!(
+        !fixture
+            .run(&["config", "set", "default.verda.disk_gb=0", "--json"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn verda_options_do_not_silently_change_other_providers() {
+    let fixture = Fixture::new();
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "vast.ai",
+        "--ssh",
+        "--dry-run",
+        "--image",
+        "example",
+        "--max-price-per-hr",
+        "1",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "unsupported_arguments");
 }

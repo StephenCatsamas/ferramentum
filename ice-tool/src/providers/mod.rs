@@ -21,6 +21,7 @@ pub(crate) mod catalog;
 pub(crate) mod gcp;
 pub(crate) mod local;
 pub(crate) mod vast;
+pub(crate) mod verda;
 
 pub(crate) fn load_cached_arc<T, F>(
     cache: &LazyLock<Mutex<Option<Arc<T>>>>,

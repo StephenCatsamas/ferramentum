@@ -1,6 +1,6 @@
 # ice
 
-Minimal CLI for deploying and managing workloads on `vast.ai`, `gcp`, `aws`, and `local`.
+Minimal CLI for deploying and managing workloads on `vast.ai`, `gcp`, `aws`, `verda`, and `local`.
 
 ## Install
 
@@ -27,6 +27,7 @@ Supported cloud identifiers:
 - `vast.ai`
 - `gcp`
 - `aws`
+- `verda` — ordinary GPU VMs with SSH; see [Verda setup, billing and profiling](docs/verda.md).
 - `local`
 
 ## Commands
@@ -37,6 +38,7 @@ Supported cloud identifiers:
 - `ice config set <KEY=VALUE>`
 - `ice config unset <KEY>`
 - `ice list [--cloud CLOUD]`
+- `ice catalog --cloud verda` — live types, images, availability and storage prices
 - `ice logs [--cloud CLOUD] <INSTANCE> [--tail N] [--follow]`
 - `ice shell [--cloud CLOUD] <INSTANCE>`
 - `ice pull [--cloud CLOUD] <INSTANCE> <REMOTE_PATH> [LOCAL_PATH]`

@@ -8,6 +8,7 @@ use crate::cli::{InstanceArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
 use crate::model::{Cloud, IceConfig};
 use crate::providers::{
     CloudInstance, CloudProvider, CommandProvider, RemoteCloudProvider, aws, gcp, local, vast,
+    verda,
 };
 use crate::support::{
     VAST_WAIT_TIMEOUT_SECS, ensure_provider_cli_installed, resolve_cloud, spinner,
@@ -23,6 +24,7 @@ pub(crate) fn cmd_logs(args: LogsArgs, config: &IceConfig) -> Result<()> {
         ));
     }
     match cloud {
+        Cloud::Verda => run_logs::<verda::Provider>(config, &args),
         Cloud::VastAi => run_logs::<vast::Provider>(config, &args),
         Cloud::Gcp => run_logs::<gcp::Provider>(config, &args),
         Cloud::Aws => run_logs::<aws::Provider>(config, &args),
@@ -35,14 +37,15 @@ pub(crate) fn cmd_shell(args: ShellArgs, config: &IceConfig) -> Result<()> {
         bail!("`shell --json` requires `--print-creds`; interactive shells need a terminal.");
     }
     let cloud = resolve_cloud(args.cloud, config)?;
-    if args.no_probe && cloud != Cloud::VastAi {
+    if args.no_probe && !matches!(cloud, Cloud::VastAi | Cloud::Verda) {
         return Err(crate::automation::error(
             "invalid_arguments",
-            "--no-probe is currently supported only for vast.ai.",
+            "--no-probe is supported only for vast.ai and verda.",
             json!({"cloud": cloud, "flags": ["--no-probe"]}),
         ));
     }
     match cloud {
+        Cloud::Verda => run_shell::<verda::Provider>(config, &args),
         Cloud::VastAi => run_shell::<vast::Provider>(config, &args),
         Cloud::Gcp => run_shell::<gcp::Provider>(config, &args),
         Cloud::Aws => run_shell::<aws::Provider>(config, &args),
@@ -52,6 +55,7 @@ pub(crate) fn cmd_shell(args: ShellArgs, config: &IceConfig) -> Result<()> {
 
 pub(crate) fn cmd_pull(args: PullArgs, config: &IceConfig) -> Result<()> {
     match resolve_cloud(args.cloud, config)? {
+        Cloud::Verda => run_pull::<verda::Provider>(config, &args),
         Cloud::VastAi => run_pull::<vast::Provider>(config, &args),
         Cloud::Gcp => run_pull::<gcp::Provider>(config, &args),
         Cloud::Aws => run_pull::<aws::Provider>(config, &args),
@@ -61,6 +65,7 @@ pub(crate) fn cmd_pull(args: PullArgs, config: &IceConfig) -> Result<()> {
 
 pub(crate) fn cmd_push(args: PushArgs, config: &IceConfig) -> Result<()> {
     match resolve_cloud(args.cloud, config)? {
+        Cloud::Verda => run_push::<verda::Provider>(config, &args),
         Cloud::VastAi => run_push::<vast::Provider>(config, &args),
         Cloud::Gcp => run_push::<gcp::Provider>(config, &args),
         Cloud::Aws => run_push::<aws::Provider>(config, &args),
@@ -70,6 +75,7 @@ pub(crate) fn cmd_push(args: PushArgs, config: &IceConfig) -> Result<()> {
 
 pub(crate) fn cmd_stop(args: InstanceArgs, config: &IceConfig) -> Result<()> {
     match resolve_cloud(args.cloud, config)? {
+        Cloud::Verda => cmd_stop_cloud::<verda::Provider>(config, &args.instance),
         Cloud::VastAi => cmd_stop_cloud::<vast::Provider>(config, &args.instance),
         Cloud::Gcp => cmd_stop_cloud::<gcp::Provider>(config, &args.instance),
         Cloud::Aws => cmd_stop_cloud::<aws::Provider>(config, &args.instance),
@@ -79,6 +85,7 @@ pub(crate) fn cmd_stop(args: InstanceArgs, config: &IceConfig) -> Result<()> {
 
 pub(crate) fn cmd_start(args: InstanceArgs, config: &IceConfig) -> Result<()> {
     match resolve_cloud(args.cloud, config)? {
+        Cloud::Verda => cmd_start_cloud::<verda::Provider>(config, &args.instance),
         Cloud::VastAi => cmd_start_cloud::<vast::Provider>(config, &args.instance),
         Cloud::Gcp => cmd_start_cloud::<gcp::Provider>(config, &args.instance),
         Cloud::Aws => cmd_start_cloud::<aws::Provider>(config, &args.instance),
@@ -88,6 +95,7 @@ pub(crate) fn cmd_start(args: InstanceArgs, config: &IceConfig) -> Result<()> {
 
 pub(crate) fn cmd_delete(args: InstanceArgs, config: &IceConfig) -> Result<()> {
     match resolve_cloud(args.cloud, config)? {
+        Cloud::Verda => verda::delete(config, &args.instance),
         Cloud::VastAi => cmd_delete_remote::<vast::Provider>(config, &args.instance),
         Cloud::Gcp => cmd_delete_remote::<gcp::Provider>(config, &args.instance),
         Cloud::Aws => cmd_delete_remote::<aws::Provider>(config, &args.instance),

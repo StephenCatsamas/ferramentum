@@ -73,13 +73,16 @@ pub(crate) enum Commands {
         name = "create",
         about = "Create the cheapest matching instance for a workload, or a managed local container."
     )]
-    Create(CreateArgs),
+    Create(Box<CreateArgs>),
 
     #[command(
         name = "refresh-catalog",
         about = "Refresh a locally cached machine/pricing catalog for a cloud provider."
     )]
     RefreshCatalog(RefreshCatalogArgs),
+
+    /// Discover live machine types, images, availability and storage prices (Verda).
+    Catalog(CloudArgs),
 }
 
 #[derive(Debug, Args)]
@@ -166,7 +169,7 @@ pub(crate) struct ShellArgs {
     /// Print a connection command after readiness checks and any instance-key recovery.
     #[arg(long)]
     pub(crate) print_creds: bool,
-    /// Vast only: print reported endpoints without readiness checks, SSH probes, or key changes.
+    /// Vast/Verda: print reported endpoints without readiness checks, SSH probes, or key changes.
     #[arg(long, requires = "print_creds", conflicts_with = "preserve_ephemeral")]
     pub(crate) no_probe: bool,
     /// Deprecated for Vast: recovery no longer creates temporary account keys.
@@ -202,16 +205,28 @@ pub(crate) struct InstanceArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct CreateArgs {
+    /// Verda only: acknowledge that --hours is an estimate; arrange and verify deletion yourself.
+    #[arg(long)]
+    pub(crate) manual_cleanup: bool,
+    /// Verda only: pin a current Ubuntu CUDA image from `ice catalog`.
+    #[arg(long)]
+    pub(crate) image: Option<String>,
+    /// Verda only: datacenter location code; otherwise choose cheapest available.
+    #[arg(long)]
+    pub(crate) location: Option<String>,
+    /// Verda only: existing provider SSH key ID.
+    #[arg(long)]
+    pub(crate) ssh_key_id: Option<String>,
     /// Accept creation within the supplied filters and price ceiling.
     #[arg(long)]
     pub(crate) yes: bool,
     /// Ignore saved search filters and disk preferences for this invocation.
     #[arg(long)]
     pub(crate) no_defaults: bool,
-    /// Exact GPU count (positive counts: Vast only). Zero requires CPU-only.
+    /// Exact GPU count (positive counts: Vast/Verda). Zero requires CPU-only.
     #[arg(long, value_name = "COUNT")]
     pub(crate) gpu_count: Option<u32>,
-    /// Minimum memory per GPU in GB (Vast only).
+    /// Minimum memory per GPU in GB (Vast/Verda).
     #[arg(long, value_name = "GB", alias = "min-vram-gb")]
     pub(crate) min_gpu_memory_gb: Option<f64>,
     /// Disk allocation in provider GB units (shown in the quote).
@@ -241,10 +256,10 @@ pub(crate) struct CreateArgs {
     /// Clear the saved GPU model filter. Use --gpu-count 0 to require CPU-only.
     #[arg(long, conflicts_with = "gpus")]
     pub(crate) no_gpu: bool,
-    /// Override the maximum hourly price filter in USD/hr.
+    /// Maximum USD/hr. Verda includes compute + OS disk; bandwidth/taxes are separate.
     #[arg(long, value_name = "USD")]
     pub(crate) max_price_per_hr: Option<f64>,
-    /// Runtime duration in hours. Defaults to `default.runtime_hours`, then `1.0`.
+    /// Runtime hours (Verda: cost estimate only, no enforced deadline). Defaults to saved value, then 1.
     #[arg(long, value_name = "HOURS")]
     pub(crate) hours: Option<f64>,
     /// Pin a cloud-specific machine type on marketplace-backed clouds.
@@ -311,6 +326,7 @@ impl Commands {
             Self::Delete(_) => "delete",
             Self::Create(_) => "create",
             Self::RefreshCatalog(_) => "refresh-catalog",
+            Self::Catalog(_) => "catalog",
         }
     }
 
@@ -319,7 +335,7 @@ impl Commands {
             Self::Config(_) => return None,
             Self::RefreshCatalog(args) => return args.cloud,
             Self::Login(args) => args.cloud,
-            Self::List(args) => args.cloud,
+            Self::List(args) | Self::Catalog(args) => args.cloud,
             Self::Logs(args) => args.cloud,
             Self::Shell(args) => args.cloud,
             Self::Pull(args) => args.cloud,

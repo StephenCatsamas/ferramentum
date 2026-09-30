@@ -347,7 +347,7 @@ pub(crate) fn prompt_f64(prompt: &str, default: Option<f64>, min_value: f64) -> 
 
 pub(crate) fn ensure_provider_cli_installed(cloud: Cloud) -> Result<()> {
     match cloud {
-        Cloud::VastAi | Cloud::Local => Ok(()),
+        Cloud::VastAi | Cloud::Local | Cloud::Verda => Ok(()),
         Cloud::Gcp => ensure_command_available("gcloud"),
         Cloud::Aws => ensure_command_available("aws"),
     }

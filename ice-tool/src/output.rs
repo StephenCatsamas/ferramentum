@@ -63,7 +63,11 @@ pub(crate) fn config_values(config: &IceConfig) -> Result<Value> {
         let value = key.split('.').fold(&raw, |value, part| &value[part]);
         let value = if matches!(
             key,
-            "auth.vast_ai.api_key" | "auth.aws.access_key_id" | "auth.aws.secret_access_key"
+            "auth.vast_ai.api_key"
+                | "auth.aws.access_key_id"
+                | "auth.aws.secret_access_key"
+                | "auth.verda.client_id"
+                | "auth.verda.client_secret"
         ) && !value.is_null()
         {
             json!("<redacted>")
@@ -290,6 +294,7 @@ pub(crate) fn allocated_disk_gb(config: &IceConfig, cloud: Cloud) -> Option<u32>
                 .disk_gb
                 .unwrap_or(crate::support::VAST_DEFAULT_DISK_GB as u32),
         ),
+        Cloud::Verda => Some(config.default.verda.disk_gb.unwrap_or(100)),
         Cloud::Local => None,
     }
 }
