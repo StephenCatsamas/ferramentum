@@ -46,7 +46,22 @@ pub(super) struct View {
     pub cwd: Option<PathBuf>,
     pub state: TurnState,
     pub last_finished_at: Option<i64>,
+    pub started_at: Option<i64>,
+    pub duration_ms: Option<u64>,
     pub detail: Option<String>,
+}
+
+impl View {
+    pub(super) fn run_time_ms(&self, now: u64) -> Option<u64> {
+        match self.state {
+            TurnState::Working | TurnState::NeedsInput => self
+                .started_at
+                .and_then(|at| u64::try_from(at).ok())
+                .map(|at| now.saturating_sub(at).saturating_mul(1000)),
+            TurnState::Ready | TurnState::Interrupted | TurnState::Error => self.duration_ms,
+            TurnState::Unknown | TurnState::Exited => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -85,6 +100,10 @@ struct Payload {
     turn_id: Option<String>,
     #[serde(default)]
     completed_at: Option<i64>,
+    #[serde(default)]
+    started_at: Option<i64>,
+    #[serde(default)]
+    duration_ms: Option<i64>,
     #[serde(default)]
     error: Option<Present>,
     #[serde(default)]
@@ -161,6 +180,8 @@ impl Transcript {
             self.input_requests.clear();
             self.view.state = TurnState::Unknown;
             self.view.last_finished_at = None;
+            self.view.started_at = None;
+            self.view.duration_ms = None;
             self.view.detail =
                 Some("Older history omitted; showing available recent turn events".into());
         }
@@ -180,6 +201,8 @@ impl Transcript {
                 self.view.state = TurnState::Unknown;
                 self.turn = None;
                 self.input_requests.clear();
+                self.view.started_at = None;
+                self.view.duration_ms = None;
                 self.view.detail = Some(
                     "An oversized log record was skipped; waiting for a complete turn event".into(),
                 );
@@ -195,6 +218,8 @@ impl Transcript {
                     self.view.state = TurnState::Unknown;
                     self.turn = None;
                     self.input_requests.clear();
+                    self.view.started_at = None;
+                    self.view.duration_ms = None;
                     self.view.detail = Some(
                         "A log record could not be read; waiting for a complete turn event".into(),
                     );
@@ -216,6 +241,8 @@ impl Transcript {
                 self.turn = payload.turn_id;
                 self.input_requests.clear();
                 self.view.state = TurnState::Working;
+                self.view.started_at = payload.started_at.or(at);
+                self.view.duration_ms = None;
                 self.view.detail = None;
             }
             ("event_msg", "task_complete" | "turn_complete" | "turn_aborted") => {
@@ -232,6 +259,17 @@ impl Transcript {
                     TurnState::Ready
                 };
                 self.view.last_finished_at = payload.completed_at.or(at);
+                self.view.started_at = payload.started_at.or(self.view.started_at);
+                self.view.duration_ms = payload
+                    .duration_ms
+                    .and_then(|value| u64::try_from(value).ok())
+                    .or_else(|| {
+                        self.view
+                            .last_finished_at
+                            .zip(self.view.started_at)
+                            .and_then(|(end, start)| u64::try_from(end.checked_sub(start)?).ok())
+                            .map(|seconds| seconds.saturating_mul(1000))
+                    });
                 self.view.detail = None;
                 self.turn = None;
                 self.input_requests.clear();

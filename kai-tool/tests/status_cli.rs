@@ -50,7 +50,14 @@ fn lifecycle(path: &Path, kind: &str, turn: &str) {
 #[test]
 fn watches_existing_windows_through_completion_new_work_and_exit() {
     let root = tempdir().unwrap();
-    let log = root.path().join("rollout-fixture.jsonl");
+    let sessions = root.path().join("sessions/2026/09/30");
+    fs::create_dir_all(&sessions).unwrap();
+    let log = sessions.join("rollout-fixture.jsonl");
+    fs::write(
+        root.path().join("session_index.jsonl"),
+        "{\"id\":\"fixture-thread\",\"thread_name\":\"Test dashboard\"}\n",
+    )
+    .unwrap();
     fs::write(
         &log,
         format!(
@@ -149,15 +156,22 @@ while :; do /bin/sleep 1; done
             }
         }
     };
-    assert_eq!(wait_for("working")["thread_id"], "fixture-thread");
+    let working = wait_for("working");
+    assert_eq!(working["thread_id"], "fixture-thread");
+    assert_eq!(working["thread_name"], "Test dashboard");
+    assert!(working["run_time_ms"].is_u64());
     lifecycle(&log, "task_complete", "first");
     let done = wait_for("ready");
     assert!(done["last_finished_at"].is_i64());
+    fs::write(
+        root.path().join("session_index.jsonl"),
+        "{\"id\":\"fixture-thread\",\"thread_name\":\"Renamed dashboard\"}\n",
+    )
+    .unwrap();
     lifecycle(&log, "task_started", "second");
-    assert_eq!(
-        wait_for("working")["last_finished_at"],
-        done["last_finished_at"]
-    );
+    let working = wait_for("working");
+    assert_eq!(working["last_finished_at"], done["last_finished_at"]);
+    assert_eq!(working["thread_name"], "Renamed dashboard");
     launcher.stop();
     assert!(wait_for("exited")["exited_at"].is_u64());
     watcher.stop();
@@ -226,8 +240,8 @@ fn json_watch_exits_cleanly_when_its_pipe_closes() {
 }
 
 #[test]
-fn terminal_watch_restores_the_terminal_after_q_and_control_c() {
-    for quit in [b'q', 3] {
+fn terminal_watch_restores_the_terminal_after_escape_and_control_c() {
+    for quit in [27, 3] {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 30,
@@ -252,7 +266,7 @@ fn terminal_watch_restores_the_terminal_after_q_and_control_c() {
         });
         let deadline = Instant::now() + TIMEOUT;
         let mut output = Vec::new();
-        while !String::from_utf8_lossy(&output).contains("Kai windows:") {
+        while !String::from_utf8_lossy(&output).contains("Kai windows") {
             match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(bytes) => output.extend(bytes),
                 Err(error) => {

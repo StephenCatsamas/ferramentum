@@ -30,9 +30,18 @@ Install with `cargo install --path kai-tool --locked --force`.
 ## Window status
 
 `kai status --watch` shows the current user's local Kai launcher processes, including windows
-opened before the dashboard started. Each row includes the PID, terminal, working directory,
-conversation ID, and the age of the latest recorded turn completion. Use `--interval SECONDS`
-to change the refresh rate (1–3600 seconds), and press `q`, Esc, or Ctrl-C to quit.
+opened before the dashboard started. Its Ratatui interface follows the `kai r` session picker:
+blue selection, a `›` marker, subdued metadata, type-to-search, and keyboard hints below the list.
+Rows show thread names and run time, with the last completion time on wider terminals. Run time
+is elapsed time for the current turn, or the final duration of the most recent finished turn.
+Names come from Codex's `session_index.jsonl`, including subsequent renames.
+
+Use ↑/↓, Page Up/Down, or Home/End to browse; ←/→ switches All/Working/Finished. Type to filter
+by name, state, terminal, directory, PID, or conversation ID. Ctrl-O toggles dense/comfortable
+rows, and Ctrl-E expands the selected row's terminal, directory, PID, completion time, and full
+conversation ID. Esc clears a search, then quits; Ctrl-C quits immediately. Plain letters,
+including `q`, belong to search, matching the resume picker. Selection follows the same window
+across live refreshes. `--interval SECONDS` sets the refresh rate (1–3600 seconds).
 
 | State | Meaning |
 | --- | --- |
@@ -66,8 +75,9 @@ messages are not included in output. LLM progress summaries are a separate featu
 
 For scripts, `kai status --json` emits one snapshot; `kai status --watch --json` emits one JSON
 object per line, including when output is piped. Snapshot `version` is `1`, `observed_at` is Unix
-seconds, and `windows` contains `pid`, `tty`, `cwd`, `thread_id`, `state`, `last_finished_at`,
-`exited_at`, and `detail`. Unavailable values are null, timestamps are Unix seconds, and state names
+seconds, and `windows` contains `pid`, `tty`, `cwd`, `thread_id`, `thread_name`, `run_time_ms`,
+`state`, `last_finished_at`, `exited_at`, and `detail`. Unavailable values are null, timestamps
+are Unix seconds, run time is milliseconds, and state names
 are `working`, `ready`, `needs_input`, `interrupted`, `error`, `unknown`, or `exited`. `warnings`
 reports incomplete process discovery. No terminal escape sequences are emitted in JSON mode.
 

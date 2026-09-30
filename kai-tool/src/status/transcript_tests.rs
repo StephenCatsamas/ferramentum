@@ -175,3 +175,47 @@ fn oversized_records_and_long_history_are_bounded_and_recover_at_lifecycle_event
     append(&mut file, &huge, &mut transcript);
     assert_eq!(transcript.view().state, TurnState::Interrupted);
 }
+
+#[test]
+fn run_time_uses_turn_timestamps_and_freezes_after_completion() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    let timed = |kind, turn, start, end, duration| {
+        format!(
+            "{}\n",
+            json!({
+                "type":"event_msg", "timestamp":"2026-09-30T12:00:00Z", "payload":{
+                    "type":kind, "turn_id":turn, "started_at":start, "completed_at":end, "duration_ms":duration
+                }
+            })
+        )
+    };
+    append(
+        &mut file,
+        &timed("task_started", "one", Some(100), None::<i64>, None::<i64>),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().run_time_ms(112), Some(12000));
+    append(
+        &mut file,
+        &timed("task_complete", "one", Some(100), Some(113), Some(12500)),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().run_time_ms(999), Some(12500));
+    append(
+        &mut file,
+        &timed("task_started", "two", Some(200), None, None),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().run_time_ms(210), Some(10000));
+    // Older builds omit duration_ms; interruption falls back to recorded timestamps.
+    append(
+        &mut file,
+        &timed("turn_aborted", "two", None, Some(220), None),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().run_time_ms(999), Some(20000));
+    append(&mut file, "invalid\n", &mut transcript);
+    assert_eq!(transcript.view().run_time_ms(999), None);
+}
