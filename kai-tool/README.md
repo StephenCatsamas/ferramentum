@@ -32,13 +32,13 @@ Install with `cargo install --path kai-tool --locked --force`.
 `kai status --watch` shows the current user's local Kai launcher processes, including windows
 opened before the dashboard started. Its Ratatui interface follows the `kai r` session picker:
 blue selection, a `›` marker, subdued metadata, type-to-search, and keyboard hints below the list.
-Rows show thread names and **Turn time**, an **Agents** column from 50 columns wide,
+Rows show thread names and **Turn time**, a **Subagents** column from 50 columns wide,
 **Tokens** from 70 columns, and **Last ended** from 110 columns. Turn time
 is elapsed time for the current turn, or the final duration of the most recent ended turn;
 it is not the age of the whole session.
 Names come from Codex's `session_index.jsonl`, including subsequent renames.
 
-Agents shows the number of subagents with an active recorded turn (for example, `2 active`),
+Subagents shows the number of subagents with an active recorded turn (for example, `2 active`),
 including nested descendants.
 It follows currently open subagent logs, using root/parent thread IDs to associate
 them with the main conversation and excluding inherited parent history where marked. The main

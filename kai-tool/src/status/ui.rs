@@ -510,7 +510,7 @@ impl View {
         let compact = area.width < 62;
         let cols = Columns::new(area.width);
         let agents = if cols.agents > 0 {
-            format!("{:width$}", "Agents", width = cols.agents)
+            format!("{:width$}", "Subagents", width = cols.agents)
         } else {
             String::new()
         };
@@ -794,7 +794,7 @@ impl View {
                 row.thread_id.as_deref().unwrap_or("—")
             ));
             messages.push(format!(
-                "Agents: {}",
+                "Subagents: {}",
                 row.agents.as_ref().map_or_else(
                     || "Unknown; session discovery is incomplete".into(),
                     super::agents::Summary::description
