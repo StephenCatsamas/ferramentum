@@ -11,6 +11,7 @@ mod gpu;
 mod http_retry;
 mod listing;
 mod local;
+mod login;
 mod model;
 mod output;
 mod providers;

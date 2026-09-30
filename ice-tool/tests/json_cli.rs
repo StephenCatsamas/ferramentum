@@ -243,6 +243,15 @@ fn agent_mode_rejects_prompts_even_with_terminal_stdin() {
             "--custom",
         ],
         vec!["--non-interactive", "--json", "login", "--cloud", "vast.ai"],
+        vec!["--non-interactive", "--json", "login", "--cloud", "verda"],
+        vec![
+            "--non-interactive",
+            "--json",
+            "login",
+            "--cloud",
+            "verda",
+            "--force",
+        ],
         vec![
             "--non-interactive",
             "--json",
@@ -1319,7 +1328,14 @@ fn verda_missing_credentials_and_cleanup_are_structured() {
         let value =
             failed(fixture.run(&[command, "--cloud", "verda", "--non-interactive", "--json"]));
         assert_eq!(value["cloud"], "verda");
-        assert_eq!(value["error"]["code"], "missing_credentials");
+        assert_eq!(
+            value["error"]["code"],
+            if command == "login" {
+                "authentication_required"
+            } else {
+                "missing_credentials"
+            }
+        );
     }
     let value = failed(fixture.run(&[
         "create",
@@ -1333,6 +1349,69 @@ fn verda_missing_credentials_and_cleanup_are_structured() {
     ]));
     assert_eq!(value["error"]["code"], "cleanup_acknowledgement_required");
     assert_eq!(value["error"]["details"]["automatic_delete"], false);
+}
+
+#[test]
+fn verda_partial_environment_never_mixes_with_saved_credentials() {
+    let fixture = Fixture::new();
+    let saved = "[auth.verda]\nclient_id = 'saved-id'\nclient_secret = 'saved-secret'\n";
+    fixture.config(saved);
+    for variable in ["VERDA_CLIENT_ID", "VERDA_CLIENT_SECRET"] {
+        for force in [false, true] {
+            let mut command = fixture.command();
+            command.env(variable, "environment-value").args([
+                "login",
+                "--cloud",
+                "verda",
+                "--json",
+                "--non-interactive",
+            ]);
+            if force {
+                command.arg("--force");
+            }
+            let output = bounded_output(command);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for secret in ["saved-id", "saved-secret", "environment-value"] {
+                assert!(!text.contains(secret));
+            }
+            let value = failed(output);
+            assert_eq!(value["error"]["code"], "missing_credentials");
+            assert_eq!(
+                value["error"]["details"]["environment"],
+                json!(["VERDA_CLIENT_ID", "VERDA_CLIENT_SECRET"])
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.root.path().join("config/ice/config.toml")).unwrap(),
+                saved
+            );
+        }
+    }
+}
+
+#[test]
+fn forced_noninteractive_login_preserves_saved_credentials() {
+    for cloud in ["vast.ai", "verda"] {
+        let fixture = Fixture::new();
+        let saved = "[auth.vast_ai]\napi_key = 'old-key'\n[auth.verda]\nclient_id = 'saved-id'\nclient_secret = 'saved-secret'\n";
+        fixture.config(saved);
+        let value = failed(fixture.run(&[
+            "login",
+            "--cloud",
+            cloud,
+            "--force",
+            "--non-interactive",
+            "--json",
+        ]));
+        assert_eq!(value["error"]["code"], "authentication_required");
+        assert_eq!(
+            fs::read_to_string(fixture.root.path().join("config/ice/config.toml")).unwrap(),
+            saved
+        );
+    }
 }
 
 #[test]
@@ -1427,6 +1506,11 @@ fn verda_configuration_round_trips_and_redacts_credentials() {
         );
         assert!(!String::from_utf8_lossy(&output.stdout).contains("verda-test-secret"));
     }
+    let config_path = fixture.root.path().join("config/ice/config.toml");
+    assert_eq!(
+        fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     let output = fixture.run(&["config", "list", "--json"]);
     assert!(output.status.success());
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();

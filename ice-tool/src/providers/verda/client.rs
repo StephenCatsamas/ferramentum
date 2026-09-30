@@ -9,9 +9,48 @@ use serde_json::{Value, json};
 
 use crate::automation::error;
 use crate::model::IceConfig;
+use crate::support::nonempty_string;
 
 const API: &str = "https://api.verda.com/v1";
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+pub(super) struct Credentials {
+    pub(super) client_id: String,
+    pub(super) client_secret: String,
+}
+
+impl Credentials {
+    pub(super) fn environment() -> Result<Option<Self>> {
+        Self::environment_pair(
+            std::env::var("VERDA_CLIENT_ID").ok(),
+            std::env::var("VERDA_CLIENT_SECRET").ok(),
+        )
+    }
+
+    fn environment_pair(id: Option<String>, secret: Option<String>) -> Result<Option<Self>> {
+        match (
+            id.and_then(nonempty_string),
+            secret.and_then(nonempty_string),
+        ) {
+            (None, None) => Ok(None),
+            (Some(client_id), Some(client_secret)) => Ok(Some(Self {
+                client_id,
+                client_secret,
+            })),
+            _ => Err(missing(
+                "Supply both VERDA_CLIENT_ID and VERDA_CLIENT_SECRET, or unset both to use saved credentials or interactive login.",
+            )),
+        }
+    }
+
+    pub(super) fn saved(config: &IceConfig) -> Option<Self> {
+        Some(Self {
+            client_id: nonempty_string(config.auth.verda.client_id.clone()?)?,
+            client_secret: nonempty_string(config.auth.verda.client_secret.clone()?)?,
+        })
+    }
+}
 
 struct Token {
     value: String,
@@ -36,26 +75,17 @@ pub(super) fn missing(message: &str) -> anyhow::Error {
 
 impl Client {
     pub(super) fn from_config(config: &IceConfig) -> Result<Self> {
-        let env_id = std::env::var("VERDA_CLIENT_ID")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let env_secret = std::env::var("VERDA_CLIENT_SECRET")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        // Never accidentally combine credentials from different accounts.
-        let (id, secret) = if env_id.is_some() || env_secret.is_some() {
-            (env_id, env_secret)
-        } else {
-            (
-                config.auth.verda.client_id.clone(),
-                config.auth.verda.client_secret.clone(),
-            )
-        };
-        let id = id.filter(|s| !s.trim().is_empty()).ok_or_else(|| missing("Supply both VERDA_CLIENT_ID and VERDA_CLIENT_SECRET, or auth.verda.client_id/client_secret."))?;
-        let secret = secret
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| missing("Supply both Verda client credentials from the same source."))?;
-        Self::new(API, id, secret)
+        let credentials = Credentials::environment()?.or_else(|| Credentials::saved(config))
+            .ok_or_else(|| missing("Run `ice login --cloud verda` interactively, or supply both VERDA_CLIENT_ID and VERDA_CLIENT_SECRET (auth.verda.client_id/client_secret in config)."))?;
+        Self::from_credentials(&credentials)
+    }
+
+    pub(super) fn from_credentials(credentials: &Credentials) -> Result<Self> {
+        Self::new(
+            API,
+            credentials.client_id.clone(),
+            credentials.client_secret.clone(),
+        )
     }
 
     fn new(base: &str, client_id: String, client_secret: String) -> Result<Self> {
@@ -231,5 +261,42 @@ impl Client {
     pub(super) fn mutate(&self, method: Method, path: &str, body: &Value) -> Result<Value> {
         self.request(method, path, Some(body), TIMEOUT)
             .map(|(value, _)| value)
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn environment_requires_one_complete_pair() {
+        for (id, secret) in [(None, None), (Some(" ".into()), Some("".into()))] {
+            assert!(Credentials::environment_pair(id, secret).unwrap().is_none());
+        }
+        for (id, secret) in [
+            (Some("id".into()), None),
+            (None, Some("secret".into())),
+            (Some("id".into()), Some(" ".into())),
+        ] {
+            assert!(Credentials::environment_pair(id, secret).is_err());
+        }
+        let pair = Credentials::environment_pair(Some(" id ".into()), Some(" secret ".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair.client_id, "id");
+        assert_eq!(pair.client_secret, "secret");
+    }
+
+    #[test]
+    fn incomplete_saved_credentials_require_a_new_pair() {
+        let mut config = IceConfig::default();
+        config.auth.verda.client_id = Some("old-id".into());
+        assert!(Credentials::saved(&config).is_none());
+        config.auth.verda.client_secret = Some(" ".into());
+        assert!(Credentials::saved(&config).is_none());
+        config.auth.verda.client_secret = Some("secret".into());
+        let pair = Credentials::saved(&config).unwrap();
+        assert_eq!(pair.client_id, "old-id");
+        assert_eq!(pair.client_secret, "secret");
     }
 }

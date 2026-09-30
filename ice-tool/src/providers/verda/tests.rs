@@ -136,6 +136,31 @@ impl Drop for Server {
 fn token() -> Reply {
     Reply::json(200, json!({"access_token":"mock-token","expires_in":3600}))
 }
+
+#[test]
+fn login_validates_oauth_without_reading_or_creating_resources() {
+    for status in [200, 401] {
+        let server = Server::new(move |request| {
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.path, "/oauth2/token");
+            assert_eq!(
+                request.body,
+                json!({"grant_type":"client_credentials", "client_id":"test-client", "client_secret":"test-secret"})
+            );
+            if status == 200 {
+                token()
+            } else {
+                Reply::json(status, json!({"error":"test-secret"}))
+            }
+        });
+        let result = server.client.authenticate();
+        assert_eq!(result.is_ok(), status == 200);
+        if let Err(error) = result {
+            assert!(!format!("{error:#}").contains("test-secret"));
+        }
+        assert_eq!(server.requests().len(), 1);
+    }
+}
 fn instance(status: &str) -> Value {
     json!({"id":ID,"hostname":"ice-verda-test","status":status,"ip":"192.0.2.1",
         "os_volume_id":OS,"volume_ids":[OS,EXTRA],"price_per_hour":0.6,

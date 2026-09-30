@@ -18,14 +18,14 @@ use crate::automation::{error, recovery};
 use crate::cache::CloudCacheModel;
 use crate::cli::{CreateArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
 use crate::listing::{ListedInstance, list_state_color};
-use crate::model::{Cloud, IceConfig, LoginMethod, LoginOutcome};
+use crate::model::{Cloud, IceConfig, LoginOutcome};
 use crate::providers::{
     CloudInstance, CloudProvider, CommandProvider, CreateProvider, RemoteCloudProvider,
 };
 use crate::support::{build_cloud_instance_name, now_unix_secs, prompt_confirm};
 use crate::workload::InstanceWorkload;
 use catalog::{Catalog, Offer};
-use client::Client;
+use client::{Client, Credentials};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const BILLING: &str = "Verda shutdown retains compute billing and storage. Delete the VM to end compute billing; retained volumes continue to incur storage charges.";
@@ -350,16 +350,28 @@ impl CommandProvider for Provider {
     }
 }
 
-pub(crate) fn login(config: &IceConfig) -> Result<LoginOutcome> {
-    Client::from_config(config)?.authenticate()?;
-    Ok(LoginOutcome {
-        method: if std::env::var_os("VERDA_CLIENT_ID").is_some() {
-            LoginMethod::AutoDetected
-        } else {
-            LoginMethod::Cached
+pub(crate) fn login(config: &mut IceConfig, force: bool) -> Result<LoginOutcome> {
+    crate::login::CredentialLogin {
+        cloud: Cloud::Verda,
+        environment: Credentials::environment()?,
+        cached: Credentials::saved(config),
+        force,
+        interactive: !crate::automation::non_interactive(),
+    }.run(
+        |credentials| Client::from_credentials(credentials)?.authenticate(),
+        || {
+            crate::login::begin_prompt(Cloud::Verda, "https://console.verda.com/")?;
+            crate::ui::print_notice("Select Credentials → Cloud API credentials → Create. Both values are hidden while you paste them.");
+            Ok(Credentials {
+                client_id: crate::login::prompt_secret("Verda Client ID")?,
+                client_secret: crate::login::prompt_secret("Verda Client Secret")?,
+            })
         },
-        saved_path: None,
-    })
+        |credentials| crate::login::save_credentials(config, |updated| {
+            updated.auth.verda.client_id = Some(credentials.client_id);
+            updated.auth.verda.client_secret = Some(credentials.client_secret);
+        }),
+    )
 }
 
 pub(crate) fn catalog_command(cloud: Cloud, config: &IceConfig) -> Result<()> {

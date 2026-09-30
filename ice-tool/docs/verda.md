@@ -8,13 +8,32 @@ managed workload logs are unsupported and fail explicitly.
 
 ## Credentials and discovery
 
-Create API client credentials in the Verda console and provide both
-`VERDA_CLIENT_ID` and `VERDA_CLIENT_SECRET` through your secret manager or shell
-environment. Ice exchanges them for a short-lived OAuth token in memory; it does
-not save environment credentials. Alternatively configure
-`auth.verda.client_id` and `auth.verda.client_secret` in Ice's config. An incomplete
-environment pair fails instead of mixing it with saved credentials. Config
-display redacts both fields. `login --force` also validates a fresh token.
+Run this in a terminal to set up persistent credentials:
+
+```sh
+ice login --cloud verda
+```
+
+Ice opens the Verda console. Select **Credentials → Cloud API credentials →
+Create**, then paste the Client ID and Client Secret at Ice's prompts. Both inputs
+are hidden. Ice validates the pair with Verda before saving it under
+`auth.verda.client_id` and `auth.verda.client_secret` in its config (normally
+`~/.config/ice/config.toml` on Linux). The file stores credentials as plaintext
+with owner-only permissions on Unix. Config display redacts both values.
+
+Subsequent commands reuse the saved pair. `ice login --cloud verda --force`
+prompts for replacements; cancellation or failed validation leaves the saved pair
+unchanged. Vast and Verda share this login policy and persistence mechanism.
+
+For automation, provide both `VERDA_CLIENT_ID` and `VERDA_CLIENT_SECRET` through
+your secret manager or shell environment, or use the saved configuration.
+Environment credentials take precedence even with `--force`, are validated
+without prompts and are never saved. An incomplete environment pair fails
+instead of mixing it with saved credentials. To replace saved credentials, unset
+both environment variables before using `--force`. Noninteractive login never
+opens a browser or prompts; `--force` without environment credentials requires
+interactive input. Ice exchanges credentials for a short-lived OAuth token held
+only in memory.
 
 ```sh
 ice login --cloud verda --non-interactive --json

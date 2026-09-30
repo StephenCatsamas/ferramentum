@@ -20,6 +20,14 @@ ice logs --cloud vast.ai <instance> --follow
 ice delete --cloud vast.ai <instance>
 ```
 
+For Verda, run `ice login --cloud verda` in a terminal. Ice prompts for the
+Client ID and Client Secret, validates them, and saves both for subsequent runs.
+Vast and Verda share this prompt/validate/save flow. `--force` replaces saved
+credentials interactively; environment credentials retain precedence and are
+never saved by these providers. AWS/GCP retain their provider CLI discovery.
+See [Verda credentials](docs/verda.md#credentials-and-discovery) for automation
+and storage details.
+
 ## Clouds
 
 Supported cloud identifiers:

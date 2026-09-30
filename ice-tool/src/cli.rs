@@ -119,6 +119,7 @@ pub(crate) struct LogsArgs {
 pub(crate) struct LoginArgs {
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
+    /// Refresh login; Vast/Verda prompt again unless environment credentials are set.
     #[arg(long)]
     pub(crate) force: bool,
 }

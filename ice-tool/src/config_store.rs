@@ -642,7 +642,7 @@ pub(crate) fn acquire_config_lock(wait: bool) -> Result<capulus::InvocationLock>
 
 pub(crate) fn save_config(config: &IceConfig) -> Result<PathBuf> {
     let path = config_path()?;
-    capulus::store::write_toml_file(&path, config, None, None)
+    capulus::store::write_toml_file(&path, config, Some(0o600), None)
         .with_context(|| format!("Failed to write config file: {}", path.display()))?;
     Ok(path)
 }
