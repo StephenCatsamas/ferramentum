@@ -17,7 +17,7 @@ pub(super) struct Summary {
 impl Summary {
     pub(super) fn label(&self) -> String {
         format!(
-            "{}{}",
+            "{} active{}",
             self.running,
             if self.complete && self.unknown == 0 {
                 ""
@@ -171,6 +171,6 @@ mod tests {
         assert_eq!(summary.unknown, 1);
         assert_eq!(summary.total, 2);
         assert!(!summary.complete);
-        assert_eq!(summary.label(), "1 ?");
+        assert_eq!(summary.label(), "1 active ?");
     }
 }

@@ -354,7 +354,7 @@ mod observer {
             "PID",
             "TTY",
             "TURN TIME",
-            "ACTIVE AGENTS",
+            "AGENTS",
             "TOKENS",
             "LAST ENDED",
             "THREAD / DIRECTORY"

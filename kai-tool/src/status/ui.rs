@@ -510,7 +510,7 @@ impl View {
         let compact = area.width < 62;
         let cols = Columns::new(area.width);
         let agents = if cols.agents > 0 {
-            format!("{:width$}", "Active agents", width = cols.agents)
+            format!("{:width$}", "Agents", width = cols.agents)
         } else {
             String::new()
         };

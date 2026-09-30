@@ -130,7 +130,7 @@ fn layouts_show_name_runtime_and_navigation_without_disclaimer_text() {
         assert!(text.contains("1m 05s"), "{text}");
         if width >= 70 {
             assert!(text.contains("Tokens") && text.contains("1.0M"), "{text}");
-            assert!(text.contains("Active agents"), "{text}");
+            assert!(text.contains("Agents"), "{text}");
         }
         assert!(text.contains("esc quit"), "{text}");
         assert!(text.contains("enter focus"), "{text}");
@@ -278,7 +278,7 @@ fn agents_column_and_active_filter_include_work_after_the_parent_is_ready() {
     for width in [50, 70, 120] {
         let text = contents(&render(&mut view, &snapshot, width, 24));
         assert!(
-            text.contains("Active agents") && text.contains("2 ?"),
+            text.contains("Agents") && text.contains("2 active ?"),
             "{text}"
         );
         assert!(text.contains("Ready"), "{text}");
