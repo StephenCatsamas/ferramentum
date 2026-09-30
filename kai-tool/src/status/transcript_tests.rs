@@ -1,0 +1,177 @@
+use super::*;
+use serde_json::json;
+use std::fs;
+use std::io::Write;
+use tempfile::{NamedTempFile, tempdir};
+
+fn header(source: Value) -> String {
+    format!(
+        "{}\n",
+        json!({"type":"session_meta", "payload":{
+            "id":"thread", "source":source, "cwd":"/workspace"
+        }})
+    )
+}
+
+fn event(kind: &str, turn: &str) -> String {
+    format!(
+        "{}\n",
+        json!({"timestamp":"2026-09-30T12:00:00Z", "type":"event_msg",
+        "payload":{"type":kind, "turn_id":turn}})
+    )
+}
+
+fn append(file: &mut NamedTempFile, value: &str, transcript: &mut Transcript) {
+    file.write_all(value.as_bytes()).unwrap();
+    transcript.refresh(file.path()).unwrap();
+}
+
+#[test]
+fn root_and_subagent_logs_are_distinguished() {
+    for (source, is_main) in [
+        (json!("cli"), true),
+        (json!({"subagent":{"thread_spawn":{}}}), false),
+    ] {
+        let mut file = NamedTempFile::new().unwrap();
+        let mut transcript = Transcript::default();
+        append(&mut file, &header(source), &mut transcript);
+        assert_eq!(transcript.is_main(), is_main);
+        assert_eq!(transcript.view().state, TurnState::Unknown);
+    }
+}
+
+#[test]
+fn lifecycle_rejects_old_completion_and_retains_the_previous_finish_time() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_started", "first"), &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Working);
+    append(&mut file, &event("task_complete", "first"), &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Ready);
+    let finished = transcript.view().last_finished_at;
+    assert!(finished.is_some());
+    append(&mut file, &event("turn_started", "next"), &mut transcript);
+    append(&mut file, &event("task_complete", "first"), &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Working);
+    assert_eq!(transcript.view().last_finished_at, finished);
+    append(&mut file, &event("turn_aborted", "next"), &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Interrupted);
+    append(
+        &mut file,
+        "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_complete\",\"error\":{\"message\":\"private\"},\"completed_at\":10}}\n",
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().state, TurnState::Error);
+    assert_eq!(transcript.view().last_finished_at, Some(10));
+    assert!(transcript.view().detail.is_none());
+}
+
+#[test]
+fn only_synchronous_input_requests_block_and_matching_responses_resume() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_started", "one"), &mut transcript);
+    let call = |name, id| {
+        format!(
+            "{}\n",
+            json!({"type":"response_item", "payload":{
+                "type":"function_call", "name":name, "call_id":id, "arguments":"private"
+            }})
+        )
+    };
+    let output = |id| {
+        format!(
+            "{}\n",
+            json!({"type":"response_item", "payload":{
+                "type":"function_call_output", "call_id":id, "output":"private"
+            }})
+        )
+    };
+    append(
+        &mut file,
+        &call("functions.request_user_input_async", "async"),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().state, TurnState::Working);
+    append(
+        &mut file,
+        &call("functions.request_user_input", "sync"),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().state, TurnState::NeedsInput);
+    append(&mut file, &output("async"), &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::NeedsInput);
+    append(&mut file, &output("sync"), &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Working);
+}
+
+#[test]
+fn partial_appends_are_retried_and_invalid_records_do_not_claim_completion() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    file.write_all(b"{\"type\":").unwrap();
+    assert!(transcript.refresh(file.path()).is_err());
+    assert!(transcript.refresh(file.path()).is_err());
+    file.as_file().set_len(0).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_started", "one"), &mut transcript);
+    let complete = event("task_complete", "one");
+    append(&mut file, &complete[..20], &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Working);
+    append(&mut file, &complete[20..], &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Ready);
+    append(&mut file, "not json\n", &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Unknown);
+    append(&mut file, &event("task_started", "two"), &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Working);
+}
+
+#[test]
+fn replacement_and_truncation_reset_cached_state_and_symlinks_are_rejected() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("rollout-test.jsonl");
+    let replacement = root.path().join("replacement");
+    let mut transcript = Transcript::default();
+    fs::write(&path, header(json!("cli")) + &event("task_started", "one")).unwrap();
+    transcript.refresh(&path).unwrap();
+    fs::write(
+        &replacement,
+        header(json!("cli")) + &event("task_complete", "two"),
+    )
+    .unwrap();
+    fs::rename(&replacement, &path).unwrap();
+    transcript.refresh(&path).unwrap();
+    assert_eq!(transcript.view().state, TurnState::Ready);
+    fs::write(&path, header(json!("cli"))).unwrap();
+    transcript.refresh(&path).unwrap();
+    assert_eq!(transcript.view().state, TurnState::Unknown);
+    assert_eq!(transcript.view().last_finished_at, None);
+    std::os::unix::fs::symlink(&path, &replacement).unwrap();
+    assert!(transcript.refresh(&replacement).is_err());
+}
+
+#[test]
+fn oversized_records_and_long_history_are_bounded_and_recover_at_lifecycle_events() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_started", "one"), &mut transcript);
+    append(
+        &mut file,
+        &"x".repeat(MAX_LINE_BYTES as usize + 100),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().state, TurnState::Unknown);
+    append(
+        &mut file,
+        &("\n".to_owned() + &event("task_complete", "one")),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().state, TurnState::Ready);
+    let huge = "x".repeat(MAX_SCAN_BYTES as usize + 100) + "\n" + &event("turn_aborted", "two");
+    append(&mut file, &huge, &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Interrupted);
+}

@@ -8,6 +8,8 @@ Kai launches Codex and resumes conversations with configurable credential rotati
 kai                         Launch Codex
 kai resume                  Open the all-sessions picker
 kai resume ID               Resume a specific conversation
+kai status                  List local Kai windows and their latest turn state (Linux)
+kai status --watch          Refresh the window dashboard every two seconds
 kai llm-get PATH...          Assemble a source listing
 ```
 
@@ -24,6 +26,50 @@ line shows model/reasoning, run
 state, remaining context, weekly limit, total input/output tokens, and Fast-mode status, in that order.
 
 Install with `cargo install --path kai-tool --locked --force`.
+
+## Window status
+
+`kai status --watch` shows the current user's local Kai launcher processes, including windows
+opened before the dashboard started. Each row includes the PID, terminal, working directory,
+conversation ID, and the age of the latest recorded turn completion. Use `--interval SECONDS`
+to change the refresh rate (1–3600 seconds), and press `q`, Esc, or Ctrl-C to quit.
+
+| State | Meaning |
+| --- | --- |
+| Working | The main conversation has a recorded turn start without a matching end. |
+| Ready | The latest recorded turn completed successfully; the window remains open. |
+| Needs input | A synchronous `request_user_input` call is awaiting its matching result. |
+| Interrupted | The latest recorded turn was aborted. |
+| Error | The latest recorded turn completion contains an error. |
+| Unknown | There is insufficient evidence to identify the main conversation or its state. |
+| Exited | The dashboard observed the window process exit. Its exit result is unavailable. |
+
+“Last finished” refers to a turn ending, including interruptions and errors; it does not mean
+the overall task was accomplished. Exited windows stay visible for ten minutes while the watcher
+runs. Windows closed before observation are not included, and history is not saved between runs.
+
+This first implementation requires Linux `/proc`. It reads same-user Kai/Codex process metadata
+and the session logs held open by a direct Codex child. It does not require a Codex binary on PATH,
+call a credential provider, start a daemon, or make model/API requests. It works with the custom
+Codex build's embedded server; detached servers, remote machines, and processes hidden by `/proc`
+permissions may be unavailable. Subagent logs are excluded. Multiple open main conversations in
+one process are reported as Unknown because the log does not identify the visible conversation.
+
+State follows persisted Codex `task_started`/`task_complete`/`turn_aborted` events (also accepting
+`turn_started`/`turn_complete`), so updates can lag buffered log writes. It does not detect every
+approval prompt or infer progress from CPU use. Async questions do not imply the agent is blocked.
+Unknown is also used during startup/recovery or when logs are missing, unreadable, malformed, or
+from an unsupported format. Reads are incremental and bounded to the most recent 16 MiB on startup
+or when catching up, skipping individual records over 1 MiB. A skipped record makes state Unknown
+until a later lifecycle event provides evidence. Prompt text, tool arguments, responses, and error
+messages are not included in output. LLM progress summaries are a separate feature.
+
+For scripts, `kai status --json` emits one snapshot; `kai status --watch --json` emits one JSON
+object per line, including when output is piped. Snapshot `version` is `1`, `observed_at` is Unix
+seconds, and `windows` contains `pid`, `tty`, `cwd`, `thread_id`, `state`, `last_finished_at`,
+`exited_at`, and `detail`. Unavailable values are null, timestamps are Unix seconds, and state names
+are `working`, `ready`, `needs_input`, `interrupted`, `error`, `unknown`, or `exited`. `warnings`
+reports incomplete process discovery. No terminal escape sequences are emitted in JSON mode.
 
 ## Credential provider
 

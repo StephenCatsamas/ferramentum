@@ -33,6 +33,8 @@ tempfile = { workspace = true }
 walkdir = "2"
 which = { workspace = true }
 toml = "1"
+time = { version = "0.3", features = ["parsing"] }
+unicode-width = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
