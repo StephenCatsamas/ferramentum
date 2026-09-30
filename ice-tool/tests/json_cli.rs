@@ -13,6 +13,85 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn config(&self, contents: &str) {
+        let dir = self.root.path().join("config/ice");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), contents).unwrap();
+    }
+
+    fn gcp_creation(&self) {
+        let dir = self.root.path().join(".ice/provider/gcp");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("machine-catalog.toml"),
+            r#"
+refreshed_at_unix = 1790000000
+[[entries]]
+machine = "test-cpu"
+zone = "test-a"
+region = "test"
+vcpus = 4
+billable_vcpus = 4.0
+ram_mb = 16000
+gpus = []
+hourly_usd = 0.1
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("machine-pricing-map.toml"),
+            r#"
+[[entries]]
+machine = "test-cpu"
+region = "test"
+[[entries.components]]
+sku_id = "test-sku"
+quantity_source = "per-machine"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("sku-pricing-cache.toml"),
+            r#"
+refreshed_at_unix = 1790000000
+[[entries]]
+sku_id = "test-sku"
+description = "Fixture compute"
+rate_unit = "per-hour"
+usd_per_unit = 0.2
+"#,
+        )
+        .unwrap();
+        self.script("gcloud", r#"#!/bin/sh
+[ "$1" != --version ] || exit 0
+[ "$CLOUDSDK_CORE_DISABLE_PROMPTS" = 1 ] || exit 71
+printf '%s\n' "$*" >> "$ICE_TEST_ACTIONS"
+row() {
+  name=$(/bin/cat "$ICE_TEST_STATE.name")
+  state=$(/bin/cat "$ICE_TEST_STATE")
+  printf '{"name":"%s","status":"%s","zone":"zones/test-a","metadata":{"items":[{"key":"ice-workload-kind","value":"shell"}]}}' "$name" "$state"
+}
+case "$1:$2:$3" in
+  compute:instances:list)
+    if [ -f "$ICE_TEST_STATE.name" ]; then printf '['; row; printf ']'; else printf '[]'; fi ;;
+  compute:instances:create)
+    printf '%s' "$4" > "$ICE_TEST_STATE.name"
+    printf '%s' "${ICE_TEST_CREATED_STATE:-RUNNING}" > "$ICE_TEST_STATE"
+    printf 'provider creation output\n' ;;
+  compute:instances:describe) row ;;
+  compute:instances:stop) printf TERMINATED > "$ICE_TEST_STATE" ;;
+  compute:instances:start) printf RUNNING > "$ICE_TEST_STATE" ;;
+  compute:instances:delete) /bin/rm "$ICE_TEST_STATE.name" ;;
+  compute:ssh:*|compute:scp:*)
+    case "$*" in *BatchMode=yes*) ;; *) exit 72 ;; esac
+    if read -r answer; then exit 73; fi
+    [ "$ICE_TEST_TRANSFER_FAIL" != 1 ] || exit 74
+    printf 'transport output\n' ;;
+  *) printf 'unexpected command: %s\n' "$*" >&2; exit 75 ;;
+esac
+"#);
+    }
+
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("bin")).unwrap();
@@ -41,12 +120,14 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ice"));
         command
+            .env("HOME", self.root.path())
             .env("PATH", self.root.path().join("bin"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("XDG_RUNTIME_DIR", self.root.path().join("runtime"))
             .env("ICE_TEST_RESPONSE", self.root.path().join("response.json"))
             .env("ICE_TEST_STATE", self.root.path().join("state"))
             .env("ICE_TEST_ACTIONS", self.root.path().join("actions"))
+            .env_remove("VAST_API_KEY")
             .env_remove("AWS_ACCESS_KEY_ID")
             .env_remove("AWS_SECRET_ACCESS_KEY")
             .env_remove("AWS_SESSION_TOKEN");
@@ -97,6 +178,440 @@ esac
 printf '%s\n' "$1" >> "$ICE_TEST_ACTIONS"
 "#);
     }
+}
+
+fn bounded_output(mut command: Command) -> Output {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if start.elapsed() > Duration::from_secs(12) {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!("command blocked: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn agent_mode_rejects_prompts_even_with_terminal_stdin() {
+    use std::os::fd::FromRawFd;
+    let fixture = Fixture::new();
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: openpty initializes these descriptors; each is adopted exactly once.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let _master = unsafe { fs::File::from_raw_fd(master) };
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    for args in [
+        vec![
+            "--non-interactive",
+            "--json",
+            "create",
+            "--cloud",
+            "vast.ai",
+            "--ssh",
+            "--max-price-per-hr",
+            "1",
+        ],
+        vec![
+            "--non-interactive",
+            "--json",
+            "create",
+            "--cloud",
+            "vast.ai",
+            "--custom",
+        ],
+        vec!["--non-interactive", "--json", "login", "--cloud", "vast.ai"],
+        vec![
+            "--non-interactive",
+            "--json",
+            "shell",
+            "--cloud",
+            "vast.ai",
+            "123",
+        ],
+    ] {
+        let mut command = fixture.command();
+        command.args(args).stdin(slave.try_clone().unwrap());
+        let value = failed(bounded_output(command));
+        assert!(matches!(
+            value["error"]["code"].as_str(),
+            Some(
+                "confirmation_required"
+                    | "invalid_arguments"
+                    | "authentication_required"
+                    | "interaction_required"
+            )
+        ));
+    }
+    assert!(!fixture.root.path().join("config/ice/config.toml").exists());
+}
+
+#[test]
+fn creation_defaults_are_visible_overridable_and_never_persisted() {
+    let fixture = Fixture::new();
+    let config = "[default.vast_ai]\nmin_cpus = 8\nmin_ram_gb = 32.0\nmax_price_per_hr = 0.6\ngpu_count = 2\nmin_download_mbps = 100.0\n";
+    fixture.config(config);
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "vast.ai",
+        "--ssh",
+        "--gpu-count",
+        "1",
+        "--min-cpus",
+        "4",
+        "--disk-gb",
+        "80",
+        "--dry-run",
+        "--json",
+        "--non-interactive",
+    ]));
+    assert_eq!(value["error"]["code"], "authentication_required");
+    let filters = &value["error"]["details"]["selection"]["filters"];
+    assert_eq!(
+        filters["min_cpus"],
+        json!({"value":4,"source":"command_line"})
+    );
+    assert_eq!(
+        filters["min_ram_gb"],
+        json!({"value":32.0,"source":"saved_configuration"})
+    );
+    assert_eq!(filters["gpu_count"]["value"], 1);
+    assert_eq!(filters["disk_gb"]["value"], 80);
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("config/ice/config.toml")).unwrap(),
+        config
+    );
+
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "vast.ai",
+        "--ssh",
+        "--no-defaults",
+        "--max-price-per-hr",
+        "0.4",
+        "--dry-run",
+        "--json",
+    ]));
+    let selection = &value["error"]["details"]["selection"];
+    assert_eq!(selection["saved_filters_ignored"], true);
+    assert!(selection["filters"]["min_cpus"]["value"].is_null());
+    assert!(selection["filters"]["gpu_count"]["value"].is_null());
+    assert_eq!(selection["filters"]["disk_gb"]["value"], 32);
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("config/ice/config.toml")).unwrap(),
+        config
+    );
+}
+
+#[test]
+fn agent_creation_reports_missing_conflicting_and_unsupported_inputs() {
+    let fixture = Fixture::new();
+    let value = failed(fixture.run(&["create", "--cloud", "vast.ai", "--ssh", "--yes", "--json"]));
+    assert_eq!(value["error"]["code"], "missing_configuration");
+    assert_eq!(
+        value["error"]["details"]["required_flags"],
+        json!(["--max-price-per-hr"])
+    );
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "vast.ai",
+        "--ssh",
+        "--min-ram-gb",
+        "NaN",
+        "--disk-gb",
+        "0",
+        "--max-price-per-hr",
+        "0",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "invalid_arguments");
+    assert_eq!(
+        value["error"]["details"]["filters"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "vast.ai",
+        "--ssh",
+        "--gpu-count",
+        "0",
+        "--min-gpu-memory-gb",
+        "24",
+        "--max-price-per-hr",
+        "1",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "invalid_arguments");
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "gcp",
+        "--ssh",
+        "--min-download-mbps",
+        "500",
+        "--max-price-per-hr",
+        "1",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "unsupported_filter");
+    assert_eq!(
+        value["error"]["details"]["filters"],
+        json!(["min_download_mbps"])
+    );
+    assert!(!fixture.root.path().join("config/ice/config.toml").exists());
+}
+
+#[test]
+fn new_filter_defaults_round_trip_through_config() {
+    let fixture = Fixture::new();
+    for (key, value) in [
+        ("gpu_count", "0"),
+        ("min_gpu_memory_gb", "24"),
+        ("disk_gb", "80"),
+        ("min_download_mbps", "500"),
+        ("min_upload_mbps", "100"),
+    ] {
+        let key = format!("default.vast_ai.{key}");
+        parsed(fixture.run(&["config", "set", &format!("{key}={value}"), "--json"]));
+        let actual = parsed(fixture.run(&["config", "get", &key, "--json"]));
+        assert_eq!(
+            actual["result"]["value"].as_f64(),
+            value.parse::<f64>().ok()
+        );
+        parsed(fixture.run(&["config", "unset", &key, "--json"]));
+        let actual = parsed(fixture.run(&["config", "get", &key, "--json"]));
+        assert!(actual["result"]["value"].is_null());
+    }
+}
+
+#[test]
+fn invalid_saved_filter_cannot_silently_turn_into_an_unrestricted_search() {
+    let fixture = Fixture::new();
+    fixture.config("[default.vast_ai]\nmin_ram_gb = nan\nmax_price_per_hr = 0.6\n");
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "vast.ai",
+        "--ssh",
+        "--dry-run",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "invalid_arguments");
+    assert_eq!(value["error"]["details"]["source"], "saved_configuration");
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "vast.ai",
+        "--ssh",
+        "--min-ram-gb",
+        "16",
+        "--dry-run",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "authentication_required");
+    fixture.config("[default.vast_ai]\nallowed_gpus = ['RTX 4090']\nmax_price_per_hr = 0.6\n");
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "vast.ai",
+        "--ssh",
+        "--gpu-count",
+        "0",
+        "--no-gpu",
+        "--dry-run",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "authentication_required");
+    let filters = &value["error"]["details"]["selection"]["filters"];
+    assert_eq!(filters["gpu_count"]["value"], 0);
+    assert_eq!(filters["allowed_gpus"]["value"], json!([]));
+}
+
+#[test]
+fn gcp_service_account_applies_to_resource_commands_and_returned_connection() {
+    let fixture = Fixture::new();
+    fixture.config("[auth.gcp]\nservice_account_json = '/fixture/key with spaces.json'\n");
+    fixture.script("gcloud", r#"#!/bin/sh
+[ "$1" != --version ] || exit 0
+[ "$CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE" = '/fixture/key with spaces.json' ] || exit 80
+case "$2" in
+  instances) printf '[{"name":"ice-example","status":"RUNNING","zone":"zones/test-a","metadata":{"items":[{"key":"ice-workload-kind","value":"shell"}]}}]' ;;
+  ssh) exit 0 ;;
+  *) exit 81 ;;
+esac
+"#);
+    let value = parsed(fixture.run(&[
+        "shell",
+        "--cloud",
+        "gcp",
+        "ice-example",
+        "--print-creds",
+        "--non-interactive",
+        "--json",
+    ]));
+    let command = value["result"]["connect_command"].as_str().unwrap();
+    assert!(command.starts_with("env "));
+    assert!(
+        command.contains("CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE=/fixture/key with spaces.json")
+    );
+    assert!(command.contains("--quiet"));
+}
+
+#[test]
+fn unattended_gcp_workflow_verifies_price_creates_connects_transfers_and_cleans_up() {
+    let fixture = Fixture::new();
+    fixture.gcp_creation();
+    let base = [
+        "--non-interactive",
+        "--json",
+        "create",
+        "--cloud",
+        "gcp",
+        "--ssh",
+        "--max-price-per-hr",
+        "0.3",
+        "--disk-gb",
+        "80",
+        "--hours",
+        "0.25",
+    ];
+    let preview = parsed(fixture.run(&[base.as_slice(), &["--dry-run"]].concat()));
+    assert_eq!(preview["result"]["cost"]["hourly_usd"], 0.2);
+    assert_eq!(preview["result"]["allocated_disk_gb"], 80);
+    assert!(!fixture.root.path().join("state.name").exists());
+    let created = parsed(fixture.run(&[base.as_slice(), &["--yes"]].concat()));
+    let id = created["result"]["instance"]["id"].as_str().unwrap();
+    let connection = parsed(fixture.run(&[
+        "--non-interactive",
+        "--json",
+        "shell",
+        "--cloud",
+        "gcp",
+        id,
+        "--print-creds",
+    ]));
+    assert!(
+        connection["result"]["connect_command"]
+            .as_str()
+            .unwrap()
+            .contains("BatchMode=yes")
+    );
+    assert!(
+        connection["result"]["connect_command"]
+            .as_str()
+            .unwrap()
+            .contains("--quiet")
+    );
+    let file = fixture.root.path().join("payload");
+    fs::write(&file, "payload").unwrap();
+    for args in [
+        vec![
+            "push",
+            "--cloud",
+            "gcp",
+            id,
+            file.to_str().unwrap(),
+            "/tmp/payload",
+            "--json",
+        ],
+        vec![
+            "pull",
+            "--cloud",
+            "gcp",
+            id,
+            "/tmp/payload",
+            file.to_str().unwrap(),
+            "--json",
+        ],
+    ] {
+        parsed(fixture.run(&args));
+        let mut command = fixture.command();
+        command.args(&args).env("ICE_TEST_TRANSFER_FAIL", "1");
+        failed(bounded_output(command));
+    }
+    parsed(fixture.run(&["stop", "--cloud", "gcp", id, "--json"]));
+    let stopped = failed(fixture.run(&["shell", "--cloud", "gcp", id, "--print-creds", "--json"]));
+    assert_eq!(stopped["error"]["code"], "instance_stopped");
+    parsed(fixture.run(&["start", "--cloud", "gcp", id, "--json"]));
+    parsed(fixture.run(&["delete", "--cloud", "gcp", id, "--json"]));
+    let actions = fs::read_to_string(fixture.root.path().join("actions")).unwrap();
+    assert_eq!(
+        actions
+            .lines()
+            .filter(|line| line.starts_with("compute instances create "))
+            .count(),
+        1
+    );
+    assert!(!fixture.root.path().join("config/ice/config.toml").exists());
+}
+
+#[test]
+fn unattended_gcp_creation_rejects_repriced_offer_and_reports_timeout_resource() {
+    let fixture = Fixture::new();
+    fixture.gcp_creation();
+    let rejected = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "gcp",
+        "--ssh",
+        "--max-price-per-hr",
+        "0.15",
+        "--yes",
+        "--json",
+    ]));
+    assert_eq!(rejected["error"]["code"], "no_matching_offers");
+    assert!(!fixture.root.path().join("state.name").exists());
+    let mut command = fixture.command();
+    command
+        .args([
+            "create",
+            "--cloud",
+            "gcp",
+            "--ssh",
+            "--max-price-per-hr",
+            "0.3",
+            "--yes",
+            "--startup-timeout",
+            "1s",
+            "--json",
+        ])
+        .env("ICE_TEST_CREATED_STATE", "PROVISIONING");
+    let failed = failed(bounded_output(command));
+    assert_eq!(failed["error"]["code"], "startup_timeout");
+    let recovery = &failed["error"]["details"]["recovery"];
+    assert_eq!(recovery["stage"], "waiting_for_startup");
+    assert_eq!(
+        recovery["instance_id"].as_str().unwrap(),
+        fs::read_to_string(fixture.root.path().join("state.name")).unwrap()
+    );
+    assert_eq!(recovery["zone"], "test-a");
 }
 
 fn parsed(output: Output) -> Value {
@@ -415,7 +930,7 @@ fn credential_lookup_errors_do_not_expose_raw_token_responses() {
 
 #[test]
 fn closed_json_pipe_stops_a_log_transport_with_child_processes() {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -431,7 +946,7 @@ fn closed_json_pipe_stops_a_log_transport_with_child_processes() {
         r#"#!/bin/sh
 if [ "$2" = ssh ]; then
     printf 'first'
-    read -r release
+    while [ ! -f "$ICE_TEST_STATE.release" ]; do /bin/sleep 0.01; done
     /bin/sh -c 'printf second; exec /bin/sleep 30' &
     wait
 else
@@ -462,12 +977,7 @@ fi
         "first"
     );
     drop(stdout);
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"continue\n")
-        .unwrap();
+    fs::write(fixture.root.path().join("state.release"), "continue").unwrap();
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -481,6 +991,46 @@ fi
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn connection_and_provider_log_flags_reject_unsupported_uses_before_provider_access() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["shell", "--cloud", "vast.ai", "42", "--no-probe", "--json"],
+        vec![
+            "shell",
+            "--cloud",
+            "vast.ai",
+            "42",
+            "--print-creds",
+            "--no-probe",
+            "--preserve-ephemeral",
+            "--json",
+        ],
+        vec![
+            "shell",
+            "--cloud",
+            "gcp",
+            "42",
+            "--print-creds",
+            "--no-probe",
+            "--json",
+        ],
+        vec!["logs", "--cloud", "gcp", "42", "--provider-logs", "--json"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success(), "{args:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_arguments", "{args:?}");
+    }
+    let output = fixture.run(&["shell", "--help"]);
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("--no-probe")
+    );
 }
 
 #[test]
@@ -560,7 +1110,7 @@ fi
 
 #[test]
 fn log_output_is_flushed_before_the_stream_finishes() {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -572,14 +1122,14 @@ fn log_output_is_flushed_before_the_stream_finishes() {
             {"key":"ice-workload-source","value":"example:tag"}]}}]),
         false,
     );
-    // Block on stdin after printing the first chunk. The test releases it only
+    // Block on a file after printing the first chunk. The test releases it only
     // after receiving JSON, proving follow does not buffer until process exit.
     fixture.script(
         "gcloud",
         r#"#!/bin/sh
 if [ "$2" = ssh ]; then
     printf 'first chunk'
-    read -r release
+    while [ ! -f "$ICE_TEST_STATE" ]; do /bin/sleep 0.01; done
     printf 'last chunk'
 else
     /bin/cat "$ICE_TEST_RESPONSE"
@@ -612,7 +1162,7 @@ fi
     });
     let first = receiver.recv_timeout(Duration::from_secs(10));
     if first.is_err() {
-        let _ = child.stdin.take().unwrap().write_all(b"continue\n");
+        fs::write(fixture.root.path().join("state"), "continue").unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
         reader.join().unwrap();
@@ -621,12 +1171,7 @@ fi
     let first: Value = serde_json::from_str(&first.unwrap()).unwrap();
     assert_eq!(first["result"]["text"], "first chunk");
     assert!(child.try_wait().unwrap().is_none());
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"continue\n")
-        .unwrap();
+    fs::write(fixture.root.path().join("state"), "continue").unwrap();
     assert!(child.wait().unwrap().success());
     reader.join().unwrap();
     let remaining: Vec<Value> = receiver

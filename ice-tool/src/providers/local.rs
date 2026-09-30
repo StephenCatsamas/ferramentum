@@ -311,7 +311,10 @@ impl CreateProvider for Provider {
             return Ok(());
         }
 
-        if prompt_confirm("Open shell in the new instance now?", true)? {
+        if !crate::automation::non_interactive()
+            && !args.yes
+            && prompt_confirm("Open shell in the new instance now?", true)?
+        {
             local_open_shell(&context, &instance)?;
         }
 

@@ -9,7 +9,7 @@ use crate::cache::CloudCacheModel;
 use crate::cli::{CreateArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
 use crate::listing::ListedInstance;
 use crate::model::{Cloud, CloudMachineCandidate, IceConfig};
-use crate::support::{VAST_WAIT_TIMEOUT_SECS, ensure_provider_cli_installed, prompt_confirm};
+use crate::support::{ensure_provider_cli_installed, prompt_confirm};
 use crate::ui::print_stage;
 use crate::unpack::{
     materialize_unpack_bundle, unpack_logs_remote_command, unpack_start_remote_command,
@@ -230,11 +230,7 @@ pub(crate) trait RemoteSshProvider: RemoteCloudProvider {
         let remote_dir = Self::remote_unpack_dir(instance);
         let result = (|| {
             print_stage("Waiting for SSH access");
-            Self::wait_for_ssh_ready(
-                config,
-                instance,
-                Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-            )?;
+            Self::wait_for_ssh_ready(config, instance, crate::automation::startup_timeout())?;
             print_stage("Uploading unpack bundle");
             Self::upload_unpack_bundle(config, instance, &bundle.root, &remote_dir)?;
             print_stage("Starting unpack workload");
@@ -276,6 +272,7 @@ impl<T: RemoteSshProvider> CommandProvider for T {
         let context = T::context(config)?;
         let mut instance = T::resolve_instance(&context, &args.instance)?;
         if instance.is_stopped() {
+            crate::automation::require_running(instance.display_name())?;
             if !prompt_confirm("Instance is stopped. Start it before opening shell?", true)? {
                 bail!("Aborted: instance is stopped.");
             }
@@ -284,14 +281,10 @@ impl<T: RemoteSshProvider> CommandProvider for T {
                 &context,
                 &instance,
                 true,
-                Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
+                crate::automation::startup_timeout(),
             )?;
         }
-        T::wait_for_ssh_ready(
-            config,
-            &instance,
-            Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-        )?;
+        T::wait_for_ssh_ready(config, &instance, crate::automation::startup_timeout())?;
         if args.print_creds {
             let command = T::shell_connect_command(config, &instance)?;
             if crate::output::is_json() {

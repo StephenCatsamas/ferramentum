@@ -58,6 +58,11 @@ pub(crate) struct DefaultConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct VastDefaults {
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    pub(crate) disk_gb: Option<u32>,
+    pub(crate) min_download_mbps: Option<f64>,
+    pub(crate) min_upload_mbps: Option<f64>,
     pub(crate) min_cpus: Option<u32>,
     pub(crate) min_ram_gb: Option<f64>,
     pub(crate) allowed_gpus: Option<Vec<String>>,
@@ -67,6 +72,11 @@ pub(crate) struct VastDefaults {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GcpDefaults {
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    pub(crate) disk_gb: Option<u32>,
+    pub(crate) min_download_mbps: Option<f64>,
+    pub(crate) min_upload_mbps: Option<f64>,
     pub(crate) min_cpus: Option<u32>,
     pub(crate) min_ram_gb: Option<f64>,
     pub(crate) allowed_gpus: Option<Vec<String>>,
@@ -81,6 +91,11 @@ pub(crate) struct GcpDefaults {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AwsDefaults {
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    pub(crate) disk_gb: Option<u32>,
+    pub(crate) min_download_mbps: Option<f64>,
+    pub(crate) min_upload_mbps: Option<f64>,
     pub(crate) min_cpus: Option<u32>,
     pub(crate) min_ram_gb: Option<f64>,
     pub(crate) allowed_gpus: Option<Vec<String>>,
@@ -135,8 +150,13 @@ pub(crate) struct AwsAuth {
     pub(crate) secret_access_key: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct CreateSearchRequirements {
+    pub(crate) gpu_count: Option<u32>,
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    pub(crate) disk_gb: Option<u32>,
+    pub(crate) min_download_mbps: Option<f64>,
+    pub(crate) min_upload_mbps: Option<f64>,
     pub(crate) min_cpus: u32,
     pub(crate) min_ram_gb: f64,
     pub(crate) allowed_gpus: Vec<String>,

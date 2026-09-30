@@ -12,6 +12,9 @@ use crate::model::{Cloud, DeployTargetRequest};
     after_help = "Examples:\n  ice create test-crate\n  ice create --arca test-crate --hours 0.25\n  ice create --unpack arca:test-crate --cloud vast.ai\n  ice create --container us-central1-docker.pkg.dev/my-project/arca/my-image:tag --cloud vast.ai\n  ice create --ssh --cloud gcp --machine g2-standard-4"
 )]
 pub(crate) struct Cli {
+    /// Never prompt or open a browser, including when stdin is a terminal.
+    #[arg(long, global = true)]
+    pub(crate) non_interactive: bool,
     /// Write versioned JSON results (JSON Lines for logs). Shell requires --print-creds.
     #[arg(long, global = true)]
     pub(crate) json: bool,
@@ -102,6 +105,9 @@ pub(crate) struct LogsArgs {
     pub(crate) filter: Option<String>,
     #[arg(long)]
     pub(crate) daemon: bool,
+    /// Vast only: fetch provider container logs, including for unpack workloads.
+    #[arg(long)]
+    pub(crate) provider_logs: bool,
     #[arg(long)]
     pub(crate) follow: bool,
 }
@@ -157,8 +163,13 @@ pub(crate) struct ConfigUnsetArgs {
 pub(crate) struct ShellArgs {
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
+    /// Print a connection command after readiness checks and any instance-key recovery.
     #[arg(long)]
     pub(crate) print_creds: bool,
+    /// Vast only: print reported endpoints without readiness checks, SSH probes, or key changes.
+    #[arg(long, requires = "print_creds", conflicts_with = "preserve_ephemeral")]
+    pub(crate) no_probe: bool,
+    /// Deprecated for Vast: recovery no longer creates temporary account keys.
     #[arg(long)]
     pub(crate) preserve_ephemeral: bool,
     pub(crate) instance: String,
@@ -191,6 +202,30 @@ pub(crate) struct InstanceArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct CreateArgs {
+    /// Accept creation within the supplied filters and price ceiling.
+    #[arg(long)]
+    pub(crate) yes: bool,
+    /// Ignore saved search filters and disk preferences for this invocation.
+    #[arg(long)]
+    pub(crate) no_defaults: bool,
+    /// Exact GPU count (positive counts: Vast only). Zero requires CPU-only.
+    #[arg(long, value_name = "COUNT")]
+    pub(crate) gpu_count: Option<u32>,
+    /// Minimum memory per GPU in GB (Vast only).
+    #[arg(long, value_name = "GB", alias = "min-vram-gb")]
+    pub(crate) min_gpu_memory_gb: Option<f64>,
+    /// Disk allocation in provider GB units (shown in the quote).
+    #[arg(long, value_name = "GB")]
+    pub(crate) disk_gb: Option<u32>,
+    /// Minimum reported host internet download speed, in Mbps (Vast only).
+    #[arg(long, value_name = "MBPS")]
+    pub(crate) min_download_mbps: Option<f64>,
+    /// Minimum reported host internet upload speed, in Mbps (Vast only).
+    #[arg(long, value_name = "MBPS")]
+    pub(crate) min_upload_mbps: Option<f64>,
+    /// Maximum readiness wait, e.g. 900s or 30m. Does not extend auto-stop.
+    #[arg(long, default_value = "15m", value_parser = parse_duration)]
+    pub(crate) startup_timeout: u64,
     /// Target cloud. Defaults to `default.cloud`.
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
@@ -203,7 +238,7 @@ pub(crate) struct CreateArgs {
     /// Override the allowed GPU filter. Repeat or separate with commas.
     #[arg(long = "gpu", value_name = "GPU", action = ArgAction::Append, value_delimiter = ',')]
     pub(crate) gpus: Vec<String>,
-    /// Clear any default GPU filter.
+    /// Clear the saved GPU model filter. Use --gpu-count 0 to require CPU-only.
     #[arg(long, conflicts_with = "gpus")]
     pub(crate) no_gpu: bool,
     /// Override the maximum hourly price filter in USD/hr.
@@ -238,6 +273,22 @@ pub(crate) struct CreateArgs {
         help = "Defaults to a local `arca` artifact selector."
     )]
     pub(crate) target: Option<String>,
+}
+
+fn parse_duration(value: &str) -> Result<u64, String> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix('m') {
+        (value, 60)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1)
+    } else {
+        (value, 1)
+    };
+    number
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(multiplier))
+        .filter(|n| *n > 0)
+        .ok_or_else(|| "Use a positive duration such as 900s or 30m".to_owned())
 }
 
 impl Commands {

@@ -67,6 +67,8 @@ fn test_vast_instance(end_date: Option<f64>) -> VastInstance {
         end_date,
         ssh_host: None,
         ssh_port: None,
+        public_ipaddr: None,
+        ports: serde_json::Value::Null,
         workload: None,
     }
 }
@@ -293,6 +295,7 @@ fn gcp_create_summary_includes_project_before_region_and_zone() {
         min_ram_gb: 1.0,
         allowed_gpus: Vec::new(),
         max_price_per_hr: 1.0,
+        ..Default::default()
     };
 
     let lines = crate::app::machine_candidate_summary_display_lines(
@@ -339,6 +342,7 @@ fn gcp_catalog_selection_prefers_cpu_only_when_gpu_filter_is_empty() {
         min_ram_gb: 1.0,
         allowed_gpus: Vec::new(),
         max_price_per_hr: 1.0,
+        ..Default::default()
     };
     let catalog = vec![
         GcpMachineCatalogEntry {
@@ -385,6 +389,7 @@ fn gcp_catalog_selection_honors_gpu_filter() {
         min_ram_gb: 1.0,
         allowed_gpus: vec!["L4".to_owned()],
         max_price_per_hr: 1.0,
+        ..Default::default()
     };
     let catalog = vec![
         GcpMachineCatalogEntry {
@@ -431,6 +436,7 @@ fn gcp_catalog_selection_treats_614mb_as_point_six_gb() {
         min_ram_gb: 0.6,
         allowed_gpus: Vec::new(),
         max_price_per_hr: 1.0,
+        ..Default::default()
     };
     let catalog = vec![
         GcpMachineCatalogEntry {
