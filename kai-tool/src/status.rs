@@ -1,12 +1,27 @@
-//! Read-only local observation. A running process and a completed turn are separate facts.
+//! Local observation and explicit window switching. Process and turn states are separate facts.
+//! Internal feature status: beta; native validation varies by desktop backend.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod command;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod focus;
 #[cfg(target_os = "linux")]
+mod focus_linux;
+#[cfg(target_os = "macos")]
+mod focus_macos;
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+mod macos_data;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod names;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod process;
 #[cfg(target_os = "linux")]
+mod process_linux;
+#[cfg(target_os = "macos")]
+mod process_macos;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod transcript;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod ui;
 
 use anyhow::{Result, bail};
@@ -26,9 +41,9 @@ pub(crate) struct StatusArgs {
 }
 
 pub(crate) fn run(args: StatusArgs) -> Result<()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let result = linux::run(args);
+        let result = observer::run(args);
         if result.as_ref().err().is_some_and(|error| {
             error
                 .downcast_ref::<std::io::Error>()
@@ -43,15 +58,15 @@ pub(crate) fn run(args: StatusArgs) -> Result<()> {
         }
         result
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = args;
-        bail!("kai status currently requires Linux /proc process inspection")
+        bail!("kai status currently supports Linux and macOS process inspection")
     }
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod observer {
     use super::names::Names;
     use super::process::{ProcessIdentity, Window, discover, same_process};
     use super::transcript::{Transcript, TurnState};
@@ -61,7 +76,7 @@ mod linux {
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
         io::{self, IsTerminal, Write},
-        path::{Path, PathBuf},
+        path::PathBuf,
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
     use unicode_width::UnicodeWidthChar;
@@ -101,10 +116,8 @@ mod linux {
 
     impl Observer {
         pub(super) fn snapshot(&mut self, now: u64) -> Result<Snapshot> {
-            let (windows, warnings) = discover(Path::new("/proc"), std::process::id())?;
-            Ok(self.observe(windows, warnings, now, |identity| {
-                same_process(Path::new("/proc"), identity)
-            }))
+            let (windows, warnings) = discover(std::process::id())?;
+            Ok(self.observe(windows, warnings, now, same_process))
         }
 
         fn observe(

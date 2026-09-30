@@ -1,6 +1,6 @@
 //! Session-picker conventions used by `kai r`: compact chrome, blue selection,
 //! type-to-search, arrow navigation, Ctrl-O density, and a ruled shortcut footer.
-use super::linux::{Observer, Row, Snapshot, age, now, safe_text};
+use super::observer::{Observer, Row, Snapshot, age, now, safe_text};
 use super::process::ProcessIdentity;
 use super::transcript::TurnState;
 use anyhow::Result;
@@ -51,7 +51,9 @@ pub(super) fn watch(interval: Duration) -> Result<()> {
         if event::poll(next_refresh.saturating_duration_since(Instant::now()))? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if view.key(key, &snapshot) {
+                    if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                        view.focus_selected(&snapshot, super::focus::focus);
+                    } else if view.key(key, &snapshot) {
                         break;
                     }
                     dirty = true;
@@ -193,6 +195,7 @@ struct View {
     list: ListState,
     page_size: usize,
     palette: Palette,
+    notice: Option<String>,
 }
 
 impl View {
@@ -207,6 +210,7 @@ impl View {
             list: ListState::default(),
             page_size: 1,
             palette,
+            notice: None,
         }
     }
 
@@ -254,6 +258,7 @@ impl View {
     }
 
     fn add_query(&mut self, text: &str) {
+        self.notice = None;
         let clean = safe_text(text, 1024);
         self.query.extend(
             clean
@@ -263,11 +268,13 @@ impl View {
     }
 
     fn key(&mut self, key: KeyEvent, snapshot: &Snapshot) -> bool {
+        let had_notice = self.notice.take().is_some();
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let index = self.list.selected().unwrap_or_default();
         let last = self.visible.len().saturating_sub(1);
         match key.code {
             KeyCode::Char('c') if control => return true,
+            KeyCode::Esc if had_notice => (),
             KeyCode::Esc if self.query.is_empty() => return true,
             KeyCode::Esc => self.query.clear(),
             KeyCode::Char('o') if control => self.dense = !self.dense,
@@ -296,16 +303,55 @@ impl View {
         false
     }
 
+    fn focus_selected(
+        &mut self,
+        snapshot: &Snapshot,
+        focus: impl FnOnce(ProcessIdentity) -> Result<()>,
+    ) {
+        self.notice = None;
+        let Some(row) = snapshot
+            .windows
+            .iter()
+            .find(|row| Some(row.identity) == self.selected)
+        else {
+            return;
+        };
+        self.notice = if row.exited_at.is_some() {
+            Some("This session has exited; its window is no longer available.".into())
+        } else {
+            focus(row.identity)
+                .err()
+                .map(|error| safe_text(&error.to_string(), 512))
+        };
+    }
+
     fn draw(&mut self, frame: &mut Frame, snapshot: &Snapshot, interval: Duration) {
         let area = frame.area();
         // Match the resume picker's collapsing vertical gaps and one-column chrome inset.
         let gap = u16::from(area.height >= 18);
-        let [header, _, toolbar, _, search, columns, list, footer] = Layout::vertical([
+        let notice_lines = wrap_notice(
+            self.notice.as_deref().unwrap_or_default(),
+            area.width.saturating_sub(2).into(),
+        );
+        let notice_height = notice_lines.len().min(area.height.saturating_sub(4).into()) as u16;
+        let notice = Paragraph::new(notice_lines.into_iter().map(Line::from).collect::<Vec<_>>());
+        let [
+            header,
+            _,
+            toolbar,
+            _,
+            search,
+            message,
+            columns,
+            list,
+            footer,
+        ] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(gap),
             Constraint::Length(1),
             Constraint::Length(gap),
             Constraint::Length(1),
+            Constraint::Length(notice_height),
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(3),
@@ -328,6 +374,7 @@ impl View {
                 .count()
         );
         frame.render_widget(Line::from(header_text).bold(), inset(header));
+        frame.render_widget(notice, inset(message));
         let mut tabs = vec![Span::styled("Filter: ", self.palette.secondary)];
         for filter in Filter::ALL {
             let style = if self.filter == filter {
@@ -421,7 +468,9 @@ impl View {
                     Rect::new(rule.right() - width - 1, rule.y, width, 1),
                 );
             }
-            let quit = if self.query.is_empty() {
+            let quit = if self.notice.is_some() {
+                "dismiss"
+            } else if self.query.is_empty() {
                 "quit"
             } else {
                 "clear search"
@@ -430,7 +479,7 @@ impl View {
             let rows = if compact {
                 vec![
                     hints(
-                        &[("esc", quit), ("↑/↓", "browse"), ("ctrl+c", "quit")],
+                        &[("enter", "focus"), ("esc", quit), ("↑/↓", "browse")],
                         self.palette.secondary,
                         inset(footer).width,
                     ),
@@ -444,9 +493,10 @@ impl View {
                 vec![
                     hints(
                         &[
+                            ("enter", "focus"),
                             ("↑/↓", "browse"),
-                            ("←/→", "filter"),
                             ("esc", quit),
+                            ("←/→", "filter"),
                             ("ctrl+c", "quit"),
                         ],
                         self.palette.secondary,
@@ -566,6 +616,24 @@ impl View {
         }
         ListItem::new(lines)
     }
+}
+
+fn wrap_notice(message: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in message.split_whitespace() {
+        if !line.is_empty() && line.width() + 1 + word.width() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 fn short_state(state: TurnState) -> &'static str {

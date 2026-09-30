@@ -112,6 +112,7 @@ fn layouts_show_name_runtime_and_navigation_without_disclaimer_text() {
         assert!(text.contains("Prepare release"), "{text}");
         assert!(text.contains("1m 05s"), "{text}");
         assert!(text.contains("esc quit"), "{text}");
+        assert!(text.contains("enter focus"), "{text}");
         assert!(text.contains("ctrl+o comfortable"), "{text}");
         assert!(!text.contains("recorded") && !text.contains("lag"));
         let buffer = terminal.backend().buffer();
@@ -126,6 +127,38 @@ fn layouts_show_name_runtime_and_navigation_without_disclaimer_text() {
         assert!(contents(&terminal).contains("Task 19"));
         assert!(contents(&terminal).contains("20 / 20"));
     }
+}
+
+#[test]
+fn focus_uses_the_filtered_selection_and_reports_errors_only_on_request() {
+    let mut snapshot = snapshot();
+    let mut view = view();
+    view.add_query("Task 19");
+    view.reconcile(&snapshot);
+    let expected = view.selected.unwrap();
+    let message = "Window switching is not supported here. Press Ctrl+E for terminal details.";
+    view.focus_selected(&snapshot, |identity| {
+        assert_eq!(identity, expected);
+        anyhow::bail!(message)
+    });
+    let text = contents(&render(&mut view, &snapshot, 38, 16));
+    assert!(text.contains("Window switching"));
+    assert!(text.contains("Ctrl+E"));
+    assert!(text.contains("esc dismiss"));
+    assert!(!text.contains("beta"));
+    assert!(!view.key(key(KeyCode::Esc), &snapshot));
+    assert!(view.notice.is_none());
+    assert_eq!(view.query, "Task 19");
+    view.focus_selected(&snapshot, |_| Ok(()));
+    assert!(view.notice.is_none());
+    assert_eq!(view.selected, Some(expected));
+    snapshot.windows.last_mut().unwrap().exited_at = Some(999);
+    view.focus_selected(&snapshot, |_| panic!("cannot focus exited window"));
+    assert!(view.notice.as_deref().unwrap().contains("exited"));
+    view.add_query("no match");
+    view.reconcile(&snapshot);
+    view.focus_selected(&snapshot, |_| panic!("no selection"));
+    assert!(view.notice.is_none());
 }
 
 #[test]

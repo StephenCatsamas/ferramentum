@@ -8,7 +8,7 @@ Kai launches Codex and resumes conversations with configurable credential rotati
 kai                         Launch Codex
 kai resume                  Open the all-sessions picker
 kai resume ID               Resume a specific conversation
-kai status                  List local Kai windows and their latest turn state (Linux)
+kai status                  List local Kai windows and their latest turn state (Linux/macOS)
 kai status --watch          Refresh the window dashboard every two seconds
 kai llm-get PATH...          Assemble a source listing
 ```
@@ -39,9 +39,34 @@ Names come from Codex's `session_index.jsonl`, including subsequent renames.
 Use ↑/↓, Page Up/Down, or Home/End to browse; ←/→ switches All/Working/Finished. Type to filter
 by name, state, terminal, directory, PID, or conversation ID. Ctrl-O toggles dense/comfortable
 rows, and Ctrl-E expands the selected row's terminal, directory, PID, completion time, and full
-conversation ID. Esc clears a search, then quits; Ctrl-C quits immediately. Plain letters,
+conversation ID. Enter focuses the selected session's existing terminal window. The dashboard
+stays open. Esc dismisses a message, clears a search, then quits; Ctrl-C quits immediately. Plain letters,
 including `q`, belong to search, matching the resume picker. Selection follows the same window
 across live refreshes. `--interval SECONDS` sets the refresh rate (1–3600 seconds).
+
+Development status: **beta**. This designation is kept in documentation and source, not in the
+dashboard. Switching failures appear only after pressing Enter, with a suggested next step;
+Ctrl-E exposes terminal details for manual switching. Exited rows cannot be activated.
+
+| Desktop | Focus backend | Requirements and limits |
+| --- | --- | --- |
+| Sway | Exact container ID through `swaymsg` | Separate terminal process per window; tested with Foot in an isolated headless compositor. |
+| Hyprland | Exact window address through `hyprctl` | Lua and classic dispatch forms; parsers fixture-tested, native testing pending. |
+| X11, including GNOME X11 and i3 | EWMH activation through `wmctrl`, confirmed with `xprop` | The window manager must honor activation requests; parser fixture-tested, native testing pending. |
+| GNOME Wayland | [Kai Window Focus companion extension](integrations/gnome/README.md) over D-Bus | Requires the extension and `gdbus`; activation logic fixture-tested, native desktop testing pending. |
+| macOS Terminal / iTerm2 | AppleScript selects the exact tty's tab/pane and raises its window | Uses `lsof` for discovery; may require macOS Automation permission. Cross-compiled checks and parser fixtures pass; native testing pending. |
+| Windows | Not available | Kai's existing `capulus` dependency fails Windows compilation on Unix APIs; this change does not port that library. |
+
+Linux activation currently supports Foot, Alacritty, xterm, st, and urxvt. Shared-server windows,
+GNOME Terminal/Console, Kitty, WezTerm, Konsole, and multiplexers such as tmux/screen/Zellij need
+terminal-specific tab/pane integrations. Kai refuses ambiguous targets instead of guessing.
+It validates process birth times before activation and passes numeric window IDs to helpers;
+thread names and window titles are never interpreted as commands or matching expressions.
+Other desktops can still show the Linux dashboard and receive an actionable message on Enter.
+
+Native Sway verification is opt-in and uses its own headless compositor:
+`cargo test -p kai-tool --test status_focus_sway -- --ignored`.
+GNOME extension fixture tests: `node --test kai-tool/integrations/gnome/focus.test.js`.
 
 | State | Meaning |
 | --- | --- |
@@ -57,11 +82,12 @@ across live refreshes. `--interval SECONDS` sets the refresh rate (1–3600 seco
 the overall task was accomplished. Exited windows stay visible for ten minutes while the watcher
 runs. Windows closed before observation are not included, and history is not saved between runs.
 
-This first implementation requires Linux `/proc`. It reads same-user Kai/Codex process metadata
-and the session logs held open by a direct Codex child. It does not require a Codex binary on PATH,
+Discovery uses Linux `/proc` or macOS `libproc` plus `lsof`. It reads same-user Kai/Codex process
+metadata and the session logs held open by a direct Codex child. It does not require a Codex binary on PATH,
 call a credential provider, start a daemon, or make model/API requests. It works with the custom
-Codex build's embedded server; detached servers, remote machines, and processes hidden by `/proc`
-permissions may be unavailable. Subagent logs are excluded. Multiple open main conversations in
+Codex build's embedded server; detached servers, remote machines, and processes hidden by OS
+permissions may be unavailable. macOS file discovery is batched once per refresh, with bounded
+output and a three-second timeout. Subagent logs are excluded. Multiple open main conversations in
 one process are reported as Unknown because the log does not identify the visible conversation.
 
 State follows persisted Codex `task_started`/`task_complete`/`turn_aborted` events (also accepting
