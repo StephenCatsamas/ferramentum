@@ -2,6 +2,8 @@
 //! Internal feature status: beta; native validation varies by desktop backend.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod agents;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod command;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod focus;
@@ -97,6 +99,7 @@ mod observer {
         pub(super) thread_name: Option<String>,
         pub(super) run_time_ms: Option<u64>,
         pub(super) state: TurnState,
+        pub(super) agents: Option<super::agents::Summary>,
         pub(super) last_finished_at: Option<i64>,
         // Retained as null for JSON v1 compatibility; exited processes are removed.
         pub(super) exited_at: Option<u64>,
@@ -159,15 +162,25 @@ mod observer {
                 cancel.check()?;
                 live.insert(window.identity);
                 let mut roots = Vec::new();
+                let mut children = Vec::new();
                 let mut errors = Vec::new();
                 for path in &window.transcripts {
                     cancel.check()?;
                     paths.insert(path.clone());
                     let transcript = self.transcripts.entry(path.clone()).or_default();
-                    match transcript.refresh(path) {
-                        Ok(()) if transcript.is_main() => roots.push(transcript.view()),
-                        Ok(()) => (),
-                        Err(_) => errors.push("Could not read a session log"),
+                    let result = transcript.refresh(path);
+                    if transcript.is_subagent() {
+                        let mut child = transcript.view();
+                        if result.is_err() {
+                            child.state = TurnState::Unknown;
+                        }
+                        children.push(child);
+                    } else {
+                        match result {
+                            Ok(()) if transcript.is_main() => roots.push(transcript.view()),
+                            Ok(()) => (),
+                            Err(_) => errors.push("Could not read a session log"),
+                        }
                     }
                 }
                 // A process can retain multiple root threads after switching conversations.
@@ -181,6 +194,7 @@ mod observer {
                     thread_name: None,
                     run_time_ms: None,
                     state: TurnState::Unknown,
+                    agents: None,
                     last_finished_at: None,
                     exited_at: None,
                     detail: None,
@@ -201,6 +215,7 @@ mod observer {
                         row.state = root.state;
                         row.last_finished_at = root.last_finished_at;
                         row.detail.clone_from(&root.detail);
+                        row.agents = Some(super::agents::summarize(&root.id, children, true));
                     }
                     [] => row.detail = Some(
                         "No readable main session log (starting, recovering, or unsupported build)"
@@ -222,6 +237,7 @@ mod observer {
                 if let Some(warning) = window.warning {
                     row.state = TurnState::Unknown;
                     row.run_time_ms = None;
+                    row.agents = None;
                     row.detail = Some(warning);
                 }
                 self.windows.insert(window.identity, row);
@@ -233,6 +249,7 @@ mod observer {
                     }
                     row.state = TurnState::Unknown;
                     row.run_time_ms = None;
+                    row.agents = None;
                     row.detail = Some("Window could not be inspected during this refresh".into());
                 }
                 true
@@ -325,8 +342,8 @@ mod observer {
         });
         let mut lines = vec![format!("Kai windows: {} open", snapshot.windows.len(),)];
         lines.push(format!(
-            "{:<11} {:<8} {:<9} {:<10} {:<14} {}",
-            "STATE", "PID", "TTY", "TURN TIME", "LAST ENDED", "THREAD / DIRECTORY"
+            "{:<11} {:<8} {:<9} {:<10} {:<10} {:<14} {}",
+            "STATE", "PID", "TTY", "TURN TIME", "AGENTS", "LAST ENDED", "THREAD / DIRECTORY"
         ));
         if snapshot.windows.is_empty() {
             lines.push("No Kai windows found for this user.".into());
@@ -336,11 +353,14 @@ mod observer {
                 .last_finished_at
                 .map_or_else(|| "—".into(), |at| age(snapshot.observed_at, at));
             lines.push(format!(
-                "{:<11} {:<8} {:<9} {:<10} {:<14} {}  {}",
+                "{:<11} {:<8} {:<9} {:<10} {:<10} {:<14} {}  {}",
                 row.state.label(),
                 row.pid,
                 row.tty.as_deref().unwrap_or("—"),
                 super::ui::run_time(row.run_time_ms),
+                row.agents
+                    .as_ref()
+                    .map_or_else(|| "?".into(), super::agents::Summary::label),
                 finished,
                 row.thread_name.as_deref().unwrap_or("Unnamed thread"),
                 row.cwd.as_deref().unwrap_or("?"),
@@ -414,6 +434,69 @@ mod observer {
             assert_eq!(reused.windows[0].identity.start_ticks, 2);
             let closed = observer.observe(vec![], vec![], 103, |_| Ok(false));
             assert!(closed.windows.is_empty());
+        }
+
+        #[test]
+        fn agent_updates_do_not_overwrite_the_parent_and_closed_logs_are_removed() {
+            use serde_json::json;
+            use std::fs;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root.jsonl");
+            let child = dir.path().join("child.jsonl");
+            let nested = dir.path().join("nested.jsonl");
+            let write = |path: &PathBuf, id: &str, source, event| {
+                fs::write(
+                    path,
+                    format!(
+                        "{}\n{}\n",
+                        json!({"type":"session_meta", "payload":{"id":id, "source":source}}),
+                        json!({"type":"event_msg", "payload":{"type":event, "turn_id":id}})
+                    ),
+                )
+                .unwrap();
+            };
+            write(&root, "root", json!("cli"), "task_complete");
+            write(
+                &child,
+                "child",
+                json!({"subagent":{"thread_spawn":{"parent_thread_id":"root"}}}),
+                "task_started",
+            );
+            write(
+                &nested,
+                "nested",
+                json!({"subagent":{"thread_spawn":{"parent_thread_id":"child"}}}),
+                "task_started",
+            );
+            let mut observer = Observer::default();
+            let mut live = window(1);
+            live.transcripts = vec![root.clone(), child.clone(), nested.clone()];
+            let first = observer.observe(vec![live.clone()], vec![], 100, |_| Ok(true));
+            assert_eq!(first.windows[0].state, TurnState::Ready);
+            assert_eq!(first.windows[0].agents.as_ref().unwrap().running, 2);
+            // A known child's unreadable log affects its count, not the parent's state.
+            fs::remove_file(&nested).unwrap();
+            let failed = observer.observe(vec![live.clone()], vec![], 101, |_| Ok(true));
+            assert_eq!(failed.windows[0].state, TurnState::Ready);
+            assert_eq!(failed.windows[0].agents.as_ref().unwrap().running, 1);
+            assert_eq!(failed.windows[0].agents.as_ref().unwrap().unknown, 1);
+            live.transcripts = vec![root, child.clone()];
+            let mut file = fs::OpenOptions::new().append(true).open(&child).unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"event_msg", "payload":{"type":"task_complete", "turn_id":"child"}})
+            )
+            .unwrap();
+            let finished = observer.observe(vec![live.clone()], vec![], 102, |_| Ok(true));
+            let agents = finished.windows[0].agents.as_ref().unwrap();
+            assert_eq!(
+                (agents.total, agents.running, agents.ready, agents.unknown),
+                (1, 0, 1, 0)
+            );
+            live.warning = Some("Cannot inspect Codex's open session logs".into());
+            let partial = observer.observe(vec![live], vec![], 103, |_| Ok(true));
+            assert!(partial.windows[0].agents.is_none());
         }
 
         #[test]

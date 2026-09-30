@@ -171,7 +171,10 @@ impl Filter {
     fn includes(self, row: &Row, observed_at: u64) -> bool {
         match self {
             Self::All => true,
-            Self::Active => matches!(row.state, TurnState::Working | TurnState::NeedsInput),
+            Self::Active => {
+                matches!(row.state, TurnState::Working | TurnState::NeedsInput)
+                    || row.agents.as_ref().is_some_and(|agents| agents.running > 0)
+            }
             // Only recorded turn endings qualify, including errors/interruptions.
             // Only open windows are present; a new turn may already be active.
             Self::Recent => row
@@ -521,6 +524,11 @@ impl View {
         );
         let compact = area.width < 62;
         let cols = Columns::new(area.width);
+        let agents = if cols.agents > 0 {
+            format!("{:width$}", "Agents", width = cols.agents)
+        } else {
+            String::new()
+        };
         let last_finished = if cols.finished > 0 {
             format!("{:width$}", "Last ended", width = cols.finished)
         } else {
@@ -528,7 +536,7 @@ impl View {
         };
         frame.render_widget(
             Line::from(format!(
-                "  {:state_width$}{:time_width$}{last_finished}Thread",
+                "  {:state_width$}{:time_width$}{agents}{last_finished}Thread",
                 "State",
                 "Turn time",
                 state_width = cols.state,
@@ -673,7 +681,8 @@ impl View {
         } else {
             row.state.label()
         };
-        let title_width = usize::from(width).saturating_sub(cols.state + cols.time + cols.finished);
+        let title_width =
+            usize::from(width).saturating_sub(cols.state + cols.time + cols.agents + cols.finished);
         let mut summary = vec![
             Span::styled(format!("{state:width$}", width = cols.state), state_style),
             Span::styled(
@@ -685,6 +694,20 @@ impl View {
                 normal,
             ),
         ];
+        if cols.agents > 0 {
+            let agents = row
+                .agents
+                .as_ref()
+                .map_or_else(|| "?".into(), super::agents::Summary::label);
+            summary.push(Span::styled(
+                format!(
+                    "{:width$}",
+                    clip(&agents, cols.agents - 1),
+                    width = cols.agents
+                ),
+                normal,
+            ));
+        }
         if cols.finished > 0 {
             let finished = row
                 .last_finished_at
@@ -766,6 +789,13 @@ impl View {
                 "Thread {}",
                 row.thread_id.as_deref().unwrap_or("—")
             ));
+            messages.push(format!(
+                "Agents: {}",
+                row.agents.as_ref().map_or_else(
+                    || "Unknown; session discovery is incomplete".into(),
+                    super::agents::Summary::description
+                )
+            ));
         }
         messages
             .into_iter()
@@ -819,6 +849,7 @@ fn short_state(state: TurnState) -> &'static str {
 struct Columns {
     state: usize,
     time: usize,
+    agents: usize,
     finished: usize,
 }
 impl Columns {
@@ -826,7 +857,8 @@ impl Columns {
         Self {
             state: if width < 62 { 6 } else { 12 },
             time: if width < 62 { 10 } else { 11 },
-            finished: if width >= 88 { 14 } else { 0 },
+            agents: if width >= 50 { 10 } else { 0 },
+            finished: if width >= 100 { 14 } else { 0 },
         }
     }
 }

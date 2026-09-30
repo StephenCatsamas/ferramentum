@@ -219,3 +219,87 @@ fn run_time_uses_turn_timestamps_and_freezes_after_completion() {
     append(&mut file, "invalid\n", &mut transcript);
     assert_eq!(transcript.view().run_time_ms(999), None);
 }
+
+#[test]
+fn large_compaction_and_tool_payloads_preserve_state_and_lifecycle_records_still_apply() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_started", "one"), &mut transcript);
+    let started = transcript.view.started_at;
+    let large = "x".repeat(MAX_LINE_BYTES as usize + 200);
+    for record in [
+        json!({"type":"compacted", "payload":{"message":large}}),
+        json!({"type":"response_item", "payload":{"type":"function_call_output", "output":large}}),
+        json!({"type":"event_msg", "payload":{"type":"item_completed", "item":{"text":large}}}),
+    ] {
+        append(&mut file, &(record.to_string() + "\n"), &mut transcript);
+        assert_eq!(transcript.view.state, TurnState::Working);
+        assert_eq!(transcript.view.started_at, started);
+        assert!(transcript.view.detail.is_none());
+    }
+    // Payload precedes type; record classification must not depend on key order.
+    let ending = format!(
+        "{{\"payload\":{{\"output\":\"{large}\",\"turn_id\":\"one\",\"type\":\"task_complete\"}},\"type\":\"event_msg\"}}\n"
+    );
+    append(&mut file, &ending, &mut transcript);
+    assert_eq!(transcript.view.state, TurnState::Ready);
+    append(&mut file, &event("task_started", "two"), &mut transcript);
+    assert_eq!(transcript.view.state, TurnState::Working);
+}
+
+#[test]
+fn partial_large_records_are_retried_and_malformed_ones_cannot_preserve_a_false_state() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_started", "one"), &mut transcript);
+    let start = transcript.offset;
+    let prefix = format!(
+        "{{\"type\":\"compacted\",\"payload\":{{\"message\":\"{}",
+        "x".repeat(MAX_LINE_BYTES as usize + 20)
+    );
+    append(&mut file, &prefix, &mut transcript);
+    assert_eq!(transcript.offset, start);
+    assert_eq!(transcript.view.state, TurnState::Working);
+    append(&mut file, "\"}}\n", &mut transcript);
+    assert!(transcript.offset > start);
+    assert_eq!(transcript.view.state, TurnState::Working);
+    append(&mut file, &(prefix + "\"} invalid}\n"), &mut transcript);
+    assert_eq!(transcript.view.state, TurnState::Unknown);
+    append(&mut file, &event("task_complete", "one"), &mut transcript);
+    assert_eq!(transcript.view.state, TurnState::Ready);
+}
+
+#[test]
+fn subagents_read_their_own_turns_and_ignore_inherited_activity_and_input_calls() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    let meta = json!({"type":"session_meta","payload":{
+        "id":"child", "session_id":"root", "subagent_history_start_ordinal":3,
+        "source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}}
+    }})
+    .to_string()
+        + "\n";
+    append(&mut file, &meta, &mut transcript);
+    assert!(transcript.is_subagent());
+    assert!(!transcript.is_main());
+    assert_eq!(transcript.view.parent_id.as_deref(), Some("parent"));
+    assert_eq!(transcript.view.root_id.as_deref(), Some("root"));
+    append(
+        &mut file,
+        &(event("task_started", "inherited") + &event("task_complete", "inherited")),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view.state, TurnState::Unknown);
+    append(&mut file, &event("task_started", "own"), &mut transcript);
+    assert_eq!(transcript.view.state, TurnState::Working);
+    append(
+        &mut file,
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"request_user_input\",\"call_id\":\"denied\"}}\n",
+        &mut transcript,
+    );
+    assert_eq!(transcript.view.state, TurnState::Working);
+    append(&mut file, &event("turn_aborted", "own"), &mut transcript);
+    assert_eq!(transcript.view.state, TurnState::Interrupted);
+}

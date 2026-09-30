@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::{
     collections::HashSet,
     fs::OpenOptions,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
 };
@@ -41,6 +41,8 @@ impl TurnState {
 #[derive(Clone, Default)]
 pub(super) struct View {
     pub id: String,
+    pub parent_id: Option<String>,
+    pub root_id: Option<String>,
     pub cwd: Option<PathBuf>,
     pub state: TurnState,
     pub last_finished_at: Option<i64>,
@@ -67,6 +69,8 @@ pub(super) struct Transcript {
     identity: Option<(u64, u64)>,
     offset: u64,
     main: bool,
+    subagent: bool,
+    inherited_records: u64,
     view: View,
     turn: Option<String>,
     input_requests: HashSet<String>,
@@ -92,6 +96,12 @@ struct Payload {
     id: Option<String>,
     #[serde(default)]
     source: Option<Value>,
+    #[serde(default)]
+    parent_thread_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    subagent_history_start_ordinal: Option<u64>,
     #[serde(default)]
     cwd: Option<PathBuf>,
     #[serde(default)]
@@ -123,6 +133,9 @@ impl<'de> Deserialize<'de> for Present {
 impl Transcript {
     pub(super) fn is_main(&self) -> bool {
         self.main
+    }
+    pub(super) fn is_subagent(&self) -> bool {
+        self.subagent
     }
     pub(super) fn view(&self) -> View {
         self.view.clone()
@@ -157,22 +170,62 @@ impl Transcript {
                 record.payload.source.as_ref().and_then(Value::as_str),
                 Some("cli" | "tui")
             );
+            let spawn = record
+                .payload
+                .source
+                .as_ref()
+                .and_then(|source| source.pointer("/subagent/thread_spawn"));
+            self.subagent = spawn.is_some_and(Value::is_object);
+            if self.subagent {
+                self.view.parent_id = record.payload.parent_thread_id.or_else(|| {
+                    spawn
+                        .and_then(|spawn| spawn.get("parent_thread_id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                });
+                self.view.root_id = record.payload.session_id;
+                // Ordinals include the metadata header itself. Copied parent
+                // events do not describe the child's own activity.
+                self.inherited_records = record
+                    .payload
+                    .subagent_history_start_ordinal
+                    .unwrap_or(1)
+                    .saturating_sub(1);
+            }
             self.view.id = record.payload.id.context("session metadata has no ID")?;
             self.view.cwd = record.payload.cwd;
             self.offset = head.len() as u64;
             self.identity = Some(identity);
         }
-        if !self.main {
+        if !self.main && !self.subagent {
             return Ok(());
+        }
+        let mut budget = MAX_SCAN_BYTES;
+        if self.inherited_records > 0 {
+            file.seek(SeekFrom::Start(self.offset))?;
+            let mut reader = BufReader::new((&mut file).take(budget));
+            while self.inherited_records > 0 {
+                let (count, complete) = skip_line(&mut reader)?;
+                self.offset += count;
+                budget -= count;
+                if !complete {
+                    return Ok(());
+                }
+                self.inherited_records -= 1;
+            }
+            if budget == 0 {
+                return Ok(());
+            }
         }
         // Bound startup work for very long conversations and every subsequent refresh.
         // A missing lifecycle marker remains Unknown, never inferred from file activity.
-        if metadata.len().saturating_sub(self.offset) > MAX_SCAN_BYTES {
-            self.offset = metadata.len() - MAX_SCAN_BYTES;
+        if metadata.len().saturating_sub(self.offset) > budget {
+            self.offset = metadata.len() - budget;
             file.seek(SeekFrom::Start(self.offset))?;
             let (skipped, complete_line) =
-                skip_line(&mut BufReader::new((&mut file).take(MAX_SCAN_BYTES)))?;
+                skip_line(&mut BufReader::new((&mut file).take(budget)))?;
             self.offset += skipped;
+            budget -= skipped;
             self.skipped_line = !complete_line;
             self.turn = None;
             self.input_requests.clear();
@@ -184,8 +237,18 @@ impl Transcript {
                 Some("Older history omitted; showing available recent turn events".into());
         }
         file.seek(SeekFrom::Start(self.offset))?;
-        let mut reader = BufReader::new(file.take(MAX_SCAN_BYTES));
+        let scan_end = self.offset + budget;
+        let mut reader = BufReader::new(file.take(budget));
         loop {
+            if self.skipped_line {
+                let (count, complete) = skip_line(&mut reader)?;
+                self.offset += count;
+                self.skipped_line = !complete;
+                if !complete {
+                    break;
+                }
+                continue;
+            }
             let mut line = Vec::new();
             let count = (&mut reader)
                 .take(MAX_LINE_BYTES + 1)
@@ -193,38 +256,64 @@ impl Transcript {
             if count == 0 {
                 break;
             }
-            if self.skipped_line || line.len() as u64 > MAX_LINE_BYTES {
-                self.offset += count as u64;
-                self.skipped_line = !line.ends_with(b"\n");
-                self.view.state = TurnState::Unknown;
-                self.turn = None;
-                self.input_requests.clear();
-                self.view.started_at = None;
-                self.view.duration_ms = None;
-                self.view.detail = Some(
-                    "An oversized log record was skipped; waiting for a complete turn event".into(),
-                );
+            if line.len() as u64 > MAX_LINE_BYTES {
+                // Stream large records through serde's selective deserializer.
+                // Ignored strings (compaction history, tool output, etc.) are
+                // consumed without retaining their contents. Stop at this line.
+                let mut rest = LineReader {
+                    reader: &mut reader,
+                    complete: line.ends_with(b"\n"),
+                    bytes: 0,
+                };
+                let result = {
+                    let mut input = line.as_slice().chain(&mut rest);
+                    let result = serde_json::from_reader::<_, Record>(&mut input);
+                    io::copy(&mut input, &mut io::sink())?;
+                    result
+                };
+                let end = self.offset + count as u64 + rest.bytes;
+                if !rest.complete {
+                    if end >= scan_end {
+                        self.offset = end;
+                        self.skipped_line = true;
+                        self.unknown("A log record exceeded the refresh read limit; waiting for a complete turn event");
+                    } else if result.as_ref().is_err_and(|error| !error.is_eof()) {
+                        self.unknown(
+                            "A log record could not be read; waiting for a complete turn event",
+                        );
+                    }
+                    // An unfinished append within the budget is retried in full.
+                    break;
+                }
+                self.offset = end;
+                self.apply_result(result);
                 continue;
             }
             if !line.ends_with(b"\n") {
                 break;
             } // Retry an unfinished append on the next refresh.
             self.offset += count as u64;
-            match serde_json::from_slice::<Record>(&line) {
-                Ok(record) => self.apply(record),
-                Err(_) => {
-                    self.view.state = TurnState::Unknown;
-                    self.turn = None;
-                    self.input_requests.clear();
-                    self.view.started_at = None;
-                    self.view.duration_ms = None;
-                    self.view.detail = Some(
-                        "A log record could not be read; waiting for a complete turn event".into(),
-                    );
-                }
-            }
+            self.apply_result(serde_json::from_slice::<Record>(&line));
         }
         Ok(())
+    }
+
+    fn unknown(&mut self, detail: &str) {
+        self.view.state = TurnState::Unknown;
+        self.turn = None;
+        self.input_requests.clear();
+        self.view.started_at = None;
+        self.view.duration_ms = None;
+        self.view.detail = Some(detail.into());
+    }
+
+    fn apply_result(&mut self, result: serde_json::Result<Record>) {
+        match result {
+            Ok(record) => self.apply(record),
+            Err(_) => {
+                self.unknown("A log record could not be read; waiting for a complete turn event")
+            }
+        }
     }
 
     fn apply(&mut self, record: Record) {
@@ -278,7 +367,7 @@ impl Transcript {
                 }
             }
             ("response_item", "function_call")
-                if payload.name.as_deref().is_some_and(is_input_request) =>
+                if self.main && payload.name.as_deref().is_some_and(is_input_request) =>
             {
                 if let Some(id) = payload.call_id {
                     self.input_requests.insert(id);
@@ -300,6 +389,32 @@ impl Transcript {
             }
             _ => (),
         }
+    }
+}
+
+// Read exactly one JSONL record without allocating space for its large payload.
+struct LineReader<'a, R> {
+    reader: &'a mut R,
+    complete: bool,
+    bytes: u64,
+}
+
+impl<R: BufRead> Read for LineReader<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if self.complete || out.is_empty() {
+            return Ok(0);
+        }
+        let available = self.reader.fill_buf()?;
+        let available = &available[..available.len().min(out.len())];
+        let end = available.iter().position(|byte| *byte == b'\n');
+        let count = out
+            .len()
+            .min(end.map_or(available.len(), |index| index + 1));
+        out[..count].copy_from_slice(&available[..count]);
+        self.complete = end.is_some_and(|index| count == index + 1);
+        self.reader.consume(count);
+        self.bytes += count as u64;
+        Ok(count)
     }
 }
 

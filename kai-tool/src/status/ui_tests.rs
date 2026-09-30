@@ -25,6 +25,10 @@ fn snapshot() -> Snapshot {
                 last_finished_at: Some(900),
                 exited_at: None,
                 detail: None,
+                agents: Some(super::super::agents::Summary {
+                    complete: true,
+                    ..super::super::agents::Summary::default()
+                }),
                 state: if i == 0 {
                     TurnState::Working
                 } else {
@@ -255,4 +259,44 @@ fn expanded_details_expose_actual_errors_even_without_rows_and_can_scroll() {
             .iter()
             .all(|line| line.width() <= 5)
     );
+}
+
+#[test]
+fn agents_column_and_active_filter_include_work_after_the_parent_is_ready() {
+    let mut snapshot = snapshot();
+    snapshot.windows.truncate(2);
+    snapshot.windows[0].state = TurnState::Ready;
+    snapshot.windows[0].agents = Some(super::super::agents::Summary {
+        total: 4,
+        running: 2,
+        ready: 1,
+        unknown: 1,
+        complete: true,
+        ..super::super::agents::Summary::default()
+    });
+    let mut view = view();
+    view.filter = Filter::Active;
+    view.reconcile(&snapshot);
+    assert_eq!(view.visible, vec![0]);
+    for width in [50, 70, 120] {
+        let text = contents(&render(&mut view, &snapshot, width, 24));
+        assert!(
+            text.contains("Agents") && text.contains("2 run ?"),
+            "{text}"
+        );
+        assert!(text.contains("Ready"), "{text}");
+    }
+    view.expanded = true;
+    let text = contents(&render(&mut view, &snapshot, 38, 30));
+    assert!(text.contains("Agents: 2 running"), "{text}");
+    assert!(
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("1 unknown"),
+        "{text}"
+    );
+    snapshot.windows[0].agents.as_mut().unwrap().running = 0;
+    view.reconcile(&snapshot);
+    assert!(view.visible.is_empty());
 }

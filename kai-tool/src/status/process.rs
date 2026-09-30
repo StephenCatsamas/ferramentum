@@ -8,6 +8,7 @@ pub(super) struct ProcessIdentity {
     pub start_ticks: u64,
 }
 
+#[derive(Clone)]
 pub(super) struct Window {
     pub identity: ProcessIdentity,
     pub tty: Option<String>,

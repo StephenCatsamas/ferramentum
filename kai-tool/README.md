@@ -32,10 +32,21 @@ Install with `cargo install --path kai-tool --locked --force`.
 `kai status --watch` shows the current user's local Kai launcher processes, including windows
 opened before the dashboard started. Its Ratatui interface follows the `kai r` session picker:
 blue selection, a `›` marker, subdued metadata, type-to-search, and keyboard hints below the list.
-Rows show thread names and **Turn time**, with **Last ended** on wider terminals. Turn time
+Rows show thread names and **Turn time**, an **Agents** column from 50 columns wide,
+and **Last ended** on wider terminals. Turn time
 is elapsed time for the current turn, or the final duration of the most recent ended turn;
 it is not the age of the whole session.
 Names come from Codex's `session_index.jsonl`, including subsequent renames.
+
+Agents shows the number of subagents with an active recorded turn, including nested descendants
+(`3 run`). It follows currently open subagent logs, using root/parent thread IDs to associate
+them with the main conversation and excluding inherited parent history where marked. The main
+State and Turn time remain those of the parent; a Ready parent can still have running agents.
+The Active filter includes either kind of running work. Ctrl-E shows running, ready, interrupted,
+error, and unknown agent counts. A `?` marks unavailable or uncertain counts; it does not mean zero.
+Below 50 columns, agent counts remain available in Ctrl-E details. Subagent logs that close leave
+the counts on the next refresh. This does not keep historical agent totals or add an input flow:
+the current agent runtime restricts user-input requests to the root conversation.
 
 Use ↑/↓, Page Up/Down, or Home/End to browse; ←/→ switches All/Active/Recent 15m. Recent 15m
 shows open windows with a recorded turn ending in the last fifteen minutes, newest first, including
@@ -111,7 +122,7 @@ Codex build's embedded server; detached servers, remote machines, and processes 
 permissions may be unavailable. macOS file discovery is batched once per refresh, with bounded
 output and a three-second timeout. If `lsof` exits with status 1 while returning valid records,
 those records are retained and only sessions with missing process records become Unknown. A helper
-timeout or unusable output affects every session in that batch. Subagent logs are excluded. Multiple open main conversations in
+timeout or unusable output affects every session in that batch. Subagent activity is counted separately. Multiple open main conversations in
 one process are reported as Unknown because the log does not identify the visible conversation.
 
 State follows persisted Codex `task_started`/`task_complete`/`turn_aborted` events (also accepting
@@ -119,14 +130,17 @@ State follows persisted Codex `task_started`/`task_complete`/`turn_aborted` even
 approval prompt or infer progress from CPU use. Async questions do not imply the agent is blocked.
 Unknown is also used during startup/recovery or when logs are missing, unreadable, malformed, or
 from an unsupported format. Reads are incremental and bounded to the most recent 16 MiB on startup
-or when catching up, skipping individual records over 1 MiB. A skipped record makes state Unknown
+or when catching up. Records over the 1 MiB line-buffer threshold are parsed as a stream, retaining
+only observation metadata: large compaction records and tool output preserve the current state,
+and large lifecycle records still update it. Partial appends are retried. Malformed records,
+records exceeding the remaining refresh read budget, or missing lifecycle history make state Unknown
 until a later lifecycle event provides evidence. Prompt text, tool arguments, responses, and error
 messages are not included in output. LLM progress summaries are a separate feature.
 
 For scripts, `kai status --json` emits one snapshot; `kai status --watch --json` emits one JSON
 object per line, including when output is piped. Snapshot `version` is `1`, `observed_at` is Unix
 seconds, and `windows` contains `pid`, `tty`, `cwd`, `thread_id`, `thread_name`, `run_time_ms`,
-`state`, `last_finished_at`, `exited_at`, and `detail`. Unavailable values are null, timestamps
+`state`, `agents`, `last_finished_at`, `exited_at`, and `detail`. Unavailable values are null, timestamps
 are Unix seconds, run time is milliseconds, and state names
 are `working`, `ready`, `needs_input`, `interrupted`, `error`, or `unknown`. `warnings`
 reports incomplete process discovery. No terminal escape sequences are emitted in JSON mode.
@@ -134,6 +148,11 @@ The existing JSON names `working`, `run_time_ms`, and `last_finished_at` remain 
 they correspond to the UI's Active, Turn time, and Last ended. UI filters do not remove rows
 from JSON output. The legacy `exited_at` field remains present as null for version 1 compatibility;
 exited rows are no longer emitted.
+The additive `agents` object contains `total`, `running`, `ready`, `interrupted`, `error`,
+`unknown`, and `complete`. Counts cover attributable open subagent logs; `complete: false` means
+some could not be reliably associated with this root. Unknown states have a separate count, so
+`running: 0` does not assert that all work ended when `unknown` is nonzero or `complete` is false.
+`agents: null` means discovery could not establish the main session or its open logs.
 
 ## Credential provider
 
