@@ -26,5 +26,11 @@ Use a separate Foot, Alacritty, xterm, st, or urxvt process per window. GNOME Te
 and other terminals with internal tabs need a further terminal integration; this extension
 alone cannot identify their tabs. GNOME on X11 can use the `wmctrl`/`xprop` backend instead.
 
-Run fixture tests with `node --test focus.test.js`. Remove with
+Run fixture tests with `node --test focus.test.js`. To check asynchronous GJS/D-Bus
+replies and listener/timer cleanup on a private bus, install GJS and D-Bus and run
+`GIO_USE_VFS=local dbus-run-session -- gjs -m dbus-smoke.js`. This smoke test uses a simulated window
+and does not require GNOME Shell or an installed extension; native desktop testing
+remains separate.
+
+Remove the installed extension with
 `gnome-extensions uninstall kai-window-focus@ferramentum`.

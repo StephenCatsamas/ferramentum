@@ -109,6 +109,13 @@ supported list would not reliably select a tab. Additional terminal adapters rem
 Native Sway verification is opt-in and uses its own headless compositor:
 `cargo test -p kai-tool --test status_focus_sway -- --ignored`.
 GNOME extension fixture tests: `node --test kai-tool/integrations/gnome/focus.test.js`.
+The asynchronous D-Bus smoke test runs in a private bus without changing the desktop:
+`GIO_USE_VFS=local dbus-run-session -- gjs -m kai-tool/integrations/gnome/dbus-smoke.js`.
+It requires GJS and D-Bus; the Sway tests require Sway, swaymsg, and Foot.
+If a missing sibling dependency prevents Cargo from loading the workspace, use
+`bash scripts/check-cli.sh kai-tool test --test status_focus_sway -- --ignored`;
+see the root [development checks](../README.md#development-checks) for the normal
+Rust tests, formatting, and Clippy commands.
 
 | State | Meaning |
 | --- | --- |

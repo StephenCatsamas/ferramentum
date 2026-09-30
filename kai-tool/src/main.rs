@@ -39,7 +39,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Show local Kai windows and their latest turn state (Linux).
+    /// Show local Kai windows and their latest turn state (Linux and macOS).
     Status(status::StatusArgs),
     /// Resume a conversation, or open the all-sessions picker.
     Resume {
