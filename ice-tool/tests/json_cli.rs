@@ -128,6 +128,8 @@ esac
             .env("ICE_TEST_STATE", self.root.path().join("state"))
             .env("ICE_TEST_ACTIONS", self.root.path().join("actions"))
             .env_remove("VAST_API_KEY")
+            .env_remove("VERDA_CLIENT_ID")
+            .env_remove("VERDA_CLIENT_SECRET")
             .env_remove("AWS_ACCESS_KEY_ID")
             .env_remove("AWS_SECRET_ACCESS_KEY")
             .env_remove("AWS_SESSION_TOKEN");
@@ -163,7 +165,7 @@ esac
         self.script("docker", r#"#!/bin/sh
 case "$1" in
   version) exit 0 ;;
-  ps) printf 'test-id\n' ;;
+  ps) if [ ! -f "$ICE_TEST_STATE.deleted" ]; then printf 'test-id\n'; fi ;;
   inspect)
     state=running
     if [ -f "$ICE_TEST_STATE" ]; then state=$(/bin/cat "$ICE_TEST_STATE"); fi
@@ -171,6 +173,7 @@ case "$1" in
     ;;
   stop) printf stopped > "$ICE_TEST_STATE"; printf 'provider stop output\n' ;;
   start) printf running > "$ICE_TEST_STATE"; printf 'provider start output\n' ;;
+  rm) printf deleted > "$ICE_TEST_STATE.deleted" ;;
   logs) printf 'stdout 🦀\n'; printf 'stderr 終' >&2 ;;
   login) /bin/cat >/dev/null; printf 'registry login output\n' ;;
   *) printf 'provider operation output\n' ;;
@@ -241,6 +244,15 @@ fn agent_mode_rejects_prompts_even_with_terminal_stdin() {
             "--custom",
         ],
         vec!["--non-interactive", "--json", "login", "--cloud", "vast.ai"],
+        vec!["--non-interactive", "--json", "login", "--cloud", "verda"],
+        vec![
+            "--non-interactive",
+            "--json",
+            "login",
+            "--cloud",
+            "verda",
+            "--force",
+        ],
         vec![
             "--non-interactive",
             "--json",
@@ -316,6 +328,7 @@ fn creation_defaults_are_visible_overridable_and_never_persisted() {
     ]));
     let selection = &value["error"]["details"]["selection"];
     assert_eq!(selection["saved_filters_ignored"], true);
+    assert_eq!(selection["price_scope"], "compute_and_allocated_storage");
     assert!(selection["filters"]["min_cpus"]["value"].is_null());
     assert!(selection["filters"]["gpu_count"]["value"].is_null());
     assert_eq!(selection["filters"]["disk_gb"]["value"], 32);
@@ -658,7 +671,7 @@ fn list_projects_provider_records_without_secrets_or_display_formatting() {
         false,
     );
     let value = parsed(fixture.run(&["list", "--cloud", "gcp", "--json"]));
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["command"], "list");
     assert_eq!(value["cloud"], "gcp");
     assert_eq!(value["result"]["instances"][0]["id"], "ice-example");
@@ -854,17 +867,22 @@ fn lifecycle_reports_actual_state_and_distinguishes_noop() {
     fixture.runtime();
     let args = |command| [command, "--cloud", "local", "ice-example", "--json"];
     let unchanged = parsed(fixture.run(&args("start")));
-    assert_eq!(unchanged["result"]["changed"], false);
+    assert_eq!(unchanged["result"]["request"], "not_needed");
+    let reads = fs::read_to_string(fixture.root.path().join("actions")).unwrap();
+    assert_eq!(reads.lines().filter(|line| *line == "ps").count(), 1);
+    assert_eq!(reads.lines().filter(|line| *line == "inspect").count(), 1);
     let stopped = parsed(fixture.run(&args("stop")));
-    assert_eq!(stopped["result"]["changed"], true);
+    assert_eq!(stopped["result"]["request"], "acknowledged");
     assert_eq!(stopped["result"]["instance"]["state"], "stopped");
     let stopped = parsed(fixture.run(&args("stop")));
-    assert_eq!(stopped["result"]["changed"], false);
+    assert_eq!(stopped["result"]["request"], "not_needed");
     let started = parsed(fixture.run(&args("start")));
-    assert_eq!(started["result"]["changed"], true);
+    assert_eq!(started["result"]["request"], "acknowledged");
     assert_eq!(started["result"]["instance"]["state"], "running");
     let deleted = parsed(fixture.run(&args("delete")));
-    assert_eq!(deleted["result"]["status"], "deleted");
+    assert_eq!(deleted["result"]["state"], "deleted");
+    assert_eq!(deleted["result"]["outcome"], "verified");
+    assert_eq!(deleted["result"]["verification"], "read_back");
     assert_eq!(deleted["result"]["instance_id"], "test-id");
     let actions = fs::read_to_string(fixture.root.path().join("actions")).unwrap();
     assert_eq!(actions.lines().filter(|line| *line == "stop").count(), 2);
@@ -1308,4 +1326,494 @@ fn remote_log_failure_keeps_partial_records_and_ends_with_error() {
             .iter()
             .any(|record| record["result"]["event"] == "complete")
     );
+}
+
+#[test]
+fn verda_missing_credentials_and_cleanup_are_structured() {
+    let fixture = Fixture::new();
+    for command in ["login", "list", "catalog"] {
+        let value =
+            failed(fixture.run(&[command, "--cloud", "verda", "--non-interactive", "--json"]));
+        assert_eq!(value["cloud"], "verda");
+        assert_eq!(
+            value["error"]["code"],
+            if command == "login" {
+                "authentication_required"
+            } else {
+                "missing_credentials"
+            }
+        );
+    }
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "verda",
+        "--ssh",
+        "--yes",
+        "--max-price-per-hr",
+        "1",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "cleanup_acknowledgement_required");
+    assert_eq!(value["error"]["details"]["automatic_delete"], false);
+}
+
+#[test]
+fn verda_partial_environment_never_mixes_with_saved_credentials() {
+    let fixture = Fixture::new();
+    let saved = "[auth.verda]\nclient_id = 'saved-id'\nclient_secret = 'saved-secret'\n";
+    fixture.config(saved);
+    for variable in ["VERDA_CLIENT_ID", "VERDA_CLIENT_SECRET"] {
+        for force in [false, true] {
+            let mut command = fixture.command();
+            command.env(variable, "environment-value").args([
+                "login",
+                "--cloud",
+                "verda",
+                "--json",
+                "--non-interactive",
+            ]);
+            if force {
+                command.arg("--force");
+            }
+            let output = bounded_output(command);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for secret in ["saved-id", "saved-secret", "environment-value"] {
+                assert!(!text.contains(secret));
+            }
+            let value = failed(output);
+            assert_eq!(value["error"]["code"], "missing_credentials");
+            assert_eq!(
+                value["error"]["details"]["environment"],
+                json!(["VERDA_CLIENT_ID", "VERDA_CLIENT_SECRET"])
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.root.path().join("config/ice/config.toml")).unwrap(),
+                saved
+            );
+        }
+    }
+}
+
+#[test]
+fn forced_noninteractive_login_preserves_saved_credentials() {
+    for cloud in ["vast.ai", "verda"] {
+        let fixture = Fixture::new();
+        let saved = "[auth.vast_ai]\napi_key = 'old-key'\n[auth.verda]\nclient_id = 'saved-id'\nclient_secret = 'saved-secret'\n";
+        fixture.config(saved);
+        let value = failed(fixture.run(&[
+            "login",
+            "--cloud",
+            cloud,
+            "--force",
+            "--non-interactive",
+            "--json",
+        ]));
+        assert_eq!(value["error"]["code"], "authentication_required");
+        assert_eq!(
+            fs::read_to_string(fixture.root.path().join("config/ice/config.toml")).unwrap(),
+            saved
+        );
+    }
+}
+
+#[test]
+fn verda_unsupported_workloads_fail_before_credentials_or_rentals() {
+    let fixture = Fixture::new();
+    for mode in [
+        vec!["--container", "example.invalid/image"],
+        vec!["--unpack", "image.tar"],
+        vec!["--arca", "fixture"],
+    ] {
+        let mut args = vec!["create", "--cloud", "verda", "--dry-run", "--json"];
+        args.extend(mode);
+        let value = failed(fixture.run(&args));
+        assert_eq!(value["error"]["code"], "unsupported_workload");
+    }
+}
+
+#[test]
+fn verda_filters_and_provider_options_preserve_provenance() {
+    let fixture = Fixture::new();
+    fixture.config("[default.verda]\nmin_cpus = 10\nmin_ram_gb = 32.0\ndisk_gb = 200\nimage = 'saved-image'\nlocation = 'FIN-01'\nssh_key_id = 'saved-key'\n");
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "verda",
+        "--ssh",
+        "--dry-run",
+        "--json",
+        "--no-defaults",
+        "--gpu-count",
+        "1",
+        "--min-gpu-memory-gb",
+        "48",
+        "--gpu",
+        "Future GPU Model",
+        "--max-price-per-hr",
+        "1",
+        "--image",
+        "ubuntu-26.04-cuda-13.2-open",
+    ]));
+    assert_eq!(value["error"]["code"], "missing_credentials");
+    let selection = &value["error"]["details"]["selection"];
+    assert_eq!(selection["filters"]["disk_gb"]["value"], 100);
+    assert_eq!(selection["filters"]["min_cpus"]["value"], Value::Null);
+    assert_eq!(selection["filters"]["gpu_count"]["value"], 1);
+    assert_eq!(selection["price_scope"], "compute_and_os_storage");
+    assert_eq!(
+        selection["provider_options"]["image"]["source"],
+        "command_line"
+    );
+    assert_eq!(
+        selection["provider_options"]["location"]["value"],
+        Value::Null
+    );
+    assert_eq!(
+        selection["provider_options"]["ssh_key_id"]["value"],
+        "saved-key"
+    );
+    let unsupported = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "verda",
+        "--ssh",
+        "--dry-run",
+        "--json",
+        "--min-download-mbps",
+        "100",
+        "--max-price-per-hr",
+        "1",
+    ]));
+    assert_eq!(unsupported["error"]["code"], "unsupported_filter");
+}
+
+#[test]
+fn verda_configuration_round_trips_and_redacts_credentials() {
+    let fixture = Fixture::new();
+    for assignment in [
+        "default.cloud=verda",
+        "default.verda.gpu_count=1",
+        "default.verda.disk_gb=100",
+        "default.verda.max_price_per_hr=0.8",
+        "default.verda.allowed_gpus=RTX A6000,H100",
+        "default.verda.location=FIN-01",
+        "auth.verda.client_id=verda-test-id",
+        "auth.verda.client_secret=verda-test-secret",
+    ] {
+        let output = fixture.run(&["config", "set", assignment, "--json"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("verda-test-secret"));
+    }
+    let config_path = fixture.root.path().join("config/ice/config.toml");
+    assert_eq!(
+        fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let output = fixture.run(&["config", "list", "--json"]);
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["result"]["values"]["auth.verda.client_id"],
+        "<redacted>"
+    );
+    assert_eq!(
+        value["result"]["values"]["auth.verda.client_secret"],
+        "<redacted>"
+    );
+    assert_eq!(
+        value["result"]["values"]["default.verda.allowed_gpus"],
+        json!(["RTX A6000", "H100"])
+    );
+    assert!(
+        fixture
+            .run(&["config", "unset", "auth.verda.client_secret", "--json"])
+            .status
+            .success()
+    );
+    assert!(
+        !fixture
+            .run(&["config", "set", "default.verda.disk_gb=0", "--json"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn verda_options_do_not_silently_change_other_providers() {
+    let fixture = Fixture::new();
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "vast.ai",
+        "--ssh",
+        "--dry-run",
+        "--image",
+        "example",
+        "--max-price-per-hr",
+        "1",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "unsupported_arguments");
+}
+
+#[test]
+fn lifecycle_delete_reconciles_once_and_does_not_confuse_gcp_stopped_with_deleted() {
+    for scenario in ["gone", "lost-receipt", "stopped", "malformed", "wrong-id"] {
+        let fixture = Fixture::new();
+        fixture.script(
+            "gcloud",
+            r#"#!/bin/sh
+[ "$1" != --version ] || exit 0
+printf '%s\n' "$*" >> "$ICE_TEST_ACTIONS"
+case "$1:$2:$3" in
+ compute:instances:list)
+  if [ ! -f "$ICE_TEST_STATE" ]; then
+    printf '[{"name":"ice-test","zone":"zones/test-a","status":"RUNNING"}]'
+  else
+    case "$ICE_TEST_SCENARIO" in
+      gone|lost-receipt) printf '[]' ;;
+      stopped) printf '[{"name":"ice-test","zone":"zones/test-a","status":"TERMINATED"}]' ;;
+      malformed) printf '{}' ;;
+      wrong-id) printf '[{"name":"ice-other","zone":"zones/test-a","status":"TERMINATED"}]' ;;
+    esac
+  fi ;;
+ compute:instances:delete)
+  printf deleted > "$ICE_TEST_STATE"
+  if [ "$ICE_TEST_SCENARIO" = lost-receipt ]; then printf secret-token >&2; exit 7; fi ;;
+ *) exit 71 ;;
+esac
+"#,
+        );
+        let output = bounded_output({
+            let mut cmd = fixture.command();
+            cmd.env("ICE_TEST_SCENARIO", scenario).args([
+                "delete",
+                "--cloud",
+                "gcp",
+                "ice-test",
+                "--timeout",
+                "1s",
+                "--json",
+            ]);
+            cmd
+        });
+        if matches!(scenario, "gone" | "lost-receipt") {
+            let value = parsed(output);
+            assert_eq!(value["result"]["state"], "deleted");
+            assert_eq!(value["result"]["outcome"], "verified");
+            assert_eq!(
+                value["result"]["request"],
+                if scenario == "gone" {
+                    "acknowledged"
+                } else {
+                    "unconfirmed"
+                }
+            );
+            assert_eq!(value["result"]["storage"]["verification"], "unknown");
+        } else {
+            let value = failed(output);
+            assert_eq!(value["error"]["code"], "operation_unverified");
+            assert_eq!(value["error"]["details"]["instance_id"], "ice-test");
+            assert!(!value.to_string().contains("secret-token"));
+        }
+        let calls = fs::read_to_string(fixture.root.path().join("actions")).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.contains("instances delete"))
+                .count(),
+            1
+        );
+        assert!(!calls.contains("instances stop"));
+        assert!(calls.contains("--zones test-a --filter name=ice-test"));
+    }
+}
+
+#[test]
+fn lifecycle_timeout_also_bounds_cli_availability_checks() {
+    let fixture = Fixture::new();
+    fixture.script("aws", "#!/bin/sh\nexec /bin/sleep 30\n");
+    let start = std::time::Instant::now();
+    let value = failed(bounded_output({
+        let mut cmd = fixture.command();
+        cmd.args([
+            "delete",
+            "--cloud",
+            "aws",
+            "i-test",
+            "--timeout",
+            "1s",
+            "--json",
+        ]);
+        cmd
+    }));
+    assert_eq!(value["error"]["code"], "operation_timeout");
+    assert_eq!(
+        value["error"]["details"]["recovery"]["instance_identifier"],
+        "i-test"
+    );
+    assert_eq!(value["error"]["details"]["recovery"]["request"], "not_sent");
+    assert!(start.elapsed() < std::time::Duration::from_secs(4));
+}
+
+#[test]
+fn verda_requires_an_explicit_image_before_any_provider_request() {
+    let fixture = Fixture::new();
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "verda",
+        "--ssh",
+        "--max-price-per-hr",
+        "1",
+        "--dry-run",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "image_required");
+    assert_eq!(value["error"]["details"]["flag"], "--image");
+}
+
+#[test]
+fn aws_termination_waits_for_terminal_state_and_survives_removed_tags() {
+    for scenario in ["terminated", "shutting-down", "malformed"] {
+        let fixture = Fixture::new();
+        fixture.config("[default.aws]\nregion = 'test-region'\n");
+        fixture.script("aws", r#"#!/bin/sh
+[ "$1" != --version ] || exit 0
+printf '%s\n' "$*" >> "$ICE_TEST_ACTIONS"
+case "$1:$2" in
+ ec2:describe-instances)
+  if [ ! -f "$ICE_TEST_STATE" ]; then
+   printf '{"Reservations":[{"Instances":[{"InstanceId":"i-test","State":{"Name":"running"},"Tags":[{"Key":"Name","Value":"ice-test"}]}]}]}'
+  elif [ "$ICE_TEST_SCENARIO" = malformed ]; then printf '{}'
+  else
+   printf '{"Reservations":[{"Instances":[{"InstanceId":"i-test","State":{"Name":"%s"}}]}]}' "$ICE_TEST_SCENARIO"
+  fi ;;
+ ec2:terminate-instances) printf accepted > "$ICE_TEST_STATE"; printf '{"TerminatingInstances":[{"CurrentState":{"Name":"shutting-down"}}]}' ;;
+ *) exit 71 ;;
+esac
+"#);
+        let output = bounded_output({
+            let mut cmd = fixture.command();
+            cmd.env("ICE_TEST_SCENARIO", scenario).args([
+                "delete",
+                "--cloud",
+                "aws",
+                "i-test",
+                "--timeout",
+                "1s",
+                "--json",
+            ]);
+            cmd
+        });
+        if scenario == "terminated" {
+            let value = parsed(output);
+            assert_eq!(value["result"]["state"], "deleted");
+            assert_eq!(value["result"]["instance"]["state"], "terminated");
+        } else {
+            let value = failed(output);
+            assert_eq!(value["error"]["code"], "operation_unverified");
+            assert_eq!(value["error"]["details"]["instance_id"], "i-test");
+        }
+        let calls = fs::read_to_string(fixture.root.path().join("actions")).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.contains("terminate-instances"))
+                .count(),
+            1
+        );
+        assert!(!calls.contains("stop-instances"));
+        assert!(calls.contains("Name=instance-id,Values=i-test"));
+    }
+}
+
+#[test]
+fn version_is_json_capable_and_independent_of_credentials_tools_and_config() {
+    let fixture = Fixture::new();
+    // Invalid credentials/configuration must not hide the identity of this binary.
+    fixture.config("broken = [ 'secret-placeholder'\n");
+    for args in [
+        vec!["version", "--json"],
+        vec!["--json", "--version"],
+        vec!["--version", "--json"],
+    ] {
+        let value = parsed(fixture.run(&args));
+        assert_eq!(value["command"], "version");
+        assert_eq!(value["cloud"], Value::Null);
+        assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            value["result"]["json_schema_version"],
+            value["schema_version"]
+        );
+        let expected_revision = option_env!("ICE_BUILD_REVISION");
+        assert_eq!(value["result"]["source_revision"], json!(expected_revision));
+        assert!(!value.to_string().contains("secret-placeholder"));
+    }
+    for args in [vec!["version"], vec!["--version"], vec!["-V"]] {
+        let output = fixture.run(&args);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.starts_with(&format!("ice {} (", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("JSON schema 2"));
+        assert!(output.stderr.is_empty());
+    }
+    assert!(!fixture.root.path().join(".ice").exists());
+}
+
+#[test]
+fn verda_creation_reports_local_key_setup_errors_before_credentials_or_catalog_access() {
+    let id = "44444444-4444-4444-8444-444444444444";
+    for (setting, expected) in [
+        ("".to_owned(), "ssh_key_required"),
+        ("ssh_key_id = ''".into(), "ssh_key_required"),
+        ("ssh_key_id = 'invalid'".into(), "invalid_ssh_key_id"),
+        (
+            format!("ssh_key_id = '{id}'\nssh_key_path = '/ice-test-missing-key'"),
+            "ssh_identity_unavailable",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.config(&format!("[default.verda]\n{setting}\n"));
+        let value = failed(fixture.run(&[
+            "create",
+            "--cloud",
+            "verda",
+            "--ssh",
+            "--image",
+            "provider-image",
+            "--max-price-per-hr",
+            "1",
+            "--yes",
+            "--manual-cleanup",
+            "--json",
+        ]));
+        assert_eq!(value["error"]["code"], expected);
+        assert_eq!(value["error"]["details"]["resource_created"], false);
+        let preview = failed(fixture.run(&[
+            "create",
+            "--cloud",
+            "verda",
+            "--ssh",
+            "--image",
+            "provider-image",
+            "--max-price-per-hr",
+            "1",
+            "--dry-run",
+            "--json",
+        ]));
+        assert_eq!(
+            preview["error"]["code"], "missing_credentials",
+            "preview should not require a usable SSH key"
+        );
+    }
 }

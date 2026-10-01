@@ -21,6 +21,7 @@ pub(crate) mod catalog;
 pub(crate) mod gcp;
 pub(crate) mod local;
 pub(crate) mod vast;
+pub(crate) mod verda;
 
 pub(crate) fn load_cached_arc<T, F>(
     cache: &LazyLock<Mutex<Option<Arc<T>>>>,
@@ -94,6 +95,8 @@ pub(crate) trait CloudProvider: Sized {
         on_progress: &mut dyn FnMut(String),
     ) -> Result<Vec<Self::Instance>>;
     fn sort_instances(instances: &mut [Self::Instance]);
+    /// Resolve from a fresh provider observation. A cached identifier may locate
+    /// the resource, but cached state must never satisfy a lifecycle operation.
     fn resolve_instance(
         context: &Self::ProviderContext<'_>,
         identifier: &str,
@@ -109,6 +112,12 @@ pub(crate) trait CloudProvider: Sized {
         running: bool,
         timeout: Duration,
     ) -> Result<Self::Instance>;
+    /// Fresh exact-identity observation; None must mean confirmed absence.
+    fn observe_instance(
+        context: &Self::ProviderContext<'_>,
+        instance: &Self::Instance,
+    ) -> Result<Option<Self::Instance>>;
+
     fn delete_instance(
         context: &Self::ProviderContext<'_>,
         instance: &Self::Instance,

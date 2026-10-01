@@ -21,6 +21,7 @@ const BASIC: [&str; 4] = ["min_cpus", "min_ram_gb", "allowed_gpus", "max_price_p
 
 fn provider_key(cloud: Cloud) -> &'static str {
     match cloud {
+        Cloud::Verda => "verda",
         Cloud::VastAi => "vast_ai",
         Cloud::Gcp => "gcp",
         Cloud::Aws => "aws",
@@ -36,6 +37,18 @@ pub(crate) fn snapshot() -> Option<Value> {
 }
 
 pub(crate) fn resolve(config: &IceConfig, cloud: Cloud, args: &CreateArgs) -> Result<IceConfig> {
+    if cloud != Cloud::Verda
+        && (args.manual_cleanup
+            || args.image.is_some()
+            || args.location.is_some()
+            || args.ssh_key_id.is_some())
+    {
+        return Err(error(
+            "unsupported_arguments",
+            "--manual-cleanup, --image, --location and --ssh-key-id currently require --cloud verda.",
+            json!({"cloud": cloud}),
+        ));
+    }
     let runtime_hours = crate::workload::resolve_deploy_hours(config, args.hours)?;
     let mut invalid = Vec::new();
     for (flag, value) in [
@@ -90,6 +103,16 @@ pub(crate) fn resolve(config: &IceConfig, cloud: Cloud, args: &CreateArgs) -> Re
     // TOML permits NaN/inf but JSON represents them as null. Validate saved
     // floating-point requirements before conversion so they cannot disappear.
     let saved_floats = match cloud {
+        Cloud::Verda => {
+            let d = &config.default.verda;
+            [
+                d.min_ram_gb,
+                d.max_price_per_hr,
+                d.min_gpu_memory_gb,
+                d.min_download_mbps,
+                d.min_upload_mbps,
+            ]
+        }
         Cloud::VastAi => {
             let d = &config.default.vast_ai;
             [
@@ -153,6 +176,10 @@ pub(crate) fn resolve(config: &IceConfig, cloud: Cloud, args: &CreateArgs) -> Re
         match cloud {
             Cloud::Gcp => raw["default"][key]["boot_disk_gb"] = Value::Null,
             Cloud::Aws => raw["default"][key]["root_disk_gb"] = Value::Null,
+            Cloud::Verda => {
+                raw["default"][key]["image"] = Value::Null;
+                raw["default"][key]["location"] = Value::Null;
+            }
             _ => (),
         }
     }
@@ -184,6 +211,18 @@ pub(crate) fn resolve(config: &IceConfig, cloud: Cloud, args: &CreateArgs) -> Re
             .is_none_or(|gpus| gpus.is_empty());
     if aws_cpu_default {
         effective.default.aws.gpu_count = Some(0);
+    }
+    if cloud == Cloud::Verda {
+        let d = &mut effective.default.verda;
+        if let Some(value) = &args.image {
+            d.image = Some(value.clone());
+        }
+        if let Some(value) = &args.location {
+            d.location = Some(value.clone());
+        }
+        if let Some(value) = &args.ssh_key_id {
+            d.ssh_key_id = Some(value.clone());
+        }
     }
     let raw = serde_json::to_value(&effective)?;
     let defaults = &raw["default"][key];
@@ -228,13 +267,18 @@ pub(crate) fn resolve(config: &IceConfig, cloud: Cloud, args: &CreateArgs) -> Re
             .into_iter()
             .filter(|field| !defaults[*field].is_null())
             .collect::<Vec<_>>();
-        if count.is_some_and(|n| n > 0) {
+        if cloud == Cloud::Verda {
+            unsupported.retain(|field| *field != "min_gpu_memory_gb");
+        }
+        if cloud != Cloud::Verda && count.is_some_and(|n| n > 0) {
             unsupported.push("gpu_count");
         }
         if !unsupported.is_empty() {
             return Err(error(
                 "unsupported_filter",
-                format!("These filters are currently supported only on vast.ai, not {cloud}."),
+                format!(
+                    "{cloud} cannot enforce these filters. Remove them or choose a provider that supports them."
+                ),
                 json!({"filters": unsupported, "cloud": cloud}),
             ));
         }
@@ -268,12 +312,23 @@ pub(crate) fn resolve(config: &IceConfig, cloud: Cloud, args: &CreateArgs) -> Re
         };
         filters[field] = json!({"value": value, "source": source});
     }
+    let mut provider_options = json!({});
+    if cloud == Cloud::Verda {
+        for (field, supplied) in [
+            ("image", &args.image),
+            ("location", &args.location),
+            ("ssh_key_id", &args.ssh_key_id),
+        ] {
+            provider_options[field] = json!({"value": defaults[field], "source": if supplied.is_some() { "command_line" } else if !defaults[field].is_null() { "saved_configuration" } else { "unspecified" }});
+        }
+    }
     *EFFECTIVE.lock().unwrap_or_else(|err| err.into_inner()) = Some(json!({
         "config_path": crate::config_store::config_path()?, "saved_filters_ignored": args.no_defaults,
         "filters": filters,
         "runtime_hours": {"value": runtime_hours, "source": if args.hours.is_some() { "command_line" } else if config.default.runtime_hours.is_some() { "saved_configuration" } else { "built_in" }},
         "machine": args.machine,
-        "price_scope": if cloud == Cloud::VastAi { "provider_rate" } else { "compute" },
+        "provider_options": provider_options,
+        "price_scope": if cloud == Cloud::Verda { "compute_and_os_storage" } else if cloud == Cloud::VastAi { "compute_and_allocated_storage" } else { "compute" },
     }));
     crate::provision::build_search_requirements(&effective, cloud)?;
     Ok(effective)

@@ -246,7 +246,8 @@ fn vast_autostop_plan_rounds_up_to_hour_boundary() {
 #[test]
 fn vast_autostop_cost_estimate_respects_plan_runtime() {
     let base = estimate_runtime_cost(Cloud::VastAi, 0.5, 0.25).expect("base estimate should work");
-    let adjusted = apply_vast_autostop_cost_estimate(base).expect("adjusted estimate");
+    let adjusted =
+        apply_vast_autostop_cost_estimate(base, 1_790_559_480).expect("adjusted estimate");
     assert!(adjusted.billed_hours >= adjusted.requested_hours);
     assert!((adjusted.total_usd - (adjusted.hourly_usd * adjusted.billed_hours)).abs() < 1e-9);
 }
@@ -510,6 +511,7 @@ fn vast_job_termination_unix_recognizes_stop_and_delete_actions() {
         request_method: Some("PUT".to_owned()),
         request_body: Some(json!({"state":"stopped"})),
         start_time: Some(1_700_000_000.0),
+        ..Default::default()
     };
     let delete_job = VastScheduledJob {
         instance_id: Some(42),
@@ -517,6 +519,7 @@ fn vast_job_termination_unix_recognizes_stop_and_delete_actions() {
         request_method: Some("DELETE".to_owned()),
         request_body: None,
         start_time: Some(1_700_000_100.0),
+        ..Default::default()
     };
     let irrelevant_job = VastScheduledJob {
         instance_id: Some(42),
@@ -524,6 +527,7 @@ fn vast_job_termination_unix_recognizes_stop_and_delete_actions() {
         request_method: Some("PUT".to_owned()),
         request_body: Some(json!({"state":"running"})),
         start_time: Some(1_700_000_200.0),
+        ..Default::default()
     };
 
     assert_eq!(job_termination_unix(&stop_job), Some(1_700_000_000.0));
@@ -541,6 +545,7 @@ fn nearest_vast_scheduled_termination_picks_earliest_future_job() {
             request_method: Some("PUT".to_owned()),
             request_body: Some(json!({"state":"stopped"})),
             start_time: Some(now + 7_200.0),
+            ..Default::default()
         },
         VastScheduledJob {
             instance_id: Some(42),
@@ -548,6 +553,7 @@ fn nearest_vast_scheduled_termination_picks_earliest_future_job() {
             request_method: Some("DELETE".to_owned()),
             request_body: None,
             start_time: Some(now + 3_600.0),
+            ..Default::default()
         },
         VastScheduledJob {
             instance_id: Some(42),
@@ -555,6 +561,7 @@ fn nearest_vast_scheduled_termination_picks_earliest_future_job() {
             request_method: Some("DELETE".to_owned()),
             request_body: None,
             start_time: Some(now - 60.0),
+            ..Default::default()
         },
     ];
 

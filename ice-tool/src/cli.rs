@@ -7,6 +7,7 @@ use crate::model::{Cloud, DeployTargetRequest};
 #[derive(Debug, Parser)]
 #[command(
     name = "ice",
+    version = crate::version::display(),
     about = "Manage cloud VM instances and local workload containers.",
     infer_subcommands = true,
     after_help = "Examples:\n  ice create test-crate\n  ice create --arca test-crate --hours 0.25\n  ice create --unpack arca:test-crate --cloud vast.ai\n  ice create --container us-central1-docker.pkg.dev/my-project/arca/my-image:tag --cloud vast.ai\n  ice create --ssh --cloud gcp --machine g2-standard-4"
@@ -24,6 +25,9 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
+    /// Report the installed build and JSON schema, without configuration or provider access.
+    Version,
+
     #[command(
         name = "login",
         about = "Ensure credentials exist for a cloud provider."
@@ -66,20 +70,23 @@ pub(crate) enum Commands {
     #[command(name = "start", about = "Start an instance.")]
     Start(InstanceArgs),
 
-    #[command(name = "delete", about = "Stop then delete an instance.")]
+    #[command(name = "delete", about = "Delete an instance and verify its removal.")]
     Delete(InstanceArgs),
 
     #[command(
         name = "create",
         about = "Create the cheapest matching instance for a workload, or a managed local container."
     )]
-    Create(CreateArgs),
+    Create(Box<CreateArgs>),
 
     #[command(
         name = "refresh-catalog",
         about = "Refresh a locally cached machine/pricing catalog for a cloud provider."
     )]
     RefreshCatalog(RefreshCatalogArgs),
+
+    /// Discover live machine types, images, availability and storage prices (Verda).
+    Catalog(CloudArgs),
 }
 
 #[derive(Debug, Args)]
@@ -116,6 +123,7 @@ pub(crate) struct LogsArgs {
 pub(crate) struct LoginArgs {
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
+    /// Refresh login; Vast/Verda prompt again unless environment credentials are set.
     #[arg(long)]
     pub(crate) force: bool,
 }
@@ -166,7 +174,7 @@ pub(crate) struct ShellArgs {
     /// Print a connection command after readiness checks and any instance-key recovery.
     #[arg(long)]
     pub(crate) print_creds: bool,
-    /// Vast only: print reported endpoints without readiness checks, SSH probes, or key changes.
+    /// Vast/Verda: print reported endpoints without readiness checks, SSH probes, or key changes.
     #[arg(long, requires = "print_creds", conflicts_with = "preserve_ephemeral")]
     pub(crate) no_probe: bool,
     /// Deprecated for Vast: recovery no longer creates temporary account keys.
@@ -198,20 +206,35 @@ pub(crate) struct InstanceArgs {
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
     pub(crate) instance: String,
+    /// Total lifecycle command budget, including provider requests and state verification.
+    #[arg(long, default_value="5m", value_parser=parse_duration)]
+    pub(crate) timeout: u64,
 }
 
 #[derive(Debug, Args)]
 pub(crate) struct CreateArgs {
+    /// Verda only: acknowledge that --hours is an estimate; arrange and verify deletion yourself.
+    #[arg(long)]
+    pub(crate) manual_cleanup: bool,
+    /// Verda only: select a provider OS image UUID/type from `ice catalog` (no local upload).
+    #[arg(long)]
+    pub(crate) image: Option<String>,
+    /// Verda only: datacenter location code; otherwise choose cheapest available.
+    #[arg(long)]
+    pub(crate) location: Option<String>,
+    /// Verda only: existing provider SSH key ID.
+    #[arg(long)]
+    pub(crate) ssh_key_id: Option<String>,
     /// Accept creation within the supplied filters and price ceiling.
     #[arg(long)]
     pub(crate) yes: bool,
-    /// Ignore saved search filters and disk preferences for this invocation.
+    /// Ignore saved search filters/disk size; also image/location on Verda. Retains credentials and runtime.
     #[arg(long)]
     pub(crate) no_defaults: bool,
-    /// Exact GPU count (positive counts: Vast only). Zero requires CPU-only.
+    /// Exact GPU count (positive counts: Vast/Verda). Zero requires CPU-only.
     #[arg(long, value_name = "COUNT")]
     pub(crate) gpu_count: Option<u32>,
-    /// Minimum memory per GPU in GB (Vast only).
+    /// Minimum memory per GPU in GB (Vast/Verda).
     #[arg(long, value_name = "GB", alias = "min-vram-gb")]
     pub(crate) min_gpu_memory_gb: Option<f64>,
     /// Disk allocation in provider GB units (shown in the quote).
@@ -241,13 +264,13 @@ pub(crate) struct CreateArgs {
     /// Clear the saved GPU model filter. Use --gpu-count 0 to require CPU-only.
     #[arg(long, conflicts_with = "gpus")]
     pub(crate) no_gpu: bool,
-    /// Override the maximum hourly price filter in USD/hr.
+    /// Maximum USD/hr: compute + allocated disk on Vast/Verda; compute on GCP/AWS. Excludes bandwidth/taxes.
     #[arg(long, value_name = "USD")]
     pub(crate) max_price_per_hr: Option<f64>,
-    /// Runtime duration in hours. Defaults to `default.runtime_hours`, then `1.0`.
+    /// Runtime hours (Verda: cost estimate only, no enforced deadline). Defaults to saved value, then 1.
     #[arg(long, value_name = "HOURS")]
     pub(crate) hours: Option<f64>,
-    /// Pin a cloud-specific machine type on marketplace-backed clouds.
+    /// Exact type on AWS/GCP/Verda; GPU-model selector on Vast (not a host or offer ID).
     #[arg(long)]
     pub(crate) machine: Option<String>,
     /// Prompt interactively for marketplace search filters.
@@ -294,6 +317,7 @@ fn parse_duration(value: &str) -> Result<u64, String> {
 impl Commands {
     pub(crate) fn name(&self) -> &'static str {
         match self {
+            Self::Version => "version",
             Self::Login(_) => "login",
             Self::Config(args) => match args.command {
                 ConfigCommands::List(_) => "config list",
@@ -311,15 +335,16 @@ impl Commands {
             Self::Delete(_) => "delete",
             Self::Create(_) => "create",
             Self::RefreshCatalog(_) => "refresh-catalog",
+            Self::Catalog(_) => "catalog",
         }
     }
 
     pub(crate) fn cloud(&self, config: &crate::model::IceConfig) -> Option<Cloud> {
         let requested = match self {
-            Self::Config(_) => return None,
+            Self::Config(_) | Self::Version => return None,
             Self::RefreshCatalog(args) => return args.cloud,
             Self::Login(args) => args.cloud,
-            Self::List(args) => args.cloud,
+            Self::List(args) | Self::Catalog(args) => args.cloud,
             Self::Logs(args) => args.cloud,
             Self::Shell(args) => args.cloud,
             Self::Pull(args) => args.cloud,

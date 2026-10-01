@@ -10,6 +10,8 @@ use crate::model::{Cloud, CloudMachineCandidate, IceConfig, RuntimeCostEstimate}
 use crate::providers::vast::VastOffer;
 use crate::workload::InstanceWorkload;
 
+pub(crate) const SCHEMA_VERSION: u64 = 2;
+
 // A CLI process handles one command. Output policy is initialized once, before dispatch.
 static JSON: OnceLock<bool> = OnceLock::new();
 static LOG_CONTEXT: OnceLock<(Cloud, String)> = OnceLock::new();
@@ -28,7 +30,7 @@ pub(crate) fn document(command: &str, cloud: impl Into<Option<Cloud>>, mut resul
     {
         result["selection"] = selection;
     }
-    json!({"schema_version": 1, "command": command, "cloud": cloud.into(), "result": result})
+    json!({"schema_version": SCHEMA_VERSION, "command": command, "cloud": cloud.into(), "result": result})
 }
 
 pub(crate) fn write_document(mut writer: impl Write, value: &Value) -> Result<()> {
@@ -50,7 +52,7 @@ pub(crate) fn error(
     write_document(
         io::stdout().lock(),
         &json!({
-            "schema_version": 1, "command": command, "cloud": cloud,
+            "schema_version": SCHEMA_VERSION, "command": command, "cloud": cloud,
             "error": {"code": code, "message": message},
         }),
     )
@@ -63,7 +65,11 @@ pub(crate) fn config_values(config: &IceConfig) -> Result<Value> {
         let value = key.split('.').fold(&raw, |value, part| &value[part]);
         let value = if matches!(
             key,
-            "auth.vast_ai.api_key" | "auth.aws.access_key_id" | "auth.aws.secret_access_key"
+            "auth.vast_ai.api_key"
+                | "auth.aws.access_key_id"
+                | "auth.aws.secret_access_key"
+                | "auth.verda.client_id"
+                | "auth.verda.client_secret"
         ) && !value.is_null()
         {
             json!("<redacted>")
@@ -264,6 +270,8 @@ pub(crate) fn vast_offer(offer: &VastOffer) -> Value {
         "download_usd_per_gb": offer.inet_down_cost, "upload_usd_per_gb": offer.inet_up_cost,
         "num_gpus": offer.num_gpus, "cpu_cores": offer.cpu_cores_effective,
         "ram_mb": offer.cpu_ram, "hourly_usd": offer.hourly_price(),
+        "provider_hourly_usd": offer.dph_total,
+        "quoted_total_hourly_usd": offer.quoted_total_hourly_price(),
         "available_seconds": offer.duration, "location": offer.geolocation,
         "verification": offer.verification, "reliability": offer.reliability,
     })
@@ -290,6 +298,7 @@ pub(crate) fn allocated_disk_gb(config: &IceConfig, cloud: Cloud) -> Option<u32>
                 .disk_gb
                 .unwrap_or(crate::support::VAST_DEFAULT_DISK_GB as u32),
         ),
+        Cloud::Verda => Some(config.default.verda.disk_gb.unwrap_or(100)),
         Cloud::Local => None,
     }
 }
@@ -321,7 +330,7 @@ pub(crate) fn command_error(
     }
     write_document(
         io::stdout().lock(),
-        &json!({"schema_version": 1, "command": command, "cloud": cloud,
+        &json!({"schema_version": SCHEMA_VERSION, "command": command, "cloud": cloud,
         "error": {"code": typed.map_or("command_failed", |err| err.code), "message": message, "details": details}}),
     )
 }
@@ -362,7 +371,7 @@ mod tests {
         write_document(&mut bytes, &expected).unwrap();
         assert_eq!(bytes.last(), Some(&b'\n'));
         assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
-        assert_eq!(expected["schema_version"], 1);
+        assert_eq!(expected["schema_version"], 2);
         assert!(
             expected["result"]["instances"]
                 .as_array()
@@ -406,6 +415,9 @@ mod tests {
         let value = vast_offer(&offer);
         assert_eq!(value["offer_id"], 123);
         assert_eq!(value["num_gpus"], 1);
+        assert_eq!(value["hourly_usd"], 0.15);
+        assert_eq!(value["provider_hourly_usd"], 0.12);
+        assert_eq!(value["quoted_total_hourly_usd"], 0.15);
         assert_eq!(offer.quoted_total_hourly_price(), Some(0.15));
         assert!(!value.to_string().contains("secret-"));
         let incomplete: VastOffer = serde_json::from_value(json!({"id": 456})).unwrap();

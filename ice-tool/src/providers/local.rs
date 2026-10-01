@@ -152,6 +152,13 @@ impl CloudProvider for Provider {
         )
     }
 
+    fn observe_instance(
+        context: &Self::ProviderContext<'_>,
+        instance: &Self::Instance,
+    ) -> Result<Option<Self::Instance>> {
+        crate::local::local_observe_instance(context, instance)
+    }
+
     fn delete_instance(
         context: &Self::ProviderContext<'_>,
         instance: &Self::Instance,

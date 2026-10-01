@@ -33,6 +33,21 @@ pub(crate) fn supported_config_keys() -> &'static [&'static str] {
         "default.aws.disk_gb",
         "default.aws.min_download_mbps",
         "default.aws.min_upload_mbps",
+        "default.verda.gpu_count",
+        "default.verda.min_gpu_memory_gb",
+        "default.verda.disk_gb",
+        "default.verda.min_download_mbps",
+        "default.verda.min_upload_mbps",
+        "default.verda.min_cpus",
+        "default.verda.min_ram_gb",
+        "default.verda.allowed_gpus",
+        "default.verda.max_price_per_hr",
+        "default.verda.location",
+        "default.verda.image",
+        "default.verda.ssh_key_id",
+        "default.verda.ssh_key_path",
+        "auth.verda.client_id",
+        "auth.verda.client_secret",
         "default.cloud",
         "default.runtime_hours",
         "default.vast_ai.min_cpus",
@@ -84,6 +99,19 @@ pub(crate) fn normalize_config_key(key: &str) -> Result<String> {
 
 pub(crate) fn get_config_value(config: &IceConfig, key: &str) -> Result<String> {
     let key = normalize_config_key(key)?;
+    if key.starts_with("default.verda.") || key.starts_with("auth.verda.") {
+        let value = filter_value(config, &key)?;
+        return Ok(if value.is_null() {
+            "<unset>".to_owned()
+        } else if key.starts_with("auth.") {
+            "<redacted>".to_owned()
+        } else {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string())
+        });
+    }
     if extra_filter_key(&key) {
         let value = filter_value(config, &key)?;
         return Ok(if value.is_null() {
@@ -239,6 +267,27 @@ fn parse_positive_f64_config_value(key: &str, value: &str) -> Result<f64> {
 
 pub(crate) fn set_config_value(config: &mut IceConfig, key: &str, value: &str) -> Result<String> {
     let key = normalize_config_key(key)?;
+    if key.starts_with("default.verda.") || key.starts_with("auth.verda.") {
+        let field = key.rsplit('.').next().unwrap();
+        let parsed = match field {
+            "gpu_count" => serde_json::json!(value.parse::<u32>()?),
+            "disk_gb" | "min_cpus" => {
+                serde_json::json!(parse_positive_u32_config_value(&key, value)?)
+            }
+            "min_gpu_memory_gb" | "min_ram_gb" | "max_price_per_hr" | "min_download_mbps"
+            | "min_upload_mbps" => serde_json::json!(parse_positive_f64_config_value(&key, value)?),
+            "allowed_gpus" => serde_json::json!(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .collect::<Vec<_>>()
+            ),
+            _ => serde_json::to_value(nonempty_string(value.to_owned()))?,
+        };
+        set_filter_value(config, &key, parsed)?;
+        return get_config_value(config, &key);
+    }
     if extra_filter_key(&key) {
         let field = key.rsplit('.').next().unwrap();
         let parsed = if field == "gpu_count" || field == "disk_gb" {
@@ -507,6 +556,9 @@ pub(crate) fn set_config_value(config: &mut IceConfig, key: &str, value: &str) -
 
 pub(crate) fn unset_config_value(config: &mut IceConfig, key: &str) -> Result<()> {
     let key = normalize_config_key(key)?;
+    if key.starts_with("default.verda.") || key.starts_with("auth.verda.") {
+        return set_filter_value(config, &key, serde_json::Value::Null);
+    }
     if extra_filter_key(&key) {
         return set_filter_value(config, &key, serde_json::Value::Null);
     }
@@ -551,6 +603,7 @@ pub(crate) fn unset_config_value(config: &mut IceConfig, key: &str) -> Result<()
 pub(crate) fn parse_cloud(value: &str) -> Result<Cloud> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
+        "verda" => Ok(Cloud::Verda),
         "vast.ai" | "vast" => Ok(Cloud::VastAi),
         "gcp" => Ok(Cloud::Gcp),
         "aws" => Ok(Cloud::Aws),
@@ -589,7 +642,7 @@ pub(crate) fn acquire_config_lock(wait: bool) -> Result<capulus::InvocationLock>
 
 pub(crate) fn save_config(config: &IceConfig) -> Result<PathBuf> {
     let path = config_path()?;
-    capulus::store::write_toml_file(&path, config, None, None)
+    capulus::store::write_toml_file(&path, config, Some(0o600), None)
         .with_context(|| format!("Failed to write config file: {}", path.display()))?;
     Ok(path)
 }
