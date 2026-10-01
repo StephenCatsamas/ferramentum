@@ -7,6 +7,7 @@ Setup wall time matters. Prefer a provider image containing the needed tools,
 reuse a suitable rental across nearby jobs, and delete it at the agreed end.
 Application installation, benchmarks and CUDA/profiling admission belong in the
 workload project. Ice does not turn SSH readiness into an application guarantee.
+
 ## Install
 
 ```bash
@@ -14,6 +15,12 @@ cargo install ice-tool
 ```
 
 Installed command: `ice`
+
+Check which binary is installed with `ice --version` or `ice version --json`.
+Both work offline, without provider tools or a valid config file. `--version
+--json` also returns JSON. The result includes the package version, source
+revision, whether that source had local changes, and JSON schema version.
+Unknown build metadata is `null`, never an assumed clean release.
 
 ## Quick start
 
@@ -45,6 +52,7 @@ Supported cloud identifiers:
 
 ## Commands
 
+- `ice version [--json]`
 - `ice login [--cloud CLOUD] [--force]`
 - `ice config list`
 - `ice config get <KEY>`
@@ -94,6 +102,8 @@ Successful commands other than `logs` write one JSON object and a newline to std
 - `list` returns an `instances` array with stable string IDs, names, provider state
   and provider-specific fields such as zone, GPU model or SSH endpoint. Missing
   values are `null`; records omit display colors and raw provider metadata.
+- `version` returns `version`, `source_revision`, `source_dirty`, and
+  `json_schema_version`, with `cloud: null`.
 - `create` returns a `status` of `preview`, `created` or `cancelled`, along with
   the selected offer/machine and cost estimate when applicable. A created result
   includes the instance ID. Vast results include allocated disk, the requested
@@ -283,6 +293,8 @@ uses resource identity, not the presence of an Ice management label.
 
 `request` is `acknowledged`, `unconfirmed` (the receipt was lost or rejected but
 readback proved the state), or `not_needed` (already in the requested state).
+When the initial fresh lookup already establishes the desired state, Ice reuses
+that observation without another provider read. Cached state cannot satisfy it.
 Ice submits each cloud lifecycle request once, then reconciles through reads.
 AWS/GCP requests run through their provider CLIs, which manage their own transport.
 Start verifies the running state, not SSH; use `shell --print-creds` to verify access.
@@ -415,7 +427,9 @@ Behavior:
 - `--image` selects a Verda provider OS catalog image (required explicitly or as
   a saved default). It does not upload a local image or select a container image.
   See [Verda provisioning and setup latency](docs/verda.md#image-provisioning-and-short-rentals).
-- `--machine` pins a specific marketplace machine type.
+- `--machine` pins a type on AWS/GCP/Verda. On Vast it selects a GPU model,
+  not a physical host ID or offer ID. Use `--gpu` for a consistent GPU-model
+  filter across providers.
 - `--dry-run` reports the chosen machine and exits before provisioning.
 
 Examples:
@@ -505,3 +519,8 @@ alternative. `--no-probe` currently applies only to Vast and requires
 - Private GCP registry pulls use your configured GCP credentials or active `gcloud`
   authentication.
 - External commands used by some flows: `ssh`, `rsync`, `gcloud`, `aws`, `docker`, `podman`.
+
+The `scripts/check-cli.sh ice-tool ...` build helper embeds the checkout's revision
+and local-change status. Direct Cargo builders can provide `ICE_BUILD_REVISION`
+(full Git hash) and `ICE_BUILD_DIRTY` (`true`/`false`) at build time; omitted values
+remain unknown. Runtime environment variables cannot change the compiled identity.

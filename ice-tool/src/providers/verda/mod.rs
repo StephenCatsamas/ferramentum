@@ -490,6 +490,11 @@ impl CreateProvider for Provider {
     fn create(config: &mut IceConfig, args: &CreateArgs) -> Result<()> {
         validate_create(args)?;
         catalog::required_image(&config.default.verda)?;
+        let creation_key = if args.dry_run {
+            None
+        } else {
+            Some(keys::creation_key_id(config)?)
+        };
         let started = Instant::now();
         let requirements = crate::provision::build_search_requirements(config, Cloud::Verda)?;
         let hours = crate::workload::resolve_deploy_hours(config, args.hours)?;
@@ -515,9 +520,7 @@ impl CreateProvider for Provider {
         if !args.yes && !prompt_confirm("Create this VM with manual cleanup?", false)? {
             bail!("Creation cancelled");
         }
-        let key = config.default.verda.ssh_key_id.as_deref().context(
-            "Supply --ssh-key-id or default.verda.ssh_key_id for an existing Verda SSH key",
-        )?;
+        let key = creation_key.context("Creation requires a checked SSH key ID")?;
         let registered = keys::registered_key(&client, key)?;
         let identity = keys::identity(config, &[registered])?;
         let names = client

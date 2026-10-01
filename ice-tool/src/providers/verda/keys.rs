@@ -12,6 +12,32 @@ use super::{Instance, SshKey, client::Client, resource_path};
 use crate::model::IceConfig;
 use crate::ssh_probe::ProbeChild;
 
+/// Reject missing local setup before authentication or catalog discovery. Dry-run
+/// callers deliberately skip this: a quote does not require an SSH identity.
+pub(super) fn creation_key_id(config: &IceConfig) -> Result<&str> {
+    let id = config.default.verda.ssh_key_id.as_deref().filter(|id| !id.trim().is_empty()).ok_or_else(|| {
+        crate::automation::error("ssh_key_required", "Select an existing Verda SSH key with --ssh-key-id or default.verda.ssh_key_id before creating a VM.",
+            json!({"flag":"--ssh-key-id", "config_key":"default.verda.ssh_key_id", "resource_created":false}))
+    })?;
+    if !super::valid_id(id) {
+        return Err(crate::automation::error(
+            "invalid_ssh_key_id",
+            "The Verda SSH key ID must be a full UUID from the provider console.",
+            json!({"flag":"--ssh-key-id", "config_key":"default.verda.ssh_key_id", "resource_created":false}),
+        ));
+    }
+    if let Some(path) = config.default.verda.ssh_key_path.as_deref()
+        && !Path::new(path).is_file()
+    {
+        return Err(crate::automation::error(
+            "ssh_identity_unavailable",
+            "Configured Verda SSH private key path is not an accessible file. Update default.verda.ssh_key_path before creating a VM.",
+            json!({"config_key":"default.verda.ssh_key_path", "resource_created":false}),
+        ));
+    }
+    Ok(id)
+}
+
 fn public_key(value: &str) -> Option<(&str, &str)> {
     let mut fields = value.split_whitespace();
     let kind = fields.next()?;

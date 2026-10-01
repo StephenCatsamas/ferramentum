@@ -1301,15 +1301,8 @@ fn lifecycle_deadline_preserves_identity_and_never_repeats_a_mutation() {
 }
 
 #[test]
-fn already_running_lifecycle_reads_state_without_a_mutation() {
-    let server = Server::new(|request| {
-        if request.path == "/oauth2/token" {
-            token()
-        } else {
-            assert_eq!(request.method, "GET");
-            Reply::json(200, instance("running"))
-        }
-    });
+fn already_running_lifecycle_reuses_the_fresh_lookup_without_another_request() {
+    let server = Server::new(|_| panic!("No additional provider request is needed"));
     let vm: Instance = serde_json::from_value(instance("running")).unwrap();
     let _budget = crate::lifecycle::Budget::enter(Duration::from_secs(2)).unwrap();
     let result = crate::lifecycle::transition::<Provider>(
@@ -1320,12 +1313,5 @@ fn already_running_lifecycle_reads_state_without_a_mutation() {
     .unwrap();
     assert_eq!(result["request"], "not_needed");
     assert_eq!(result["verification"], "read_back");
-    assert_eq!(
-        server
-            .requests()
-            .iter()
-            .filter(|r| r.method == "PUT")
-            .count(),
-        0
-    );
+    assert!(server.requests().is_empty());
 }

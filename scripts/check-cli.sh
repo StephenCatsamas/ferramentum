@@ -27,5 +27,16 @@ awk -v package="$check_package" '
 if [ -f "$check_repo/Cargo.lock" ]; then
     cp "$check_repo/Cargo.lock" "$check_workspace/Cargo.lock"
 fi
+# Preserve the source identity when building Ice from the isolated copy. Ordinary
+# Cargo builds can supply the same metadata explicitly; absent metadata is unknown.
+if [ "$check_package" = ice-tool ]; then
+    unset ICE_BUILD_REVISION ICE_BUILD_DIRTY
+    if check_root=$(git -C "$check_repo" rev-parse --show-toplevel 2>/dev/null) && [ "$check_root" = "$check_repo" ] && check_revision=$(git -C "$check_repo" rev-parse --verify HEAD 2>/dev/null); then
+        export ICE_BUILD_REVISION="$check_revision"
+        if check_changes=$(git -C "$check_repo" status --porcelain --untracked-files=normal -- ice-tool Cargo.toml Cargo.lock scripts/check-cli.sh 2>/dev/null); then
+            if [ -n "$check_changes" ]; then export ICE_BUILD_DIRTY=true; else export ICE_BUILD_DIRTY=false; fi
+        fi
+    fi
+fi
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$check_repo/target/${check_package%-tool}-standalone}"
 cargo "$check_action" --manifest-path "$check_workspace/Cargo.toml" -p "$check_package" "$@"

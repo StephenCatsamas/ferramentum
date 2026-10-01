@@ -328,6 +328,7 @@ fn creation_defaults_are_visible_overridable_and_never_persisted() {
     ]));
     let selection = &value["error"]["details"]["selection"];
     assert_eq!(selection["saved_filters_ignored"], true);
+    assert_eq!(selection["price_scope"], "compute_and_allocated_storage");
     assert!(selection["filters"]["min_cpus"]["value"].is_null());
     assert!(selection["filters"]["gpu_count"]["value"].is_null());
     assert_eq!(selection["filters"]["disk_gb"]["value"], 32);
@@ -867,6 +868,9 @@ fn lifecycle_reports_actual_state_and_distinguishes_noop() {
     let args = |command| [command, "--cloud", "local", "ice-example", "--json"];
     let unchanged = parsed(fixture.run(&args("start")));
     assert_eq!(unchanged["result"]["request"], "not_needed");
+    let reads = fs::read_to_string(fixture.root.path().join("actions")).unwrap();
+    assert_eq!(reads.lines().filter(|line| *line == "ps").count(), 1);
+    assert_eq!(reads.lines().filter(|line| *line == "inspect").count(), 1);
     let stopped = parsed(fixture.run(&args("stop")));
     assert_eq!(stopped["result"]["request"], "acknowledged");
     assert_eq!(stopped["result"]["instance"]["state"], "stopped");
@@ -1730,5 +1734,86 @@ esac
         );
         assert!(!calls.contains("stop-instances"));
         assert!(calls.contains("Name=instance-id,Values=i-test"));
+    }
+}
+
+#[test]
+fn version_is_json_capable_and_independent_of_credentials_tools_and_config() {
+    let fixture = Fixture::new();
+    // Invalid credentials/configuration must not hide the identity of this binary.
+    fixture.config("broken = [ 'secret-placeholder'\n");
+    for args in [
+        vec!["version", "--json"],
+        vec!["--json", "--version"],
+        vec!["--version", "--json"],
+    ] {
+        let value = parsed(fixture.run(&args));
+        assert_eq!(value["command"], "version");
+        assert_eq!(value["cloud"], Value::Null);
+        assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            value["result"]["json_schema_version"],
+            value["schema_version"]
+        );
+        let expected_revision = option_env!("ICE_BUILD_REVISION");
+        assert_eq!(value["result"]["source_revision"], json!(expected_revision));
+        assert!(!value.to_string().contains("secret-placeholder"));
+    }
+    for args in [vec!["version"], vec!["--version"], vec!["-V"]] {
+        let output = fixture.run(&args);
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.starts_with(&format!("ice {} (", env!("CARGO_PKG_VERSION"))));
+        assert!(text.contains("JSON schema 2"));
+        assert!(output.stderr.is_empty());
+    }
+    assert!(!fixture.root.path().join(".ice").exists());
+}
+
+#[test]
+fn verda_creation_reports_local_key_setup_errors_before_credentials_or_catalog_access() {
+    let id = "44444444-4444-4444-8444-444444444444";
+    for (setting, expected) in [
+        ("".to_owned(), "ssh_key_required"),
+        ("ssh_key_id = ''".into(), "ssh_key_required"),
+        ("ssh_key_id = 'invalid'".into(), "invalid_ssh_key_id"),
+        (
+            format!("ssh_key_id = '{id}'\nssh_key_path = '/ice-test-missing-key'"),
+            "ssh_identity_unavailable",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.config(&format!("[default.verda]\n{setting}\n"));
+        let value = failed(fixture.run(&[
+            "create",
+            "--cloud",
+            "verda",
+            "--ssh",
+            "--image",
+            "provider-image",
+            "--max-price-per-hr",
+            "1",
+            "--yes",
+            "--manual-cleanup",
+            "--json",
+        ]));
+        assert_eq!(value["error"]["code"], expected);
+        assert_eq!(value["error"]["details"]["resource_created"], false);
+        let preview = failed(fixture.run(&[
+            "create",
+            "--cloud",
+            "verda",
+            "--ssh",
+            "--image",
+            "provider-image",
+            "--max-price-per-hr",
+            "1",
+            "--dry-run",
+            "--json",
+        ]));
+        assert_eq!(
+            preview["error"]["code"], "missing_credentials",
+            "preview should not require a usable SSH key"
+        );
     }
 }

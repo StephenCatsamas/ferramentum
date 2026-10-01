@@ -144,6 +144,15 @@ pub(crate) fn main() -> ExitCode {
                 .skip(1)
                 .take_while(|arg| arg != "--")
                 .any(|arg| arg == "--json");
+            if json && error.kind() == clap::error::ErrorKind::DisplayVersion {
+                return match crate::version::print(true) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             if json && error.use_stderr() {
                 // Clap can echo supplied values. Do not repeat credentials from
                 // config assignments in an argument-validation error.
@@ -164,6 +173,9 @@ pub(crate) fn main() -> ExitCode {
     let mut cloud = cli.command.cloud(&config);
     let result = (|| {
         crate::automation::validate_command(&cli.command)?;
+        if matches!(cli.command, Commands::Version) {
+            return crate::version::print(cli.json);
+        }
         ensure_runtime_gpu_data_files()?;
         config = load_config()?;
         cloud = cli.command.cloud(&config);
@@ -232,6 +244,7 @@ fn redact_cli_assignments(mut message: String) -> String {
 
 fn run(command: Commands, config: &mut IceConfig) -> Result<()> {
     match command {
+        Commands::Version => crate::version::print(crate::output::is_json()),
         Commands::Catalog(args) => {
             verda::catalog_command(resolve_cloud(args.cloud, config)?, config)
         }

@@ -276,7 +276,9 @@ pub(crate) fn resolve(config: &IceConfig, cloud: Cloud, args: &CreateArgs) -> Re
         if !unsupported.is_empty() {
             return Err(error(
                 "unsupported_filter",
-                format!("These filters are currently supported only on vast.ai, not {cloud}."),
+                format!(
+                    "{cloud} cannot enforce these filters. Remove them or choose a provider that supports them."
+                ),
                 json!({"filters": unsupported, "cloud": cloud}),
             ));
         }
@@ -326,7 +328,7 @@ pub(crate) fn resolve(config: &IceConfig, cloud: Cloud, args: &CreateArgs) -> Re
         "runtime_hours": {"value": runtime_hours, "source": if args.hours.is_some() { "command_line" } else if config.default.runtime_hours.is_some() { "saved_configuration" } else { "built_in" }},
         "machine": args.machine,
         "provider_options": provider_options,
-        "price_scope": if cloud == Cloud::Verda { "compute_and_os_storage" } else if cloud == Cloud::VastAi { "provider_rate" } else { "compute" },
+        "price_scope": if cloud == Cloud::Verda { "compute_and_os_storage" } else if cloud == Cloud::VastAi { "compute_and_allocated_storage" } else { "compute" },
     }));
     crate::provision::build_search_requirements(&effective, cloud)?;
     Ok(effective)

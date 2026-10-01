@@ -10,6 +10,8 @@ use crate::model::{Cloud, CloudMachineCandidate, IceConfig, RuntimeCostEstimate}
 use crate::providers::vast::VastOffer;
 use crate::workload::InstanceWorkload;
 
+pub(crate) const SCHEMA_VERSION: u64 = 2;
+
 // A CLI process handles one command. Output policy is initialized once, before dispatch.
 static JSON: OnceLock<bool> = OnceLock::new();
 static LOG_CONTEXT: OnceLock<(Cloud, String)> = OnceLock::new();
@@ -28,7 +30,7 @@ pub(crate) fn document(command: &str, cloud: impl Into<Option<Cloud>>, mut resul
     {
         result["selection"] = selection;
     }
-    json!({"schema_version": 2, "command": command, "cloud": cloud.into(), "result": result})
+    json!({"schema_version": SCHEMA_VERSION, "command": command, "cloud": cloud.into(), "result": result})
 }
 
 pub(crate) fn write_document(mut writer: impl Write, value: &Value) -> Result<()> {
@@ -50,7 +52,7 @@ pub(crate) fn error(
     write_document(
         io::stdout().lock(),
         &json!({
-            "schema_version": 2, "command": command, "cloud": cloud,
+            "schema_version": SCHEMA_VERSION, "command": command, "cloud": cloud,
             "error": {"code": code, "message": message},
         }),
     )
@@ -328,7 +330,7 @@ pub(crate) fn command_error(
     }
     write_document(
         io::stdout().lock(),
-        &json!({"schema_version": 2, "command": command, "cloud": cloud,
+        &json!({"schema_version": SCHEMA_VERSION, "command": command, "cloud": cloud,
         "error": {"code": typed.map_or("command_failed", |err| err.code), "message": message, "details": details}}),
     )
 }

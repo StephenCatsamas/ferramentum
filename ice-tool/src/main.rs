@@ -23,6 +23,7 @@ mod ssh_probe;
 mod support;
 mod ui;
 mod unpack;
+mod version;
 mod workload;
 
 #[cfg(test)]

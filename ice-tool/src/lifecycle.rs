@@ -163,6 +163,34 @@ pub(crate) fn verified(action: Action, id: String, request: &'static str, start:
     .expect("operation serializes")
 }
 
+fn completed<I: CloudInstance>(
+    cloud: crate::model::Cloud,
+    action: Action,
+    id: String,
+    request: &'static str,
+    start: Instant,
+    instance: Option<&I>,
+) -> Value {
+    let mut result = verified(action, id, request, start);
+    result["instance"] = instance.map_or(Value::Null, |i| i.json_summary());
+    result["storage"] =
+        json!({"verification":"unknown","deleted_volume_ids":null,"retained_volume_ids":null});
+    if action == Action::Stop {
+        result["billing_note"] = json!(if cloud == crate::model::Cloud::Verda {
+            "Verda shutdown retains compute and storage billing."
+        } else {
+            "Stopped state does not verify storage cleanup or the end of all charges."
+        });
+    }
+    if action == Action::Delete {
+        result["billing_note"] = json!(
+            "Instance removal is verified; storage cleanup and the end of all charges are not verified."
+        );
+    }
+    result
+}
+
+/// `instance` must come from this invocation's fresh resolve_instance lookup.
 pub(crate) fn transition<P: CloudProvider>(
     context: &P::ProviderContext<'_>,
     instance: &P::Instance,
@@ -177,58 +205,58 @@ pub(crate) fn transition<P: CloudProvider>(
         "outcome":"unverified","mutation_retried":false,"reconcile_before_retry":true,
         "next_command":format!("ice list --cloud {} --json",P::CLOUD)});
     recovery("changing_state", details.clone());
-    let mut request = "not_needed";
-    if !action.reached(P::CLOUD, Some(instance)) {
-        remaining_timeout(Duration::from_secs(30))?;
-        // Mark the request as uncertain before issuing it, including cancellation.
-        details["request"] = json!("unconfirmed");
-        recovery("changing_state", details.clone());
-        let result = match action {
-            Action::Start => P::set_running(context, instance, true),
-            Action::Stop => P::set_running(context, instance, false),
-            Action::Delete => P::delete_instance(context, instance),
-        };
-        request = if result.is_ok() {
-            "acknowledged"
-        } else {
-            "unconfirmed"
-        };
-        if let Err(err) = result {
-            if capulus::error_is_cancelled(&err) {
-                return Err(err);
-            }
-            details["request_error_code"] = json!(
-                err.downcast_ref::<crate::automation::AgentError>()
-                    .map(|e| e.code)
-                    .unwrap_or("provider_error")
-            );
+    let cancellation = capulus::Cancellation::install()?;
+    cancellation.check()?;
+    remaining_timeout(Duration::from_secs(30))?;
+    if action.reached(P::CLOUD, Some(instance)) {
+        return Ok(completed(
+            P::CLOUD,
+            action,
+            id,
+            "not_needed",
+            start,
+            Some(instance),
+        ));
+    }
+    // Mark the request as uncertain before issuing it, including cancellation.
+    details["request"] = json!("unconfirmed");
+    recovery("changing_state", details.clone());
+    let result = match action {
+        Action::Start => P::set_running(context, instance, true),
+        Action::Stop => P::set_running(context, instance, false),
+        Action::Delete => P::delete_instance(context, instance),
+    };
+    let request = if result.is_ok() {
+        "acknowledged"
+    } else {
+        "unconfirmed"
+    };
+    if let Err(err) = result {
+        if capulus::error_is_cancelled(&err) {
+            return Err(err);
         }
+        details["request_error_code"] = json!(
+            err.downcast_ref::<crate::automation::AgentError>()
+                .map(|e| e.code)
+                .unwrap_or("provider_error")
+        );
     }
     details["request"] = json!(request);
     recovery("verifying_state", details.clone());
-    let cancellation = capulus::Cancellation::install()?;
     loop {
         cancellation.check()?;
         let observed = remaining_timeout(Duration::from_secs(30))
             .and_then(|_| P::observe_instance(context, instance));
         match observed {
             Ok(observed) if action.reached(P::CLOUD, observed.as_ref()) => {
-                let mut result = verified(action, id, request, start);
-                result["instance"] = observed.as_ref().map_or(Value::Null, |i| i.json_summary());
-                result["storage"] = json!({"verification":"unknown","deleted_volume_ids":null,"retained_volume_ids":null});
-                if action == Action::Stop {
-                    result["billing_note"] = json!(if P::CLOUD == crate::model::Cloud::Verda {
-                        "Verda shutdown retains compute and storage billing."
-                    } else {
-                        "Stopped state does not verify storage cleanup or the end of all charges."
-                    });
-                }
-                if action == Action::Delete {
-                    result["billing_note"] = json!(
-                        "Instance removal is verified; storage cleanup and the end of all charges are not verified."
-                    );
-                }
-                return Ok(result);
+                return Ok(completed(
+                    P::CLOUD,
+                    action,
+                    id,
+                    request,
+                    start,
+                    observed.as_ref(),
+                ));
             }
             Ok(observed) => {
                 details["observed_state"] = json!(observed.as_ref().map(|i| i.state_value()));

@@ -95,6 +95,8 @@ pub(crate) trait CloudProvider: Sized {
         on_progress: &mut dyn FnMut(String),
     ) -> Result<Vec<Self::Instance>>;
     fn sort_instances(instances: &mut [Self::Instance]);
+    /// Resolve from a fresh provider observation. A cached identifier may locate
+    /// the resource, but cached state must never satisfy a lifecycle operation.
     fn resolve_instance(
         context: &Self::ProviderContext<'_>,
         identifier: &str,

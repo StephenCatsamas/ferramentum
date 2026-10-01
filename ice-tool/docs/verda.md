@@ -55,6 +55,13 @@ ice config set default.verda.ssh_key_id=YOUR_REGISTERED_KEY_UUID
 ice config set default.verda.ssh_key_path=/absolute/path/to/private-key
 ```
 
+Actual creation checks for a missing/invalid SSH key UUID and an unavailable
+configured private-key file before authenticating or discovering offers. Errors
+identify the flag/config key and report `resource_created: false`. A dry-run
+quote does not require an SSH key or local private key; authenticated catalog
+access is still required. Matching the registered public key to a usable local
+identity remains a required check before a billable create request.
+
 Without a configured path, Ice searches local key pairs and then ssh-agent for a
 matching key, rather than picking the first unrelated local identity. Local
 checks have a ten-second budget. Keep `ssh-keygen` available; encrypted/hardware
