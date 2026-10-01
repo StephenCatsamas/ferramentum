@@ -70,6 +70,14 @@ or a matching agent-only identity when no path is configured. An explicit wrong
 key path fails instead of silently selecting another key. Existing VM connection
 and transfer commands use the VM's registered key IDs when available.
 
+Key-detail lookup accepts a bare object or a singleton array from
+`GET /ssh-keys/<id>`. Empty/multiple records, a different ID, malformed metadata
+or an unusable public key fail validation. Ice still requires a matching local
+or agent identity. Creation errors at this step include
+`stage: "ssh_key_preflight"`, the endpoint, `instance_request_sent: false` and
+`resource_created: false`, without returning key material. A successful dry-run
+quotes the rental; it does not validate this real-create SSH-key path.
+
 SSH uses root, batch authentication and `StrictHostKeyChecking=accept-new`.
 The local OpenSSH availability check uses `ssh -V` (not `--version`).
 Readiness uses the same bounded authentication probe as Vast. Connection refusal,

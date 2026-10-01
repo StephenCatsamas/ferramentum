@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{Instance, SshKey, client::Client, resource_path};
 use crate::model::IceConfig;
@@ -209,12 +209,64 @@ pub(super) fn identity(config: &IceConfig, registered: &[SshKey]) -> Result<Opti
 }
 
 pub(super) fn registered_key(client: &Client, id: &str) -> Result<SshKey> {
-    let key: SshKey = client.get(&resource_path("ssh-keys", id)?, Duration::from_secs(30))?;
-    anyhow::ensure!(
-        key.id == id,
-        "Verda returned a different SSH key than requested"
-    );
+    let endpoint = resource_path("ssh-keys", id)?;
+    let response: Value = client.get(&endpoint, Duration::from_secs(30))?;
+    let invalid = |reason: &str| {
+        crate::automation::error(
+            "verda_ssh_key_response_invalid",
+            "Verda returned invalid registered SSH key details. Expected one usable key with the requested ID; inspect the selected key in the provider console.",
+            json!({"stage":"ssh_key_lookup", "method":"GET", "endpoint":endpoint,
+                "ssh_key_id":id, "reason":reason, "key_changed":false}),
+        )
+    };
+    // The live detail endpoint returns a singleton array. Also accept the bare
+    // object used by earlier responses, without treating this as a key listing.
+    let record = match response {
+        Value::Object(_) => response,
+        Value::Array(mut records) if records.len() == 1 => records.remove(0),
+        Value::Array(_) => return Err(invalid("unexpected_key_count")),
+        _ => return Err(invalid("invalid_schema")),
+    };
+    if !record.is_object() {
+        return Err(invalid("invalid_schema"));
+    }
+    // Do not include deserialization errors or response values: a malformed
+    // field can contain public-key material or other provider metadata.
+    let key: SshKey = serde_json::from_value(record).map_err(|_| invalid("invalid_schema"))?;
+    if key.id != id {
+        return Err(invalid("id_mismatch"));
+    }
+    if key.key.as_deref().and_then(public_key).is_none() {
+        return Err(invalid("unusable_public_key"));
+    }
     Ok(key)
+}
+
+pub(super) fn creation_identity(
+    client: &Client,
+    config: &IceConfig,
+    id: &str,
+) -> Result<Option<PathBuf>> {
+    let result = registered_key(client, id).and_then(|key| identity(config, &[key]));
+    result.map_err(|err| {
+        if capulus::error_is_cancelled(&err) {
+            return err;
+        }
+        let cause = err.downcast_ref::<crate::automation::AgentError>();
+        let mut details = cause.map_or_else(|| json!({}), |cause| cause.details.clone());
+        details["stage"] = json!("ssh_key_preflight");
+        details["method"] = json!("GET");
+        details["endpoint"] = json!(resource_path("ssh-keys", id).ok());
+        details["ssh_key_id"] = json!(id);
+        details["resource_created"] = json!(false);
+        details["instance_request_sent"] = json!(false);
+        details["key_changed"] = json!(false);
+        crate::automation::error(
+            cause.map_or("ssh_key_preflight_failed", |cause| cause.code),
+            format!("Verda SSH key preflight failed before VM creation: {err}"),
+            details,
+        )
+    })
 }
 
 pub(super) fn instance_identity(
