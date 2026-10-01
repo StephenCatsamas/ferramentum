@@ -18,6 +18,7 @@ mod providers;
 mod provision;
 mod remote;
 mod selection;
+mod ssh_probe;
 mod support;
 mod ui;
 mod unpack;

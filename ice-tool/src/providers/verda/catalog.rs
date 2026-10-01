@@ -72,6 +72,7 @@ pub(super) struct Catalog {
 #[derive(Debug, Clone, Serialize)]
 pub(super) struct Offer {
     pub machine: Machine,
+    pub gpu_memory_per_gpu_gb: f64,
     pub location: String,
     pub image: Image,
     pub allocated_disk_gb: u32,
@@ -98,16 +99,29 @@ pub(super) fn image_version(image: &Image) -> Option<(u32, u32, u32, u32)> {
         || confidential(&image.category)
         || confidential(&image.image_type)
         || confidential(&image.name)
+        || [&image.category, &image.image_type, &image.name]
+            .iter()
+            .any(|value| {
+                let value = value.to_ascii_lowercase();
+                value.contains("cluster") || value.contains("kubernetes")
+            })
     {
         return None;
     }
-    let (ubuntu, cuda) = image
-        .image_type
-        .strip_prefix("ubuntu-")?
-        .split_once("-cuda-")?;
+    // Current catalog uses 26.04.cuda13.2[.docker]; older entries use
+    // ubuntu-24.04-cuda-12.9-open. Preserve both forms without treating every
+    // image containing a version number as a supported Ubuntu/CUDA image.
+    let (ubuntu, cuda) = if let Some(legacy) = image.image_type.strip_prefix("ubuntu-") {
+        legacy.split_once("-cuda-")?
+    } else {
+        image.image_type.split_once(".cuda")?
+    };
     let mut ubuntu = ubuntu.split('.');
     let ubuntu_major = ubuntu.next()?.parse::<u32>().ok()?;
     let ubuntu_minor = ubuntu.next()?.parse::<u32>().ok()?;
+    if ubuntu.next().is_some() {
+        return None;
+    }
     let mut cuda = cuda.split('-').next()?.split('.');
     let major = cuda.next()?.parse::<u32>().ok()?;
     let minor = cuda.next()?.parse::<u32>().ok()?;
@@ -148,14 +162,22 @@ impl Catalog {
         // Same conversion and rounding as Verda CLI's VolumeHourlyPrice.
         let storage_hourly_usd = (monthly * f64::from(disk) / 730.0 * 10_000.0).ceil() / 10_000.0;
         let mut offers = Vec::new();
+        let mut resource_rejections = 0_u32;
+        let mut image_rejections = 0_u32;
+        let mut availability_rejections = 0_u32;
         for machine in &self.machines {
             let Some(compute_hourly_usd) = price(&machine.price_per_hour) else {
+                resource_rejections += 1;
                 continue;
             };
             let gpu_count = machine.gpu.number_of_gpus;
+            // Verda reports aggregate VRAM (e.g. 96 GB for two 48 GB Ada GPUs).
+            let per_gpu_memory = machine.gpu_memory.size_in_gigabytes / f64::from(gpu_count);
             let hourly_usd = compute_hourly_usd + storage_hourly_usd;
             if !machine.manufacturer.eq_ignore_ascii_case("nvidia")
                 || gpu_count == 0
+                || !per_gpu_memory.is_finite()
+                || per_gpu_memory <= 0.0
                 || !machine.currency.eq_ignore_ascii_case("usd")
                 || !machine.instance_type.ends_with('V')
                 || confidential(&machine.instance_type)
@@ -168,10 +190,9 @@ impl Catalog {
                 || requirements
                     .gpu_count
                     .is_some_and(|count| count != gpu_count)
-                || requirements.min_gpu_memory_gb.is_some_and(|size| {
-                    !machine.gpu_memory.size_in_gigabytes.is_finite()
-                        || machine.gpu_memory.size_in_gigabytes < size
-                })
+                || requirements
+                    .min_gpu_memory_gb
+                    .is_some_and(|size| per_gpu_memory < size)
                 || (!requirements.allowed_gpus.is_empty()
                     && !requirements.allowed_gpus.iter().any(|gpu| {
                         gpu.eq_ignore_ascii_case(&machine.model)
@@ -180,6 +201,7 @@ impl Catalog {
                 || !hourly_usd.is_finite()
                 || hourly_usd > requirements.max_price_per_hr
             {
+                resource_rejections += 1;
                 continue;
             }
             let image =
@@ -195,8 +217,18 @@ impl Catalog {
                                 wanted == &image.image_type || wanted == &image.id
                             })
                     })
-                    .max_by_key(|image| (image_version(image), &image.image_type));
-            let Some(image) = image else { continue };
+                    .max_by_key(|image| {
+                        (
+                            image_version(image),
+                            !image.image_type.contains("docker"),
+                            &image.image_type,
+                        )
+                    });
+            let Some(image) = image else {
+                image_rejections += 1;
+                continue;
+            };
+            let mut available = false;
             for location in &self.availability {
                 if defaults
                     .location
@@ -208,6 +240,7 @@ impl Catalog {
                 }
                 offers.push(Offer {
                     machine: machine.clone(),
+                    gpu_memory_per_gpu_gb: per_gpu_memory,
                     image: image.clone(),
                     location: location.location_code.clone(),
                     allocated_disk_gb: disk,
@@ -216,6 +249,10 @@ impl Catalog {
                     hourly_usd,
                     cost_scope: "compute_and_os_storage",
                 });
+                available = true;
+            }
+            if !available {
+                availability_rejections += 1;
             }
         }
         offers.sort_by(|a, b| {
@@ -226,6 +263,7 @@ impl Catalog {
         });
         offers.into_iter().next().ok_or_else(|| crate::automation::error("no_matching_offers",
             "No available ordinary NVIDIA GPU VM matches the filters, current Ubuntu 24/26 CUDA 12.9+ image compatibility and compute-plus-OS-storage price ceiling.",
-            json!({"max_price_per_hr": requirements.max_price_per_hr, "allocated_disk_gb": disk, "cost_scope":"compute_and_os_storage", "profiling_access":"unverified"})))
+            json!({"max_price_per_hr": requirements.max_price_per_hr, "allocated_disk_gb": disk, "cost_scope":"compute_and_os_storage", "profiling_access":"unverified",
+                "rejected_machines":{"resources_or_price":resource_rejections,"compatible_image":image_rejections,"availability_or_location":availability_rejections}})))
     }
 }

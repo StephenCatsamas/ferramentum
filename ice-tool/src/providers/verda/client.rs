@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::automation::error;
+use crate::http_retry::{BackoffPolicy, retry_after_delay};
 use crate::model::IceConfig;
 use crate::support::nonempty_string;
 
@@ -63,6 +64,7 @@ pub(crate) struct Client {
     client_id: String,
     client_secret: String,
     token: Mutex<Option<Token>>,
+    retry_policy: BackoffPolicy,
 }
 
 pub(super) fn missing(message: &str) -> anyhow::Error {
@@ -100,12 +102,16 @@ impl Client {
             client_id,
             client_secret,
             token: Mutex::new(None),
+            retry_policy: BackoffPolicy::default(),
         })
     }
 
     #[cfg(test)]
     pub(super) fn mock(base: &str) -> Result<Self> {
-        Self::new(base, "test-client".into(), "test-secret".into())
+        let mut client = Self::new(base, "test-client".into(), "test-secret".into())?;
+        client.retry_policy.initial_delay = Duration::from_millis(1);
+        client.retry_policy.max_delay = Duration::from_millis(2);
+        Ok(client)
     }
 
     fn remaining(deadline: Instant) -> Result<Duration> {
@@ -154,6 +160,28 @@ impl Client {
         self.token(Instant::now() + TIMEOUT).map(|_| ())
     }
 
+    fn wait_for_retry(
+        &self,
+        path: &str,
+        attempt: u32,
+        retry_after: Option<Duration>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let delay = retry_after.unwrap_or_else(|| self.retry_policy.delay_for_retry(attempt - 1));
+        // Never cap a provider Retry-After to an earlier time. If it cannot fit
+        // inside the caller's budget, stop without sending another request.
+        if delay >= deadline.saturating_duration_since(Instant::now()) {
+            return Err(error(
+                "verda_retry_deadline",
+                "Verda read retry would exceed the request deadline; try again later.",
+                json!({"path":path, "attempts":attempt, "retry_after_seconds":delay.as_secs_f64(), "mutation_retried":false}),
+            ));
+        }
+        let cancellation = capulus::Cancellation::install()?;
+        cancellation.sleep(delay)?;
+        Ok(())
+    }
+
     fn request(
         &self,
         method: Method,
@@ -162,7 +190,14 @@ impl Client {
         timeout: Duration,
     ) -> Result<(Value, Option<usize>)> {
         let deadline = Instant::now() + timeout;
-        for attempt in 0..2 {
+        let read = method == Method::GET;
+        let max_attempts = if read {
+            self.retry_policy.max_attempts.max(1)
+        } else {
+            1
+        };
+        let mut refreshed = false;
+        for attempt in 1..=max_attempts {
             let token = self.token(deadline)?;
             let mut request = self
                 .http
@@ -172,14 +207,46 @@ impl Client {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request.send().map_err(|_| error("verda_request_failed",
-                format!("Verda {method} request failed; mutation outcome may be unknown. Reconcile resources before retrying."), json!({"path": path, "mutation_retried": false})))?;
+            let response = match request.send() {
+                Ok(response) => response,
+                Err(err) => {
+                    if read
+                        && attempt < max_attempts
+                        && (err.is_connect() || err.is_timeout() || err.is_body())
+                    {
+                        self.wait_for_retry(path, attempt, None, deadline)?;
+                        continue;
+                    }
+                    return Err(error(
+                        "verda_request_failed",
+                        if read {
+                            "Verda read request failed; check connectivity and try again."
+                                .to_owned()
+                        } else {
+                            format!(
+                                "Verda {method} request failed; mutation outcome may be unknown. Reconcile resources before retrying."
+                            )
+                        },
+                        json!({"path":path, "attempts":attempt, "mutation_retried":false}),
+                    ));
+                }
+            };
             let status = response.status();
-            if status == StatusCode::UNAUTHORIZED && method == Method::GET && attempt == 0 {
+            if status == StatusCode::UNAUTHORIZED && read && !refreshed && attempt < max_attempts {
                 *self
                     .token
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Verda token lock failed"))? = None;
+                refreshed = true;
+                continue;
+            }
+            let retry_after = retry_after_delay(&response);
+            if read
+                && attempt < max_attempts
+                && matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+            {
+                drop(response);
+                self.wait_for_retry(path, attempt, retry_after, deadline)?;
                 continue;
             }
             if !status.is_success() {
@@ -193,7 +260,7 @@ impl Client {
                     format!(
                         "Verda {method} returned HTTP {status}; check capacity, quota, credentials and the selected resource."
                     ),
-                    json!({"http_status": status.as_u16(), "path": path, "mutation_retried": false}),
+                    json!({"http_status": status.as_u16(), "path": path, "attempts":attempt, "retry_after_seconds":retry_after.map(|delay| delay.as_secs_f64()), "mutation_retried": false}),
                 ));
             }
             let total = response
@@ -207,14 +274,32 @@ impl Client {
                         .context("Invalid Verda pagination header")
                 })
                 .transpose()?;
-            let text = response
-                .text()
-                .context("Unable to read Verda response; reconcile a mutation before retrying")?;
+            let text = match response.text() {
+                Ok(text) => text,
+                Err(_) if read && attempt < max_attempts => {
+                    self.wait_for_retry(path, attempt, None, deadline)?;
+                    continue;
+                }
+                Err(_) => {
+                    return Err(error(
+                        "verda_response_unreadable",
+                        if read {
+                            "Unable to read Verda response; try again later."
+                        } else {
+                            "Unable to read Verda response; reconcile the mutation before retrying."
+                        },
+                        json!({"path":path,"attempts":attempt,"mutation_retried":false}),
+                    ));
+                }
+            };
             let value = if text.trim().is_empty() {
                 Value::Null
             } else {
-                serde_json::from_str(&text)
-                    .context("Invalid Verda JSON; reconcile a mutation before retrying")?
+                serde_json::from_str(&text).context(if read {
+                    "Invalid Verda JSON in read response"
+                } else {
+                    "Invalid Verda JSON; reconcile a mutation before retrying"
+                })?
             };
             return Ok((value, total));
         }
