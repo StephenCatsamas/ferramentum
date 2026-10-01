@@ -41,6 +41,7 @@ impl Reply {
     }
 }
 struct Server {
+    endpoint: String,
     client: Client,
     requests: Arc<Mutex<Vec<Request>>>,
     stop: Arc<AtomicBool>,
@@ -50,7 +51,8 @@ impl Server {
     fn new(handler: impl Fn(&Request) -> Reply + Send + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let client = Client::mock(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let client = Client::mock(&endpoint).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = requests.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -127,6 +129,7 @@ impl Server {
             }
         });
         Self {
+            endpoint,
             client,
             requests,
             stop,
@@ -203,6 +206,258 @@ fn offer() -> Offer {
     catalog()
         .select(&requirements(), &image_defaults(), None)
         .unwrap()
+}
+
+fn ssh_key_record() -> Value {
+    // Field names/types match the sanitized 2026-10-01 live detail response.
+    // All values are synthetic; no account key or fingerprint is retained.
+    json!({"id":KEY, "name":"fixture", "key":"ssh-ed25519 AAAAFixture key-comment",
+        "fingerprint":"fixture-fingerprint", "created_by_user_id":"fixture-user"})
+}
+
+#[test]
+fn registered_key_accepts_object_and_observed_singleton_array() {
+    for response in [ssh_key_record(), json!([ssh_key_record()])] {
+        let server = Server::new(move |request| {
+            if request.path == "/oauth2/token" {
+                return token();
+            }
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, format!("/ssh-keys/{KEY}"));
+            Reply::json(200, response.clone())
+        });
+        let key = keys::registered_key(&server.client, KEY).unwrap();
+        assert_eq!(key.id, KEY);
+        assert_eq!(key.key.as_deref(), ssh_key_record()["key"].as_str());
+        assert_eq!(server.requests().len(), 2);
+    }
+}
+
+fn invalid_key_responses() -> Vec<(Value, &'static str)> {
+    vec![
+        (json!([]), "unexpected_key_count"),
+        (
+            json!([ssh_key_record(), ssh_key_record()]),
+            "unexpected_key_count",
+        ),
+        (
+            json!({"id":ID,"key":"ssh-ed25519 AAAAFixture"}),
+            "id_mismatch",
+        ),
+        (
+            json!([{ "id":ID,"key":"ssh-ed25519 AAAAFixture"}]),
+            "id_mismatch",
+        ),
+        (json!([null]), "invalid_schema"),
+        (json!([[KEY, "ssh-ed25519 AAAAFixture"]]), "invalid_schema"),
+        (
+            json!({"id":KEY,"key":{"private":"response-secret"}}),
+            "invalid_schema",
+        ),
+        (json!({"id":77,"key":"response-secret"}), "invalid_schema"),
+        (json!({"key":"response-secret"}), "invalid_schema"),
+        (json!("response-secret"), "invalid_schema"),
+        (Value::Null, "invalid_schema"),
+        (json!({"id":KEY}), "unusable_public_key"),
+        (json!({"id":KEY,"key":null}), "unusable_public_key"),
+        (json!({"id":KEY,"key":""}), "unusable_public_key"),
+        (json!({"id":KEY,"key":"ssh-ed25519"}), "unusable_public_key"),
+        (
+            json!({"id":KEY,"key":"response-secret"}),
+            "unusable_public_key",
+        ),
+    ]
+}
+
+#[test]
+fn registered_key_rejects_ambiguous_malformed_and_wrong_identity_responses() {
+    for (response, reason) in invalid_key_responses() {
+        let server = Server::new(move |request| {
+            if request.path == "/oauth2/token" {
+                return token();
+            }
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.path, format!("/ssh-keys/{KEY}"));
+            Reply::json(200, response.clone())
+        });
+        let error = keys::registered_key(&server.client, KEY).err().unwrap();
+        let structured = error
+            .downcast_ref::<crate::automation::AgentError>()
+            .unwrap();
+        assert_eq!(structured.code, "verda_ssh_key_response_invalid");
+        assert_eq!(structured.details["reason"], reason);
+        assert_eq!(structured.details["endpoint"], format!("/ssh-keys/{KEY}"));
+        assert_eq!(structured.details["stage"], "ssh_key_lookup");
+        let diagnostic = format!("{error:#} {}", structured.details);
+        for secret in [
+            "response-secret",
+            "AAAAFixture",
+            "fixture-fingerprint",
+            "fixture-user",
+        ] {
+            assert!(!diagnostic.contains(secret));
+        }
+        assert_eq!(server.requests().len(), 2);
+    }
+}
+
+fn creation_fixture() -> (IceConfig, CreateArgs) {
+    use clap::Parser;
+    let cli = crate::cli::Cli::try_parse_from([
+        "ice",
+        "create",
+        "--cloud",
+        "verda",
+        "--ssh",
+        "--yes",
+        "--manual-cleanup",
+    ])
+    .unwrap();
+    let crate::cli::Commands::Create(args) = cli.command else {
+        unreachable!()
+    };
+    let mut config = IceConfig::default();
+    config.default.verda.image = Some(EXTRA.into());
+    config.default.verda.ssh_key_id = Some(KEY.into());
+    config.default.verda.max_price_per_hr = Some(0.7);
+    (config, *args)
+}
+
+fn creation_catalog_reply(request: &Request) -> Reply {
+    if request.path == "/oauth2/token" {
+        return token();
+    }
+    let data = serde_json::to_value(catalog()).unwrap();
+    let field = if request.path.starts_with("/instance-types?") {
+        "machines"
+    } else if request.path.starts_with("/instance-availability?") {
+        "availability"
+    } else if request.path.starts_with("/volume-types?") {
+        "volume_types"
+    } else if request.path.starts_with("/images?") {
+        "images"
+    } else {
+        return Reply::json(404, json!({}));
+    };
+    Reply::json(200, data[field].clone())
+}
+
+#[test]
+fn create_key_preflight_reports_stage_and_never_posts_an_instance_on_failure() {
+    let mut replies: Vec<Reply> = invalid_key_responses()
+        .into_iter()
+        .map(|(value, _)| Reply::json(200, value))
+        .collect();
+    replies.push(Reply::raw(200, "invalid-json-response-secret"));
+    replies.push(Reply::json(403, json!({"message":"response-secret"})));
+    for reply in replies {
+        let server = Server::new(move |request| {
+            if request.path == format!("/ssh-keys/{KEY}") {
+                return Reply {
+                    status: reply.status,
+                    body: reply.body.clone(),
+                    raw_body: reply.raw_body.clone(),
+                    headers: String::new(),
+                };
+            }
+            creation_catalog_reply(request)
+        });
+        let (mut config, args) = creation_fixture();
+        let error =
+            Provider::create_with_client(&mut config, &args, |_| Client::mock(&server.endpoint))
+                .unwrap_err();
+        let structured = error
+            .downcast_ref::<crate::automation::AgentError>()
+            .unwrap();
+        assert_eq!(structured.details["stage"], "ssh_key_preflight");
+        assert_eq!(structured.details["endpoint"], format!("/ssh-keys/{KEY}"));
+        assert_eq!(structured.details["resource_created"], false);
+        assert_eq!(structured.details["instance_request_sent"], false);
+        assert_eq!(structured.details["key_changed"], false);
+        assert!(!format!("{error:#} {}", structured.details).contains("response-secret"));
+        let requests = server.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.path == format!("/ssh-keys/{KEY}"))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.method == "GET" || r.path == "/oauth2/token")
+        );
+        assert!(!requests.iter().any(|r| r.path.starts_with("/instances")));
+    }
+}
+
+#[test]
+fn dry_run_quotes_without_calling_the_registered_key_endpoint() {
+    let server = Server::new(creation_catalog_reply);
+    let (mut config, mut args) = creation_fixture();
+    args.dry_run = true;
+    Provider::create_with_client(&mut config, &args, |_| Client::mock(&server.endpoint)).unwrap();
+    assert!(
+        server
+            .requests()
+            .iter()
+            .all(|r| !r.path.starts_with("/ssh-keys") && !r.path.starts_with("/instances"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn create_with_singleton_key_requires_matching_local_identity_before_instance_post() {
+    let root = tempfile::tempdir().unwrap();
+    let private = root.path().join("identity");
+    let generated = std::process::Command::new("ssh-keygen")
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "fixture", "-f"])
+        .arg(&private)
+        .output()
+        .expect("SSH creation regression requires ssh-keygen");
+    assert!(generated.status.success());
+    let public = std::fs::read_to_string(private.with_extension("pub")).unwrap();
+    for matching in [true, false] {
+        let mut key = ssh_key_record();
+        if matching {
+            key["key"] = json!(public);
+        }
+        let server = Server::new(move |request| {
+            if request.path == format!("/ssh-keys/{KEY}") {
+                return Reply::json(200, json!([key]));
+            }
+            if request.method == "GET" && request.path.starts_with("/instances?") {
+                return Reply::json(200, json!([]));
+            }
+            if request.method == "POST" && request.path == "/instances" {
+                assert_eq!(request.body["ssh_key_ids"], json!([KEY]));
+                // Stop at the mocked create receipt; no SSH or startup follows.
+                return Reply::json(200, json!({"unusable_receipt":true}));
+            }
+            creation_catalog_reply(request)
+        });
+        let (mut config, args) = creation_fixture();
+        config.default.verda.ssh_key_path = Some(private.to_str().unwrap().into());
+        let error =
+            Provider::create_with_client(&mut config, &args, |_| Client::mock(&server.endpoint))
+                .unwrap_err();
+        let structured = error
+            .downcast_ref::<crate::automation::AgentError>()
+            .unwrap();
+        let posts = server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "POST" && r.path == "/instances")
+            .count();
+        if matching {
+            assert_eq!(structured.code, "creation_outcome_unknown");
+            assert_eq!(posts, 1);
+        } else {
+            assert_eq!(structured.code, "ssh_key_mismatch");
+            assert_eq!(structured.details["stage"], "ssh_key_preflight");
+            assert_eq!(structured.details["instance_request_sent"], false);
+            assert_eq!(posts, 0);
+        }
+    }
 }
 
 #[test]
