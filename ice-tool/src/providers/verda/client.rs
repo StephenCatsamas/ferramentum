@@ -294,6 +294,11 @@ impl Client {
             };
             let value = if text.trim().is_empty() {
                 Value::Null
+            } else if method == Method::POST && path == "/instances" && super::valid_id(text.trim())
+            {
+                // Verda deploy receipts may be plain UUID text. Do not broaden
+                // this exception to reads or unrelated mutation responses.
+                Value::String(text.trim().to_owned())
             } else {
                 serde_json::from_str(&text).context(if read {
                     "Invalid Verda JSON in read response"

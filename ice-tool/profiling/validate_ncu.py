@@ -18,28 +18,39 @@ def numeric_counters(text: str) -> dict[str, float]:
     if "ERR_" in text or "==ERROR==" in text:
         raise ValueError("NCU reported an error while importing counters")
     rows = list(csv.reader(io.StringIO(text)))
-    required = {"ID", "Kernel Name", "Metric Name", "Metric Value", "Device"}
-    header_index = next((i for i, row in enumerate(rows) if required.issubset(row)), None)
+    identity = {"ID", "Kernel Name", "Device"}
+    long_metrics = {"Metric Name", "Metric Value"}
+    header_index = next((i for i, row in enumerate(rows) if identity.issubset(row)
+                         and (long_metrics.issubset(row) or set(METRICS).issubset(row))), None)
     if header_index is None:
         raise ValueError("No NCU raw metric table")
     header = rows[header_index]
+    if len(set(header)) != len(header):
+        raise ValueError("Duplicate NCU table columns")
+    long_format = long_metrics.issubset(header)
     captures: dict[tuple[str, str], dict[str, float]] = {}
     for row in rows[header_index + 1:]:
         if len(row) != len(header):
+            if any("counter_probe" in cell for cell in row):
+                raise ValueError("Malformed checked kernel row")
             continue
         entry = dict(zip(header, row))
         if "counter_probe(" not in entry["Kernel Name"] and entry["Kernel Name"] != "counter_probe":
             continue
-        metric = entry["Metric Name"]
-        if metric not in METRICS:
-            continue
-        number = float(entry["Metric Value"].replace(",", ""))
-        if not math.isfinite(number) or number <= 0:
-            raise ValueError(f"Nonpositive or invalid counter: {metric}")
-        capture = captures.setdefault((entry["ID"], entry["Device"]), {})
-        if metric in capture:
-            raise ValueError("Duplicate counter; expected one kernel capture")
-        capture[metric] = number
+        if not entry["ID"].strip() or not entry["Device"].strip():
+            raise ValueError("Kernel capture or device identity missing")
+        metrics = ([(entry["Metric Name"], entry["Metric Value"])] if long_format
+                   else [(metric, entry[metric]) for metric in METRICS])
+        for metric, value in metrics:
+            if metric not in METRICS:
+                continue
+            number = float(value.replace(",", ""))
+            if not math.isfinite(number) or number <= 0:
+                raise ValueError(f"Nonpositive or invalid counter: {metric}")
+            capture = captures.setdefault((entry["ID"], entry["Device"]), {})
+            if metric in capture:
+                raise ValueError("Duplicate counter; expected one kernel capture")
+            capture[metric] = number
     if len(captures) != 1:
         raise ValueError("Expected one checked kernel capture on one device")
     counters = next(iter(captures.values()))
