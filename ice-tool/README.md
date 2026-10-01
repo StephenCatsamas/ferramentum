@@ -349,14 +349,14 @@ Behavior:
   `default.runtime_hours` and otherwise falls back to `1.0`.
 - `--custom` prompts for search filters on marketplace-backed clouds.
 - `--no-gpu` clears saved GPU models; it does not require CPU-only hardware.
-- `--gpu-count COUNT` requests an exact GPU count. Positive counts are initially
-  supported on Vast; zero explicitly requires a CPU-only candidate on any remote
-  provider. Zero conflicts with GPU model/memory requirements.
-- `--min-gpu-memory-gb GB` requires memory per card, not summed across GPUs (Vast).
+- `--gpu-count COUNT` requests an exact GPU count. Positive counts are supported
+  on Vast/Verda; zero explicitly requires a CPU-only candidate on Vast/GCP/AWS.
+  Verda currently requires a GPU VM. Zero conflicts with GPU model/memory requirements.
+- `--min-gpu-memory-gb GB` requires memory per card, not summed across GPUs (Vast/Verda).
 - `--min-download-mbps MBPS` and `--min-upload-mbps MBPS` constrain reported
   internet bandwidth at the rented host (Vast). They cannot guarantee throughput
   from a particular image registry. Missing measurements cannot satisfy a filter.
-- `--disk-gb GB` requests allocation on Vast/GCP/AWS. Provider disk units and
+- `--disk-gb GB` requests allocation on Vast/Verda/GCP/AWS. Provider disk units and
   rounding apply. Vast search pricing uses the same allocation as creation.
 - GPU memory uses Vast's reported GB convention (API memory / 1000), consistent
   with its official CLI. Network units are megabits per second. JSON offers expose

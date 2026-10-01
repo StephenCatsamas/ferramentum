@@ -22,6 +22,7 @@ struct Reply {
     status: u16,
     body: Value,
     headers: String,
+    raw_body: Option<String>,
 }
 impl Reply {
     fn json(status: u16, body: Value) -> Self {
@@ -29,6 +30,13 @@ impl Reply {
             status,
             body,
             headers: String::new(),
+            raw_body: None,
+        }
+    }
+    fn raw(status: u16, body: &str) -> Self {
+        Self {
+            raw_body: Some(body.to_owned()),
+            ..Self::json(status, Value::Null)
         }
     }
 }
@@ -104,7 +112,9 @@ impl Server {
                 let body = if response.status == 204 {
                     String::new()
                 } else {
-                    response.body.to_string()
+                    response
+                        .raw_body
+                        .unwrap_or_else(|| response.body.to_string())
                 };
                 let _ = write!(
                     stream,
@@ -492,6 +502,98 @@ fn ambiguous_creation_is_not_replayed_and_preserves_hostname() {
 }
 
 #[test]
+fn instance_creation_accepts_only_a_valid_bare_uuid_receipt() {
+    for receipt in [
+        ID.to_owned(),
+        format!("{ID}\n"),
+        json!(ID).to_string(),
+        json!({"id":ID}).to_string(),
+    ] {
+        let server = Server::new(move |request| {
+            if request.path == "/oauth2/token" {
+                token()
+            } else {
+                Reply::raw(202, &receipt)
+            }
+        });
+        assert_eq!(
+            create_vm(&server.client, &offer(), "ice-test", KEY).unwrap(),
+            ID
+        );
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.path == "/instances")
+                .count(),
+            1
+        );
+    }
+    for receipt in [
+        "",
+        "test-secret",
+        "{}",
+        "null",
+        "{\"id\":\"bad\"}",
+        "11111111-1111-4111-8111-11111111111g",
+    ] {
+        let server = Server::new(move |request| {
+            if request.path == "/oauth2/token" {
+                token()
+            } else {
+                Reply::raw(202, receipt)
+            }
+        });
+        let err = create_vm(&server.client, &offer(), "ice-reconcile", KEY).unwrap_err();
+        let details = &err
+            .downcast_ref::<crate::automation::AgentError>()
+            .unwrap()
+            .details;
+        assert_eq!(details["instance_name"], "ice-reconcile");
+        assert_eq!(details["reconcile_before_retry"], true);
+        assert!(!format!("{err:#}").contains("test-secret"));
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.path == "/instances")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn bare_uuid_response_is_not_accepted_for_other_operations() {
+    let server = Server::new(|request| {
+        if request.path == "/oauth2/token" {
+            token()
+        } else {
+            Reply::raw(200, ID)
+        }
+    });
+    assert!(
+        server
+            .client
+            .get::<Value>("/instances", Duration::from_secs(1))
+            .is_err()
+    );
+    assert!(
+        server
+            .client
+            .mutate(Method::PUT, "/instances", &json!({}))
+            .is_err()
+    );
+    assert!(
+        server
+            .client
+            .mutate(Method::POST, "/volumes", &json!({}))
+            .is_err()
+    );
+    assert_eq!(server.requests().len(), 4);
+}
+
+#[test]
 fn startup_failure_returns_instance_and_volume_cleanup_details() {
     let server = Server::new(|request| {
         if request.path == "/oauth2/token" {
@@ -555,7 +657,37 @@ fn action_partial_failure_is_not_success() {
             )
         }
     });
-    assert!(server.client.action(ID, "shutdown", None).is_err());
+    let err = server.client.action(ID, "shutdown", None).unwrap_err();
+    let details = &err
+        .downcast_ref::<crate::automation::AgentError>()
+        .unwrap()
+        .details;
+    assert_eq!(details["receipt"]["rows"][0]["status"], "error");
+    assert_eq!(details["receipt"]["rows"][0]["fields"]["error"], "string");
+    assert!(!details.to_string().contains("secret"));
+}
+
+#[test]
+fn action_diagnostics_retain_bounded_shape_without_provider_strings() {
+    for response in [
+        json!({"secret-key":"secret-value"}),
+        json!(vec![
+            json!({"instanceId":EXTRA,"action":"secret-action","status":"secret-status",
+            "error":"secret-error","statusCode":400,"secret-key":"secret-value"});
+            6
+        ]),
+    ] {
+        let summary = deletion::receipt_summary(&response, ID, "delete");
+        assert!(!summary.to_string().contains("secret"));
+        if response.is_array() {
+            assert_eq!(summary["row_count"], 6);
+            assert_eq!(summary["rows"].as_array().unwrap().len(), 4);
+            assert_eq!(summary["rows"][0]["instance_id_matches"], false);
+            assert_eq!(summary["rows"][0]["action_matches"], false);
+            assert_eq!(summary["rows"][0]["status_code"], 400);
+            assert_eq!(summary["rows"][0]["unknown_field_count"], 1);
+        }
+    }
 }
 
 #[test]
@@ -592,7 +724,10 @@ fn delete_only_removes_boot_volume_and_verifies_absence() {
                 202,
                 json!([{"instanceId":ID,"action":"delete","status":"success"}]),
             )
-        } else if request.path.starts_with("/volumes/trash?") {
+        } else if request.path.starts_with("/volumes/trash?")
+            || request.path.starts_with("/instances?")
+            || request.path.starts_with("/volumes?")
+        {
             Reply::json(200, json!([]))
         } else {
             Reply::json(404, json!({}))
@@ -635,6 +770,194 @@ fn retained_boot_volume_prevents_claiming_verified_deletion() {
     );
 }
 
+// Model the retained HTTP 200 records from the 2026-10-01 Ada trial.
+fn terminal_deletion_reply(request: &Request) -> Reply {
+    match request.path.as_str() {
+        "/oauth2/token" => token(),
+        "/instances" if request.method == "PUT" => Reply::json(204, Value::Null),
+        p if p == format!("/instances/{ID}") => {
+            Reply::json(200, json!({"id":ID,"status":"discontinued"}))
+        }
+        p if p == format!("/volumes/{OS}") => Reply::json(
+            200,
+            json!({"id":OS,"status":"deleted","is_permanently_deleted":true}),
+        ),
+        p if p.starts_with("/instances?")
+            || p.starts_with("/volumes?")
+            || p.starts_with("/volumes/trash?") =>
+        {
+            Reply::json(200, json!([]))
+        }
+        _ => panic!("Unexpected request: {request:?}"),
+    }
+}
+
+#[test]
+fn deletion_reconciles_terminal_records_after_ambiguous_receipts_without_replay() {
+    for body in [
+        None,
+        Some("{}"),
+        Some("not JSON"),
+        Some("[{\"status\":\"error\",\"error\":\"secret\"}]"),
+    ] {
+        let server = Server::new(move |request| {
+            if request.method == "PUT"
+                && let Some(body) = body
+            {
+                return Reply::raw(202, body);
+            }
+            terminal_deletion_reply(request)
+        });
+        let vm: Instance = serde_json::from_value(instance("running")).unwrap();
+        let receipt = delete_selected(&server.client, &vm, Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            receipt["verification"],
+            "terminal_deletion_and_active_absence_verified"
+        );
+        assert_eq!(receipt["action_receipt_confirmed"], body.is_none());
+        assert_eq!(receipt["instance_state"], "discontinued");
+        assert_eq!(receipt["os_volume_states"][OS], "permanently_deleted");
+        assert_eq!(receipt["retained_volume_ids"], json!([EXTRA]));
+        assert_eq!(receipt["retained_storage_charges_continue"], true);
+        assert!(!receipt.to_string().contains("secret"));
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method == "PUT")
+                .count(),
+            1
+        );
+        assert!(server.requests().iter().all(|r| !r.path.contains(EXTRA)));
+    }
+}
+
+#[test]
+fn deletion_reconciles_http_failure_without_replaying_mutation() {
+    let server = Server::new(|request| {
+        if request.method == "PUT" {
+            Reply::json(503, json!({"error":"secret"}))
+        } else {
+            terminal_deletion_reply(request)
+        }
+    });
+    let vm: Instance = serde_json::from_value(instance("running")).unwrap();
+    let receipt = delete_selected(&server.client, &vm, Duration::from_secs(1)).unwrap();
+    assert_eq!(receipt["action_receipt_confirmed"], false);
+    assert_eq!(receipt["action_error"]["details"]["http_status"], 503);
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn deletion_never_confuses_terminal_metadata_with_verified_absence() {
+    for fault in [
+        "vm_id",
+        "volume_id",
+        "vm_status",
+        "volume_status",
+        "soft_deleted",
+        "missing_permanent_flag",
+        "active_vm",
+        "active_volume",
+        "trash",
+        "malformed_list",
+        "failed_read",
+    ] {
+        let server = Server::new(move |request| {
+            if request.method == "PUT" {
+                return Reply::json(207, json!([{"status":"error","error":"secret"}]));
+            }
+            let mut reply = terminal_deletion_reply(request);
+            if request.path == format!("/instances/{ID}") {
+                match fault {
+                    "vm_id" => reply.body["id"] = json!(EXTRA),
+                    "vm_status" => reply.body["status"] = json!("offline"),
+                    "failed_read" => return Reply::json(403, json!({"error":"secret"})),
+                    _ => (),
+                }
+            } else if request.path == format!("/volumes/{OS}") {
+                match fault {
+                    "volume_id" => reply.body["id"] = json!(EXTRA),
+                    "volume_status" => reply.body["status"] = json!("deleting"),
+                    "soft_deleted" => reply.body["is_permanently_deleted"] = json!(false),
+                    "missing_permanent_flag" => {
+                        reply
+                            .body
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("is_permanently_deleted");
+                    }
+                    _ => (),
+                }
+            } else if request.path.starts_with("/instances?") && fault == "active_vm" {
+                reply.body = json!([{"id":ID}]);
+            } else if (request.path.starts_with("/volumes?") && fault == "active_volume")
+                || (request.path.starts_with("/volumes/trash?") && fault == "trash")
+            {
+                reply.body = json!([{"id":OS}]);
+            } else if request.path.starts_with("/volumes?") && fault == "malformed_list" {
+                reply.body = json!([{"status":"secret"}]);
+            }
+            reply
+        });
+        let vm: Instance = serde_json::from_value(instance("running")).unwrap();
+        let start = Instant::now();
+        let err = delete_selected(&server.client, &vm, Duration::from_millis(150)).unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(1), "{fault}");
+        let err = err.downcast_ref::<crate::automation::AgentError>().unwrap();
+        assert_eq!(
+            err.code,
+            if fault == "trash" {
+                "storage_cleanup_unverified"
+            } else {
+                "deletion_unverified"
+            },
+            "{fault}"
+        );
+        assert_eq!(err.details["instance_id"], ID);
+        assert_eq!(err.details["os_volume_ids"], json!([OS]));
+        assert_eq!(err.details["action_error"]["code"], "verda_action_failed");
+        assert!(!err.details.to_string().contains("secret"));
+        assert_eq!(
+            server
+                .requests()
+                .iter()
+                .filter(|r| r.method == "PUT")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn deletion_checks_all_active_list_pages_before_claiming_absence() {
+    let server = Server::new(|request| {
+        if request.path.starts_with("/instances?") {
+            let id = if request.path.contains("page=1&") {
+                EXTRA
+            } else {
+                ID
+            };
+            Reply {
+                headers: "X-Total-Count: 2\r\n".into(),
+                ..Reply::json(200, json!([{"id":id}]))
+            }
+        } else {
+            terminal_deletion_reply(request)
+        }
+    });
+    let vm: Instance = serde_json::from_value(instance("running")).unwrap();
+    assert!(delete_selected(&server.client, &vm, Duration::from_millis(150)).is_err());
+    assert!(server.requests().iter().any(|r| r.path.contains("page=2&")));
+}
+
 #[test]
 fn collection_pagination_is_complete_and_bad_metadata_fails() {
     let server = Server::new(|request| {
@@ -650,6 +973,7 @@ fn collection_pagination_is_complete_and_bad_metadata_fails() {
             status: 200,
             body: json!([page]),
             headers: "X-Total-Count: 2\r\n".into(),
+            raw_body: None,
         }
     });
     assert_eq!(server.client.list::<u32>("/images").unwrap(), vec![1, 2]);
@@ -708,6 +1032,8 @@ fn trashed_os_volume_is_not_permanent_deletion() {
             Reply::json(204, Value::Null)
         } else if request.path.starts_with("/volumes/trash?") {
             Reply::json(200, json!([{"id": OS}]))
+        } else if request.path.starts_with("/instances?") || request.path.starts_with("/volumes?") {
+            Reply::json(200, json!([]))
         } else {
             Reply::json(404, json!({}))
         }
@@ -759,6 +1085,7 @@ fn read_retries_honor_retry_after_without_extending_deadlines() {
                 status: 429,
                 body: json!({}),
                 headers: "Retry-After: 1\r\n".into(),
+                raw_body: None,
             }
         } else {
             Reply::json(200, json!([]))
@@ -782,6 +1109,7 @@ fn read_retries_honor_retry_after_without_extending_deadlines() {
                 status: 429,
                 body: json!({}),
                 headers: "Retry-After: 60\r\n".into(),
+                raw_body: None,
             }
         }
     });

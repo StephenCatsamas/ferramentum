@@ -1,6 +1,7 @@
 //! Ordinary on-demand GPU VMs. No scheduler, automatic deletion or profiling guarantee.
 mod catalog;
 mod client;
+mod deletion;
 mod keys;
 mod ssh;
 #[cfg(test)]
@@ -27,6 +28,7 @@ use crate::support::{build_cloud_instance_name, now_unix_secs, prompt_confirm};
 use crate::workload::InstanceWorkload;
 use catalog::{Catalog, Offer};
 use client::{Client, Credentials};
+use deletion::delete_selected;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const BILLING: &str = "Verda shutdown retains compute billing and storage. Delete the VM to end compute billing; retained volumes continue to incur storage charges.";
@@ -105,18 +107,20 @@ impl Client {
         let response = self.mutate(Method::PUT, "/instances", &body)?;
         // 204 has no body. 202/207 carry per-instance success/error results.
         if !response.is_null() {
-            let rows = response
-                .as_array()
-                .context("Unexpected Verda action receipt; reconcile before retrying")?;
-            if rows.len() != 1
-                || rows[0]["instanceId"] != id
-                || rows[0]["action"] != action
-                || rows[0]["status"] != "success"
-            {
+            let confirmed = response.as_array().is_some_and(|rows| {
+                rows.len() == 1
+                    && rows[0]["instanceId"] == id
+                    && rows[0]["action"] == action
+                    && rows[0]["status"] == "success"
+            });
+            if !confirmed {
                 return Err(error(
                     "verda_action_failed",
                     "Verda did not confirm the requested instance action. Inspect its current state before retrying.",
-                    json!({"instance_id": id, "action": action, "next_command": format!("ice list --cloud verda --json")}),
+                    json!({"instance_id": id, "action": action,
+                        "receipt": deletion::receipt_summary(&response, id, action),
+                        "mutation_retried": false, "reconcile_before_retry": true,
+                        "next_command": "ice list --cloud verda --json"}),
                 ));
             }
         }
@@ -460,11 +464,21 @@ fn create_vm(client: &Client, offer: &Offer, hostname: &str, key: &str) -> Resul
         json!({"instance_name":hostname, "cloud":"verda", "cleanup_required":true,
         "automatic_delete":false, "next_command":"ice list --cloud verda --json", "reconcile_before_retry":true}),
     );
-    let response = client.mutate(Method::POST, "/instances", &body).map_err(|_| error("creation_outcome_unknown",
-        "Verda create did not return a usable receipt. Do not repeat creation: find the recorded hostname in ice list or the Verda console, inspect its volumes, then delete unwanted resources.",
-        json!({"instance_name":hostname, "instance_id":null, "reconcile_before_retry":true,"cleanup_required":true,"next_command":"ice list --cloud verda --json"})))?;
-    let id = response.as_str().or_else(|| response.get("id").and_then(Value::as_str))
-        .filter(|id| valid_id(id)).context("Verda creation response omitted a valid instance ID; reconcile the recorded hostname before retrying")?;
+    let unknown = || {
+        error(
+            "creation_outcome_unknown",
+            "Verda create did not return a usable receipt. Do not repeat creation: find the recorded hostname in ice list or the Verda console, inspect its volumes, then delete unwanted resources.",
+            json!({"instance_name":hostname, "instance_id":null, "reconcile_before_retry":true,"cleanup_required":true,"next_command":"ice list --cloud verda --json"}),
+        )
+    };
+    let response = client
+        .mutate(Method::POST, "/instances", &body)
+        .map_err(|_| unknown())?;
+    let id = response
+        .as_str()
+        .or_else(|| response.get("id").and_then(Value::as_str))
+        .filter(|id| valid_id(id))
+        .ok_or_else(unknown)?;
     recovery("waiting_for_startup", cleanup_details(id, None));
     Ok(id.to_owned())
 }
@@ -564,73 +578,6 @@ impl CreateProvider for Provider {
             );
             Ok(())
         }
-    }
-}
-
-fn delete_selected(client: &Client, instance: &Instance, timeout: Duration) -> Result<Value> {
-    let os = instance.os_volume_id.iter().cloned().collect::<Vec<_>>();
-    let retained = instance
-        .volume_ids
-        .iter()
-        .filter(|id| !os.contains(id))
-        .cloned()
-        .collect::<Vec<_>>();
-    let details = json!({"instance_id":instance.id,"os_volume_ids":os,"retained_volume_ids":retained,
-        "storage_cleanup_known":instance.os_volume_id.is_some(), "billing_note":BILLING,
-        "next_command":"Inspect the instance and volume IDs in the Verda console before retrying cleanup."});
-    recovery("deleting", details.clone());
-    client.action(&instance.id, "delete", Some(&os))?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(error(
-                "deletion_unverified",
-                "Verda deletion requested but resource absence was not verified. Billing may continue.",
-                details,
-            ));
-        }
-        if client
-            .instance(&instance.id, remaining.min(REQUEST_TIMEOUT))?
-            .is_none()
-        {
-            let mut volumes_absent = true;
-            for id in &os {
-                match client.get::<Value>(
-                    &resource_path("volumes", id)?,
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(REQUEST_TIMEOUT),
-                ) {
-                    Err(err) if is_not_found(&err) => (),
-                    Ok(_) => volumes_absent = false,
-                    Err(err) => return Err(err),
-                }
-            }
-            if volumes_absent {
-                // A soft-deleted volume may disappear from ordinary lookup yet
-                // remain recoverable in trash. Verify permanent deletion too.
-                let trash: Vec<Value> = client.list_until("/volumes/trash", deadline)?;
-                if trash
-                    .iter()
-                    .any(|volume| os.iter().any(|id| volume["id"] == *id))
-                {
-                    return Err(error(
-                        "storage_cleanup_unverified",
-                        "The VM is absent, but its OS volume remains in Verda trash. Inspect the volume IDs and permanently delete them using Verda.",
-                        details,
-                    ));
-                }
-                return Ok(
-                    json!({"status":"deleted", "instance_id":instance.id, "verification":"read_back_absent",
-                    "permanently_deleted_os_volume_ids":os, "retained_volume_ids":retained,
-                    "storage_cleanup_known":instance.os_volume_id.is_some(), "retained_storage_charges_continue": !retained.is_empty() || instance.os_volume_id.is_none()}),
-                );
-            }
-        }
-        thread::sleep(
-            Duration::from_secs(2).min(deadline.saturating_duration_since(Instant::now())),
-        );
     }
 }
 

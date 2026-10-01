@@ -64,6 +64,7 @@ key path fails instead of silently selecting another key. Existing VM connection
 and transfer commands use the VM's registered key IDs when available.
 
 SSH uses root, batch authentication and `StrictHostKeyChecking=accept-new`.
+The local OpenSSH availability check uses `ssh -V` (not `--version`).
 Readiness uses the same bounded authentication probe as Vast. Connection refusal,
 reset and similar transport failures retry within the startup deadline;
 authentication, host-key, local-setup and unknown failures stop immediately with
@@ -104,7 +105,8 @@ proof that the provider has no capacity.
 The default boot disk is **100 GB**, priced as NVMe. `--disk-gb` changes both the
 quoted size and the creation request. The API image catalog does not expose a
 minimum disk size: this default follows the provider's CLI example, and neither
-it nor a smaller override has been live-validated by this adapter.
+the catalog nor a preview guarantees every disk size is accepted. The separately
+authorised Ada trial used 100 GB successfully; smaller overrides remain unverified.
 
 `--max-price-per-hr` covers **compute plus the allocated OS disk** in USD. Storage
 uses Verda CLI's conversion: monthly USD/GB × disk GB ÷ 730, rounded up to four
@@ -139,18 +141,30 @@ Verda `stop` means `shutdown`: **compute and storage billing continue** while
 the VM is offline. `start` maps to `start`; it does not create a new deadline.
 Use `delete` to end compute billing. Ice requests permanent deletion of the
 selected VM's OS volume and verifies that the VM and OS volume are absent,
-including checking volume trash. Additional attached volumes are retained and
+or have exact-ID terminal records (`discontinued` for the VM; `deleted` with
+`is_permanently_deleted: true` for its OS volume). Both paths also require absence
+from the paginated active-instance/volume lists and volume trash. Additional attached volumes are retained and
 listed as `retained_volume_ids`; they may continue to incur storage charges.
 If the OS volume ID is unavailable, the receipt explicitly marks storage
 cleanup as unknown. Inspect and remove remaining storage through Verda.
 
-Create POSTs are never replayed automatically. If the response is lost, errors
+Create accepts a plain UUID, JSON UUID string, or JSON object with an `id`.
+The plain-text exception is restricted to successful instance creation responses.
+Create POSTs are never replayed automatically. If the response is lost or unusable, errors
 include the generated hostname for reconciliation using `ice list` or the
 Verda console. Once an ID is returned, recovery details preserve it and any
 observed OS/attached volume IDs, plus a cleanup command. A startup failure leaves
 the VM billable; it does not imply a stop or deletion. Inspect that resource
 before retrying creation. A deletion timeout is also an unverified outcome;
 inspect the returned VM/volume IDs rather than assuming billing ended.
+
+An ambiguous or rejected delete receipt triggers bounded read-only reconciliation,
+never a repeated mutation. Success requires all the resource checks above, and
+reports `action_receipt_confirmed: false` plus sanitized `action_error` diagnostics
+when reconciliation establishes deletion despite that receipt. An unverified result
+retains the VM/OS/attached-volume IDs and both action and verification diagnostics.
+Receipt diagnostics preserve types, field presence, row counts and ID/action
+comparisons; arbitrary provider strings and unknown field names are not printed.
 
 Safe API reads retry transient transport failures and HTTP 408/429/500/502/503/504
 up to six attempts within the original request deadline. `Retry-After` is
@@ -196,6 +210,8 @@ for the selected GPU, checks ordinary execution before and after capture, and
 checks results during NCU capture. The script imports the resulting `.ncu-rep`
 and requires positive numerical `sm__cycles_elapsed.sum` and
 `smsp__inst_executed.sum` counters for that kernel in the same capture/device.
+Both long `Metric Name`/`Metric Value` rows and NCU 2026.1.1's wide table with a
+separate units row are supported; the admission rules are identical.
 An exit-zero permission failure, missing/empty report, missing counter, NaN,
 zero counter or failed output check cannot pass. GPU UUID consistency and
 source/binary/report/log hashes are recorded in `admission.json`.
@@ -208,9 +224,15 @@ retain evidence and apply the agreed cleanup. Admission applies only to the
 captured GPU/image/driver/user/tool context, not every Verda instance.
 
 Pull the entire output directory locally, including `.ncu-rep`, CSV, logs and
-`admission.json`, before deletion. Mock tests validate the gate, but **no paid VM,
-SSH transfer, real CUDA compilation or NCU capture has been validated for this
-adapter yet**. The installed Ice binary is not changed by this patch.
+`admission.json`, before deletion. A separately authorised 1 October 2026 trial
+captured 2,604,224 SM cycles and 458,752 executed instructions on RTX 6000 Ada
+GPU 0 with Ubuntu 26.04/CUDA 13.2, driver 580.178.04, nvcc 13.2.86, NCU 2026.1.1
+and root. All 1,048,576 outputs passed before, during and after capture. Its
+original raw CSV is retained as a regression fixture. This verifies that context,
+not A6000, non-root execution, or a future VM. The trial needed an isolated
+creation hotfix and direct API cleanup verification; the corrected complete Ice
+lifecycle still needs separate live validation. No new paid trial is required
+to run the mocked regression suite.
 
 ## Validation and references
 

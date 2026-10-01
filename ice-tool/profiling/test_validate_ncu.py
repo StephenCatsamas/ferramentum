@@ -10,9 +10,11 @@ import unittest
 
 from validate_ncu import numeric_counters
 
-CSV = ('"ID","Kernel Name","Device","Metric Name","Metric Value"\n'
-       '"0","counter_probe(unsigned int*)","0","sm__cycles_elapsed.sum","12,345"\n'
-       '"0","counter_probe(unsigned int*)","0","smsp__inst_executed.sum","64000"\n')
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+CSV = (FIXTURES / "ncu-long.csv").read_text()
+WIDE = ('"ID","Kernel Name","Device","sm__cycles_elapsed.sum","smsp__inst_executed.sum"\n'
+        '"","","","cycle","inst"\n'
+        '"0","counter_probe(unsigned int*)","0","12,345","64000"\n')
 
 
 class AdmissionTests(unittest.TestCase):
@@ -31,7 +33,27 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             numeric_counters(CSV + CSV.splitlines()[-1] + "\n")
 
-    def run_mock_probe(self, root: Path, denied: bool) -> subprocess.CompletedProcess[str]:
+    def test_both_layouts_enforce_identical_admission_rules(self) -> None:
+        self.assertEqual(numeric_counters(CSV), numeric_counters(WIDE))
+        for text in (CSV, WIDE):
+            for invalid in (text.replace('"12,345"', '"0"'), text.replace('"12,345"', '"-1"'),
+                            text.replace('"12,345"', '"NaN"'), text.replace('"12,345"', '"inf"'),
+                            text.replace('"12,345"', '"N/A"'), text.replace('"12,345"', '""'),
+                            text.replace("smsp__inst_executed.sum", "gpu__time_duration.sum"),
+                            text.replace("counter_probe", "other_kernel"),
+                            text + text.splitlines()[-1] + "\n",
+                            text + text.splitlines()[-1].replace('"0","counter_probe', '"1","counter_probe') + "\n",
+                            text.replace('","0",', '","",'),
+                            text.replace('"Kernel Name",', '"Device",'),
+                            text + "==ERROR== import failed\n"):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    numeric_counters(invalid)
+
+    def test_recorded_ncu_2026_wide_csv(self) -> None:
+        self.assertEqual(numeric_counters((FIXTURES / "ncu-2026.1.1-wide.csv").read_text()),
+                         {"sm__cycles_elapsed.sum": 2604224, "smsp__inst_executed.sum": 458752})
+
+    def run_mock_probe(self, root: Path, denied: bool, csv_text: str = CSV) -> subprocess.CompletedProcess[str]:
         tools = root / "tools"
         tools.mkdir()
         source = Path(__file__).resolve().parent
@@ -39,7 +61,7 @@ class AdmissionTests(unittest.TestCase):
         nvcc = ("#!/bin/sh\n[ \"$1\" != --version ] || exit 0\n"
                 f"printf %s {shlex.quote(probe)} > counter-probe\nchmod +x counter-probe\n")
         ncu = ("#!/bin/sh\n[ \"$1\" != --version ] || exit 0\n"
-               f"case \"$*\" in *--import*) printf '%s' {shlex.quote(CSV)}; exit 0 ;; esac\n")
+               f"case \"$*\" in *--import*) printf '%s' {shlex.quote(csv_text)}; exit 0 ;; esac\n")
         if denied:
             # Reproduce an exit-zero profiler permission failure. It must not pass.
             ncu += "echo '==ERROR== ERR_NVGPUCTRPERM'\nexit 0\n"
@@ -54,13 +76,14 @@ class AdmissionTests(unittest.TestCase):
                               env=env, capture_output=True, text=True, timeout=10, check=False)
 
     def test_probe_imports_report_and_records_checksums(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            result = self.run_mock_probe(root, False)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            admission = json.loads((root / "output/admission.json").read_text())
-            self.assertTrue(admission["admitted"])
-            self.assertEqual(len(admission["sha256"]["counter-access.ncu-rep"]), 64)
+        for csv_text in (CSV, WIDE):
+            with self.subTest(csv_text=csv_text), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                result = self.run_mock_probe(root, False, csv_text)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                admission = json.loads((root / "output/admission.json").read_text())
+                self.assertTrue(admission["admitted"])
+                self.assertEqual(len(admission["sha256"]["counter-access.ncu-rep"]), 64)
 
     def test_exit_zero_permission_error_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
