@@ -404,15 +404,24 @@ mod observer {
 
     pub(super) fn age(now: u64, at: i64) -> String {
         let seconds = now.saturating_sub(u64::try_from(at).unwrap_or_default());
-        if seconds < 60 {
-            format!("{seconds}s ago")
-        } else if seconds < 3600 {
-            format!("{}m ago", seconds / 60)
-        } else if seconds < 86_400 {
-            format!("{}h {}m ago", seconds / 3600, seconds % 3600 / 60)
-        } else {
-            format!("{}d ago", seconds / 86_400)
+        format!("{} ago", elapsed(seconds))
+    }
+
+    pub(super) fn elapsed(seconds: u64) -> String {
+        // Coarse elapsed units, not calendar arithmetic: months are 30 days and years 365.
+        for (unit, size) in [
+            ("y", 365 * 86_400),
+            ("mo", 30 * 86_400),
+            ("w", 7 * 86_400),
+            ("d", 86_400),
+            ("h", 3600),
+            ("m", 60),
+        ] {
+            if seconds >= size {
+                return format!("{}{unit}", seconds / size);
+            }
         }
+        "<1m".into()
     }
 
     pub(super) fn safe_text(value: &str, max_width: usize) -> String {

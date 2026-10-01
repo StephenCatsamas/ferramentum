@@ -41,6 +41,9 @@ are omitted. Narrower terminals show only the state, with its age in comfortable
 details. The previous turn ending is retained in details, including while a new turn is active.
 Turn time is elapsed time for the current turn, or the final duration of the most recent ended turn;
 it is not the age of the whole session.
+Durations and ages use one whole unit, rounded down: minutes, hours, days, weeks, months, then
+years (`59m`, `3h`, `4d`, `2w`, `1mo`, `1y`). Anything under a minute shows `<1m`;
+seconds and mixed units are omitted. Months use 30 days and years use 365 days.
 Names come from Codex's `session_index.jsonl`, including subsequent renames.
 
 Newly completed main turns gain a **●** before the thread name, bold yellow emphasis on the title

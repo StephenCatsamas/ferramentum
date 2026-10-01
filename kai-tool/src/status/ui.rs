@@ -1,7 +1,7 @@
 //! Session-picker conventions used by `kai r`: compact chrome, blue selection,
 //! type-to-search, arrow navigation, Ctrl-O density, and a ruled shortcut footer.
 use super::attention::{Attention, Target, now_ms};
-use super::observer::{DISCOVERY_TIMEOUT, Observer, Row, Snapshot, age, now, safe_text};
+use super::observer::{DISCOVERY_TIMEOUT, Observer, Row, Snapshot, age, elapsed, now, safe_text};
 use super::process::ProcessIdentity;
 use super::transcript::TurnState;
 use super::worker::Worker;
@@ -1025,16 +1025,7 @@ fn clip(text: &str, width: usize) -> String {
 }
 
 pub(super) fn run_time(ms: Option<u64>) -> String {
-    let Some(seconds) = ms.map(|value| value / 1000) else {
-        return "—".into();
-    };
-    if seconds < 60 {
-        format!("{seconds}s")
-    } else if seconds < 3600 {
-        format!("{}m {:02}s", seconds / 60, seconds % 60)
-    } else {
-        format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60)
-    }
+    ms.map_or_else(|| "—".into(), |value| elapsed(value / 1000))
 }
 
 #[cfg(test)]

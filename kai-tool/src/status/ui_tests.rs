@@ -119,7 +119,7 @@ fn failed_or_delayed_focus_results_do_not_clear_unread_completions() {
 fn state_age_uses_the_current_wait_or_completion_and_collapses_on_narrow_screens() {
     for (state, expected) in [
         (TurnState::Working, "Active"),
-        (TurnState::NeedsInput, "Needs input · 20s ago"),
+        (TurnState::NeedsInput, "Needs input · <1m ago"),
         (TurnState::Ready, "Ready · 1m ago"),
         (TurnState::Interrupted, "Interrupted · 1m ago"),
         (TurnState::Error, "Error · 1m ago"),
@@ -155,7 +155,7 @@ fn state_age_uses_the_current_wait_or_completion_and_collapses_on_narrow_screens
         if state == TurnState::NeedsInput {
             view.expanded = true;
             let text = contents(&render(&mut view, &snapshot, 70, 40));
-            assert!(text.contains("Input requested 20s ago"), "{text}");
+            assert!(text.contains("Input requested <1m ago"), "{text}");
             snapshot.windows[0].input_requested_at = None;
             view.expanded = false;
             let text = contents(&render(&mut view, &snapshot, 120, 24));
@@ -327,7 +327,7 @@ fn layouts_show_name_runtime_and_navigation_without_disclaimer_text() {
         let terminal = render(&mut view, &snapshot, width, height);
         let text = contents(&terminal);
         assert!(text.contains("Prepare release"), "{text}");
-        assert!(text.contains("1m 05s"), "{text}");
+        assert!(text.contains("1m"), "{text}");
         if width >= 70 {
             assert!(text.contains("Tokens") && text.contains("1.0M"), "{text}");
             assert!(text.contains("Subagents"), "{text}");
