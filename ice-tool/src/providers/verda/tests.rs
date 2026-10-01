@@ -190,6 +190,83 @@ fn offer() -> Offer {
 }
 
 #[test]
+fn recorded_catalog_selects_current_image_and_enforces_per_gpu_memory() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/verda-catalog-2026-10-01.json"
+    ))
+    .unwrap();
+    let mut cat: Catalog = serde_json::from_value(fixture["catalog"].clone()).unwrap();
+    let mut req = requirements();
+    req.max_price_per_hr = 2.50;
+    req.gpu_count = Some(2);
+    req.min_gpu_memory_gb = Some(48.0);
+    let selected = cat
+        .select(&req, &Default::default(), Some("2RTX6000ADA.20V"))
+        .unwrap();
+    assert_eq!(selected.location, "FIN-03");
+    assert_eq!(selected.image.image_type, "26.04.cuda13.2");
+    assert_eq!(selected.image.id, "e25c357f-01f7-497d-a3fa-36c9c4e27403");
+    assert_eq!(selected.gpu_memory_per_gpu_gb, 48.0);
+    assert!((selected.hourly_usd - 2.3714).abs() < 1e-9);
+    req.min_gpu_memory_gb = Some(49.0);
+    assert!(cat.select(&req, &Default::default(), None).is_err());
+    req.min_gpu_memory_gb = Some(48.0);
+    req.max_price_per_hr = 2.35; // Compute alone fits; the required disk does not.
+    assert!(cat.select(&req, &Default::default(), None).is_err());
+    req.max_price_per_hr = 2.50;
+    let defaults = crate::model::VerdaDefaults {
+        image: Some("26.04.cuda13.2.docker".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        cat.select(&req, &defaults, None).unwrap().image.image_type,
+        "26.04.cuda13.2.docker"
+    );
+    cat.images.clear();
+    let error = cat.select(&req, &Default::default(), None).unwrap_err();
+    let detail = &error
+        .downcast_ref::<crate::automation::AgentError>()
+        .unwrap()
+        .details;
+    assert_eq!(detail["rejected_machines"]["compatible_image"], 1);
+    assert_eq!(detail["rejected_machines"]["availability_or_location"], 0);
+}
+
+#[test]
+fn image_formats_preserve_version_thresholds_and_workload_exclusions() {
+    let mut image = catalog().images[0].clone();
+    for kind in [
+        "24.04.cuda12.9",
+        "26.04.cuda13.2",
+        "26.04.cuda13.2.docker",
+        "ubuntu-24.04-cuda-12.9-open",
+    ] {
+        image.image_type = kind.into();
+        assert!(catalog::image_version(&image).is_some(), "{kind}");
+    }
+    for kind in [
+        "22.04.cuda13.2",
+        "24.04.cuda12.8",
+        "26.04.base",
+        "26.04.cuda13.2.cc",
+        "26.04.cuda13.2.kubernetes-1.35.8",
+        "ubuntu-26.04-cuda-13.2-cluster",
+        "jupyter.cuda.13.2",
+        "26.04.cuda13",
+        "26.04.cuda13.2garbage",
+    ] {
+        image.image_type = kind.into();
+        assert!(catalog::image_version(&image).is_none(), "{kind}");
+    }
+    image.image_type = "26.04.cuda13.2".into();
+    image.is_cluster = true;
+    assert!(catalog::image_version(&image).is_none());
+    image.is_cluster = false;
+    image.category = "confidentialComputing".into();
+    assert!(catalog::image_version(&image).is_none());
+}
+
+#[test]
 fn storage_is_in_the_ceiling_and_preview_has_no_enforced_deadline() {
     let offer = offer();
     assert_eq!(offer.allocated_disk_gb, 100);
@@ -666,7 +743,107 @@ fn api_errors_do_not_echo_submitted_credentials() {
             .details["http_status"],
         429
     );
+    assert_eq!(server.requests().len(), 7); // One token exchange and six bounded reads.
+}
+
+#[test]
+fn read_retries_honor_retry_after_without_extending_deadlines() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = hits.clone();
+    let server = Server::new(move |request| {
+        if request.path == "/oauth2/token" {
+            return token();
+        }
+        if count.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply {
+                status: 429,
+                body: json!({}),
+                headers: "Retry-After: 1\r\n".into(),
+            }
+        } else {
+            Reply::json(200, json!([]))
+        }
+    });
+    let start = Instant::now();
+    assert!(
+        server
+            .client
+            .get::<Vec<Value>>("/images", Duration::from_secs(3))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(start.elapsed() >= Duration::from_secs(1));
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let server = Server::new(|request| {
+        if request.path == "/oauth2/token" {
+            token()
+        } else {
+            Reply {
+                status: 429,
+                body: json!({}),
+                headers: "Retry-After: 60\r\n".into(),
+            }
+        }
+    });
+    let start = Instant::now();
+    let error = server
+        .client
+        .get::<Value>("/images", Duration::from_millis(500))
+        .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<crate::automation::AgentError>()
+            .unwrap()
+            .code,
+        "verda_retry_deadline"
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
     assert_eq!(server.requests().len(), 2);
+}
+
+#[test]
+fn transient_reads_retry_but_permanent_errors_and_mutations_do_not() {
+    for status in [400, 403, 404, 408, 429, 500, 502, 503, 504] {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        let server = Server::new(move |request| {
+            if request.path == "/oauth2/token" {
+                return token();
+            }
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                Reply::json(status, json!({}))
+            } else {
+                Reply::json(200, json!([]))
+            }
+        });
+        let retry = matches!(status, 408 | 429 | 500 | 502 | 503 | 504);
+        assert_eq!(
+            server
+                .client
+                .get::<Value>("/images", Duration::from_secs(1))
+                .is_ok(),
+            retry
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), if retry { 2 } else { 1 });
+    }
+    for method in [Method::POST, Method::PUT, Method::DELETE] {
+        for status in [429, 503] {
+            let server = Server::new(move |request| {
+                if request.path == "/oauth2/token" {
+                    token()
+                } else {
+                    Reply::json(status, json!({}))
+                }
+            });
+            assert!(
+                server
+                    .client
+                    .mutate(method.clone(), "/instances", &json!({}))
+                    .is_err()
+            );
+            assert_eq!(server.requests().len(), 2);
+        }
+    }
 }
 
 #[test]

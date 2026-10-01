@@ -46,18 +46,28 @@ discovery; `create` intersects the catalog with current on-demand availability.
 Catalog entries and provider claims do not establish profiling access.
 
 Register your SSH public key in Verda before creating a VM. Supply its ID with
-`--ssh-key-id` or `default.verda.ssh_key_id`. Ice verifies that the ID exists in
-the project, but does not upload or modify keys. For a specific private key:
+`--ssh-key-id` or `default.verda.ssh_key_id`. Before creating a billable VM, Ice
+reads that key and matches its public material to an existing local or agent key.
+It does not upload or modify keys. For a specific private key:
 
 ```sh
 ice config set default.verda.ssh_key_id=YOUR_REGISTERED_KEY_UUID
 ice config set default.verda.ssh_key_path=/absolute/path/to/private-key
 ```
 
-Without a configured path, Ice uses an existing local SSH key pair when found,
-then the SSH agent/default identity mechanism. The provider key ID must correspond
-to an accessible local key. SSH uses root on these images, batch authentication
-and `StrictHostKeyChecking=accept-new`. Existing host-key mismatches fail.
+Without a configured path, Ice searches local key pairs and then ssh-agent for a
+matching key, rather than picking the first unrelated local identity. Local
+checks have a ten-second budget. Keep `ssh-keygen` available; encrypted/hardware
+keys need their `.pub` counterpart and a matching identity loaded with `ssh-add`,
+or a matching agent-only identity when no path is configured. An explicit wrong
+key path fails instead of silently selecting another key. Existing VM connection
+and transfer commands use the VM's registered key IDs when available.
+
+SSH uses root, batch authentication and `StrictHostKeyChecking=accept-new`.
+Readiness uses the same bounded authentication probe as Vast. Connection refusal,
+reset and similar transport failures retry within the startup deadline;
+authentication, host-key, local-setup and unknown failures stop immediately with
+structured diagnostics. Ice does not rewrite `known_hosts` to bypass a mismatch.
 
 ## Preview and create
 
@@ -70,17 +80,26 @@ ice create --cloud verda --ssh --gpu-count 1 --min-gpu-memory-gb 48 \
 The limits above are examples, not a current offer or spending authorization.
 `--gpu` matches the catalog's model/name, case-insensitively; `--machine` pins
 an exact instance type. `--min-cpus`, `--min-ram-gb`, GPU count and per-GPU memory
-are enforced. Host internet-speed filters are rejected because the catalog
+are enforced. Verda's catalog VRAM is the total across all GPUs; Ice divides by
+GPU count for `--min-gpu-memory-gb` and reports `offer.gpu_memory_per_gpu_gb`.
+Host internet-speed filters are rejected because the catalog
 does not supply measured rates. CPU-only, bare-metal and confidential-computing
 configurations are outside this adapter's initial creation scope.
 
 Ice selects a currently advertised Ubuntu 24/26 image with CUDA 12.9 or newer
 from the machine's `supported_os` list, preferring the highest Ubuntu/CUDA
-version. Cluster and confidential-computing images are excluded. Override with
+version. Both current dotted names (`26.04.cuda13.2`) and legacy names
+(`ubuntu-24.04-cuda-12.9-open`) are supported. At equal versions, a plain CUDA
+image is preferred over a Docker image. Cluster, Kubernetes and
+confidential-computing images are excluded. Override with
 `--image IMAGE_TYPE_OR_UUID` and `--location LOCATION_CODE`, or the matching
 `default.verda.image`/`location` settings. The selected image UUID is submitted
 to creation. Compatibility metadata is a selection constraint, not runtime
 verification of the driver, tools or counters.
+
+`no_matching_offers` includes counts by the first failing selection stage:
+resources/price, compatible image, or availability/location. It is not by itself
+proof that the provider has no capacity.
 
 The default boot disk is **100 GB**, priced as NVMe. `--disk-gb` changes both the
 quoted size and the creation request. The API image catalog does not expose a
@@ -104,7 +123,7 @@ For an authorized rental, replace `--dry-run` with
 image compatibility and the storage-inclusive quote immediately before creation.
 A price increase since confirmation fails instead of silently accepting it.
 The API offers no atomic price reservation; a preview does not reserve capacity.
-Startup waits for both `running` and a successful SSH `true` probe within one
+Startup waits for both `running` and successful SSH authentication within one
 readiness budget. Creation itself is a separate, bounded API request.
 
 ## Deadlines, failures and deletion
@@ -133,6 +152,12 @@ the VM billable; it does not imply a stop or deletion. Inspect that resource
 before retrying creation. A deletion timeout is also an unverified outcome;
 inspect the returned VM/volume IDs rather than assuming billing ended.
 
+Safe API reads retry transient transport failures and HTTP 408/429/500/502/503/504
+up to six attempts within the original request deadline. `Retry-After` is
+honoured in full: if the delay cannot fit, Ice returns `verda_retry_deadline`
+without sending an early retry. Backoff is interruptible; a GET can refresh an
+expired token once. Resource mutations are still sent only once.
+
 ```sh
 ice list --cloud verda --json
 ice shell --cloud verda INSTANCE_UUID --print-creds --json
@@ -146,7 +171,8 @@ ice delete --cloud verda INSTANCE_UUID --json
 
 List discovery shows Ice-prefixed hostnames. Explicit full resource IDs can
 address other VMs in the project; only operate resources authorized for the task.
-`--no-probe` reads connection metadata without starting the VM or probing SSH.
+`--no-probe` reads connection metadata without starting the VM, probing SSH,
+matching local keys, or requiring an installed SSH executable/local private key.
 Transfers use rsync with protected arguments and require a running VM, SSH access
 and rsync at both ends. Noninteractive connection lookup never starts a stopped VM.
 

@@ -1,6 +1,7 @@
 //! Ordinary on-demand GPU VMs. No scheduler, automatic deletion or profiling guarantee.
 mod catalog;
 mod client;
+mod keys;
 mod ssh;
 #[cfg(test)]
 mod tests;
@@ -50,6 +51,8 @@ pub(crate) struct Instance {
     os_volume_id: Option<String>,
     #[serde(default)]
     volume_ids: Vec<String>,
+    #[serde(default)]
+    ssh_key_ids: Vec<String>,
 }
 
 fn valid_id(id: &str) -> bool {
@@ -442,6 +445,8 @@ pub(crate) fn validate_create(args: &CreateArgs) -> Result<()> {
 #[derive(Deserialize)]
 struct SshKey {
     id: String,
+    #[serde(default)]
+    key: Option<String>,
 }
 
 fn create_vm(client: &Client, offer: &Offer, hostname: &str, key: &str) -> Result<String> {
@@ -493,15 +498,8 @@ impl CreateProvider for Provider {
         let key = config.default.verda.ssh_key_id.as_deref().context(
             "Supply --ssh-key-id or default.verda.ssh_key_id for an existing Verda SSH key",
         )?;
-        resource_path("ssh-keys", key)?;
-        if !client
-            .list::<SshKey>("/ssh-keys")?
-            .iter()
-            .any(|k| k.id == key)
-        {
-            bail!("Configured SSH key ID was not found in this Verda project");
-        }
-        let identity = ssh::identity(config)?;
+        let registered = keys::registered_key(&client, key)?;
+        let identity = keys::identity(config, &[registered])?;
         let names = client
             .list::<Instance>("/instances")?
             .into_iter()
@@ -537,9 +535,15 @@ impl CreateProvider for Provider {
             ssh::wait_ready(&instance, identity.as_deref(), deadline)?;
             Ok(instance)
         })();
-        let instance: Instance = ready.map_err(|err: anyhow::Error| error("creation_incomplete",
-            format!("Verda created instance {id}, but readiness failed: {err}. It remains billable; use the cleanup command and inspect retained volumes."),
-            crate::automation::recovery_details()))?;
+        let instance: Instance = ready.map_err(|err: anyhow::Error| {
+            let message = format!("Verda created instance {id}, but readiness failed: {err}. It remains billable; use the cleanup command and inspect retained volumes.");
+            if capulus::error_is_cancelled(&err) { return err.context(message); }
+            let mut details = crate::automation::recovery_details();
+            if let Some(cause) = err.downcast_ref::<crate::automation::AgentError>() {
+                details["cause"] = json!({"code":cause.code,"details":cause.details});
+            }
+            error("creation_incomplete", message, details)
+        })?;
         crate::cache::upsert_instance::<CacheModel>(&instance);
         result["status"] = json!("created");
         result["dry_run"] = json!(false);
