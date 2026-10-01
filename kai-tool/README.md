@@ -32,14 +32,14 @@ Install with `cargo install --path kai-tool --locked --force`.
 `kai status --watch` shows the current user's local Kai launcher processes, including windows
 opened before the dashboard started. Its Ratatui interface follows the `kai r` session picker:
 blue selection, a `›` marker, subdued metadata, type-to-search, and keyboard hints below the list.
-Rows show thread names and **Turn time**, a **Subagents** column from 50 columns wide,
+Rows show thread names and **Elapsed**, a **Subagents** column from 50 columns wide,
 and **Tokens** from 70 columns. From 90 columns, **State** includes a relative time:
 `Ready · 3m ago`, `Needs input · 3m ago`, or `Interrupted · 3m ago`.
 Ready, Interrupted, and Error use the latest turn ending; Needs input measures the continuous
 wait since the first pending blocking question. Active and Unknown have no age. Missing timestamps
 are omitted. Narrower terminals show only the state, with its age in comfortable rows and Ctrl-E
 details. The previous turn ending is retained in details, including while a new turn is active.
-Turn time is elapsed time for the current turn, or the final duration of the most recent ended turn;
+Elapsed is time for the current turn, or the final duration of the most recent ended turn;
 it is not the age of the whole session.
 Durations and ages use one whole unit, rounded down: minutes, hours, days, weeks, months, then
 years (`59m`, `3h`, `4d`, `2w`, `1mo`, `1y`). Anything under a minute shows `<1m`;
@@ -75,7 +75,7 @@ Subagents shows the number of subagents with an active recorded turn (for exampl
 including nested descendants.
 It follows currently open subagent logs, using root/parent thread IDs to associate
 them with the main conversation and excluding inherited parent history where marked. The main
-State and Turn time remain those of the parent; a Ready parent can still have running agents.
+State and Elapsed remain those of the parent; a Ready parent can still have running agents.
 The Active filter includes either kind of running work. Ctrl-E shows running, ready, interrupted,
 error, and unknown agent counts. A `?` marks unavailable or uncertain counts; it does not mean zero.
 Below 50 columns, agent counts remain available in Ctrl-E details. Subagent logs that close leave
@@ -193,7 +193,7 @@ are Unix seconds, run time is milliseconds, and state names
 are `working`, `ready`, `needs_input`, `interrupted`, `error`, or `unknown`. `warnings`
 reports incomplete process discovery. No terminal escape sequences are emitted in JSON mode.
 The existing JSON names `working`, `run_time_ms`, and `last_finished_at` remain unchanged;
-they correspond to the UI's Active, Turn time, and turn-ending timestamp. UI filters do not remove rows
+they correspond to the UI's Active, Elapsed, and turn-ending timestamp. UI filters do not remove rows
 from JSON output. The legacy `exited_at` field remains present as null for version 1 compatibility;
 exited rows are no longer emitted.
 The additive `agents` object contains `total`, `running`, `ready`, `interrupted`, `error`,

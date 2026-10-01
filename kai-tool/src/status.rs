@@ -363,7 +363,7 @@ mod observer {
             "STATE",
             "PID",
             "TTY",
-            "TURN TIME",
+            "ELAPSED",
             "SUBAGENTS",
             "TOKENS",
             "LAST ENDED",

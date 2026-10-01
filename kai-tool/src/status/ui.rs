@@ -571,7 +571,7 @@ impl View {
             inset(search),
         );
         let compact = area.width < 62;
-        let cols = Columns::new(area.width);
+        let cols = Columns::new(area.width, &snapshot.windows);
         let agents = if cols.agents > 0 {
             format!("{:width$}", "Subagents", width = cols.agents)
         } else {
@@ -586,7 +586,7 @@ impl View {
             Line::from(format!(
                 "  {:state_width$}{:time_width$}{agents}{tokens}Thread",
                 "State",
-                "Turn time",
+                "Elapsed",
                 state_width = cols.state,
                 time_width = cols.time
             ))
@@ -744,7 +744,7 @@ impl View {
             usize::from(width).saturating_sub(cols.state + cols.time + cols.agents + cols.tokens);
         let mut summary = vec![Span::styled(state.to_owned(), state_style)];
         let mut state_width = state.width();
-        if cols.state >= 26
+        if cols.state >= STATE_WITH_AGE_WIDTH
             && let Some(elapsed) = state_age(row, observed_at)
         {
             let elapsed = clip(
@@ -822,7 +822,7 @@ impl View {
                 ))
                 .style(normal),
             );
-            let timing = if cols.state < 26 {
+            let timing = if cols.state < STATE_WITH_AGE_WIDTH {
                 state_age(row, observed_at)
                     .map(|elapsed| format!("{} · {elapsed}  ·  ", row.state.label()))
                     .unwrap_or_default()
@@ -971,6 +971,8 @@ fn state_age(row: &Row, observed_at: u64) -> Option<String> {
     .map(|at| age(observed_at, at))
 }
 
+const STATE_WITH_AGE_WIDTH: usize = 22;
+
 #[derive(Clone, Copy)]
 struct Columns {
     state: usize,
@@ -979,17 +981,25 @@ struct Columns {
     tokens: usize,
 }
 impl Columns {
-    fn new(width: u16) -> Self {
+    fn new(width: u16, rows: &[Row]) -> Self {
+        // Keep widths stable while browsing/filtering; grow only for longer live counts.
+        let agents_width = rows
+            .iter()
+            .filter_map(|row| row.agents.as_ref())
+            .map(|agents| agents.label().width() + 1)
+            .max()
+            .unwrap_or(11)
+            .clamp(11, 15);
         Self {
             state: if width >= 90 {
-                26
+                STATE_WITH_AGE_WIDTH
             } else if width >= 62 {
                 12
             } else {
                 6
             },
-            time: if width < 62 { 10 } else { 11 },
-            agents: if width >= 50 { 15 } else { 0 },
+            time: 8,
+            agents: if width >= 50 { agents_width } else { 0 },
             tokens: if width >= 70 { 10 } else { 0 },
         }
     }
