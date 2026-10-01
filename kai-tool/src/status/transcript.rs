@@ -53,6 +53,7 @@ pub(super) struct View {
     pub cwd: Option<PathBuf>,
     pub state: TurnState,
     pub last_finished_at: Option<i64>,
+    pub input_requested_at: Option<i64>,
     pub completion: Option<Completion>,
     pub started_at: Option<i64>,
     pub duration_ms: Option<u64>,
@@ -247,6 +248,7 @@ impl Transcript {
             self.skipped_line = !complete_line;
             self.turn = None;
             self.input_requests.clear();
+            self.view.input_requested_at = None;
             self.view.state = TurnState::Unknown;
             self.view.last_finished_at = None;
             self.view.started_at = None;
@@ -320,6 +322,7 @@ impl Transcript {
         self.view.state = TurnState::Unknown;
         self.turn = None;
         self.input_requests.clear();
+        self.view.input_requested_at = None;
         self.view.started_at = None;
         self.view.duration_ms = None;
         self.view.detail = Some(detail.into());
@@ -364,6 +367,7 @@ impl Transcript {
             ("event_msg", "task_started" | "turn_started") => {
                 self.turn = payload.turn_id;
                 self.input_requests.clear();
+                self.view.input_requested_at = None;
                 self.view.state = TurnState::Working;
                 self.view.started_at = payload.started_at.or(at);
                 self.view.duration_ms = None;
@@ -402,6 +406,7 @@ impl Transcript {
                 self.view.detail = None;
                 self.turn = None;
                 self.input_requests.clear();
+                self.view.input_requested_at = None;
             }
             ("turn_context", _) => {
                 if let Some(cwd) = payload.cwd {
@@ -412,6 +417,11 @@ impl Transcript {
                 if self.main && payload.name.as_deref().is_some_and(is_input_request) =>
             {
                 if let Some(id) = payload.call_id {
+                    // Measure the continuous wait, without restarting it for duplicate
+                    // records or another question while a response is still pending.
+                    if self.input_requests.is_empty() {
+                        self.view.input_requested_at = at;
+                    }
                     self.input_requests.insert(id);
                     self.view.state = TurnState::NeedsInput;
                 }
@@ -423,6 +433,7 @@ impl Transcript {
                     .is_some_and(|id| self.input_requests.remove(id))
                     && self.input_requests.is_empty() =>
             {
+                self.view.input_requested_at = None;
                 self.view.state = if self.turn.is_some() {
                     TurnState::Working
                 } else {

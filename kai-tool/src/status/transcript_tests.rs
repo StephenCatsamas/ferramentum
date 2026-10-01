@@ -134,6 +134,97 @@ fn only_synchronous_input_requests_block_and_matching_responses_resume() {
     assert_eq!(transcript.view().state, TurnState::Working);
 }
 
+fn input_call(id: &str, timestamp: Option<&str>) -> String {
+    format!(
+        "{}\n",
+        json!({"timestamp":timestamp, "type":"response_item", "payload":{
+            "type":"function_call", "name":"functions.request_user_input", "call_id":id
+        }})
+    )
+}
+
+fn input_result(id: &str) -> String {
+    format!(
+        "{}\n",
+        json!({"type":"response_item", "payload":{
+            "type":"function_call_output", "call_id":id
+        }})
+    )
+}
+
+#[test]
+fn input_age_tracks_the_continuous_wait_and_restarts_after_all_answers() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_started", "one"), &mut transcript);
+    append(
+        &mut file,
+        &input_call("first", Some("1970-01-01T00:01:00Z")),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().input_requested_at, Some(60));
+    for id in ["first", "second"] {
+        append(
+            &mut file,
+            &input_call(id, Some("1970-01-01T00:02:00Z")),
+            &mut transcript,
+        );
+        assert_eq!(transcript.view().input_requested_at, Some(60));
+    }
+    for id in ["unrelated", "first"] {
+        append(&mut file, &input_result(id), &mut transcript);
+        assert_eq!(transcript.view().state, TurnState::NeedsInput);
+        assert_eq!(transcript.view().input_requested_at, Some(60));
+    }
+    append(&mut file, &input_result("second"), &mut transcript);
+    assert_eq!(transcript.view().state, TurnState::Working);
+    assert_eq!(transcript.view().input_requested_at, None);
+    append(
+        &mut file,
+        &input_call("third", Some("1970-01-01T00:03:00Z")),
+        &mut transcript,
+    );
+    assert_eq!(transcript.view().input_requested_at, Some(180));
+    // Opening a dashboard mid-wait recovers the same start from the persisted log.
+    let mut reopened = Transcript::default();
+    reopened.refresh(file.path()).unwrap();
+    assert_eq!(reopened.view().input_requested_at, Some(180));
+}
+
+#[test]
+fn input_age_is_cleared_on_lifecycle_changes_and_missing_timestamps_are_not_invented() {
+    for next in [
+        event("task_started", "next"),
+        event("task_complete", "one"),
+        event("turn_aborted", "one"),
+        "malformed record\n".into(),
+    ] {
+        let mut file = NamedTempFile::new().unwrap();
+        let mut transcript = Transcript::default();
+        append(&mut file, &header(json!("cli")), &mut transcript);
+        append(&mut file, &event("task_started", "one"), &mut transcript);
+        append(
+            &mut file,
+            &input_call("first", Some("1970-01-01T00:01:00Z")),
+            &mut transcript,
+        );
+        assert_eq!(transcript.view().input_requested_at, Some(60));
+        append(&mut file, &next, &mut transcript);
+        assert_eq!(transcript.view().input_requested_at, None);
+        for timestamp in [None, Some("invalid")] {
+            append(
+                &mut file,
+                &input_call("missing", timestamp),
+                &mut transcript,
+            );
+            assert_eq!(transcript.view().state, TurnState::NeedsInput);
+            assert_eq!(transcript.view().input_requested_at, None);
+            append(&mut file, &input_result("missing"), &mut transcript);
+        }
+    }
+}
+
 #[test]
 fn partial_appends_are_retried_and_invalid_records_do_not_claim_completion() {
     let mut file = NamedTempFile::new().unwrap();

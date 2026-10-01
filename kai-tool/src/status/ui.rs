@@ -204,6 +204,7 @@ impl Filter {
 struct Palette {
     selection: Style,
     secondary: Style,
+    unread: Style,
     colors: bool,
 }
 impl Palette {
@@ -233,6 +234,17 @@ impl Palette {
         Self {
             selection,
             secondary: Style::new().dim(),
+            unread: if !colors {
+                Style::new()
+            } else if truecolor {
+                Style::new()
+                    .fg(Color::Rgb(240, 228, 192))
+                    .bg(Color::Rgb(48, 44, 26))
+            } else if term.contains("256color") {
+                Style::new().fg(Color::Indexed(230)).bg(Color::Indexed(235))
+            } else {
+                Style::new().white().on_dark_gray()
+            },
             colors,
         }
     }
@@ -565,11 +577,6 @@ impl View {
         } else {
             String::new()
         };
-        let last_finished = if cols.finished > 0 {
-            format!("{:width$}", "Last ended", width = cols.finished)
-        } else {
-            String::new()
-        };
         let tokens = if cols.tokens > 0 {
             format!("{:width$}", "Tokens", width = cols.tokens)
         } else {
@@ -577,7 +584,7 @@ impl View {
         };
         frame.render_widget(
             Line::from(format!(
-                "  {:state_width$}{:time_width$}{agents}{tokens}{last_finished}Thread",
+                "  {:state_width$}{:time_width$}{agents}{tokens}Thread",
                 "State",
                 "Turn time",
                 state_width = cols.state,
@@ -728,19 +735,39 @@ impl View {
         } else {
             row.state.label()
         };
-        let title_width = usize::from(width)
-            .saturating_sub(cols.state + cols.time + cols.agents + cols.tokens + cols.finished);
-        let mut summary = vec![
-            Span::styled(format!("{state:width$}", width = cols.state), state_style),
-            Span::styled(
-                format!(
-                    "{:width$}",
-                    clip(&run_time(row.run_time_ms), cols.time.saturating_sub(1)),
-                    width = cols.time
-                ),
-                normal,
+        let emphasis = if selected || !self.palette.colors {
+            Style::new().bold()
+        } else {
+            Style::new().yellow().bold()
+        };
+        let title_width =
+            usize::from(width).saturating_sub(cols.state + cols.time + cols.agents + cols.tokens);
+        let mut summary = vec![Span::styled(state.to_owned(), state_style)];
+        let mut state_width = state.width();
+        if cols.state >= 26
+            && let Some(elapsed) = state_age(row, observed_at)
+        {
+            let elapsed = clip(
+                &format!(" · {elapsed}"),
+                cols.state.saturating_sub(state_width + 1),
+            );
+            state_width += elapsed.width();
+            summary.push(Span::styled(
+                elapsed,
+                if unread { emphasis } else { normal },
+            ));
+        }
+        summary.push(Span::raw(
+            " ".repeat(cols.state.saturating_sub(state_width)),
+        ));
+        summary.push(Span::styled(
+            format!(
+                "{:width$}",
+                clip(&run_time(row.run_time_ms), cols.time.saturating_sub(1)),
+                width = cols.time
             ),
-        ];
+            normal,
+        ));
         if cols.agents > 0 {
             let agents = row
                 .agents
@@ -769,15 +796,6 @@ impl View {
                 normal,
             ));
         }
-        if cols.finished > 0 {
-            let finished = row
-                .last_finished_at
-                .map_or_else(|| "—".into(), |at| age(observed_at, at));
-            summary.push(Span::styled(
-                format!("{finished:width$}", width = cols.finished),
-                normal,
-            ));
-        }
         let title = format!(
             "{}{}",
             if unread { "● " } else { "" },
@@ -785,10 +803,8 @@ impl View {
         );
         summary.push(Span::styled(
             clip(&title, title_width),
-            if selected || (unread && !self.palette.colors) {
-                Style::new().bold()
-            } else if unread {
-                Style::new().yellow().bold()
+            if selected || unread {
+                emphasis
             } else {
                 Style::new()
             },
@@ -806,18 +822,25 @@ impl View {
                 ))
                 .style(normal),
             );
-            let finished = row
-                .last_finished_at
-                .map_or_else(|| "—".into(), |at| age(observed_at, at));
-            lines.push(
-                Line::from(clip(
-                    &format!("Last ended {finished}  ·  PID {}", row.pid),
-                    width.into(),
-                ))
-                .style(normal),
-            );
+            let timing = if cols.state < 26 {
+                state_age(row, observed_at)
+                    .map(|elapsed| format!("{} · {elapsed}  ·  ", row.state.label()))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let timing = clip(&timing, width.into());
+            let pid_width = usize::from(width).saturating_sub(timing.width());
+            lines.push(Line::from(vec![
+                Span::styled(timing, if unread { emphasis } else { normal }),
+                Span::styled(clip(&format!("PID {}", row.pid), pid_width), normal),
+            ]));
         }
-        ListItem::new(lines)
+        ListItem::new(lines).style(if unread && !selected && self.palette.colors {
+            self.palette.unread
+        } else {
+            Style::new()
+        })
     }
 
     fn details(&self, snapshot: &Snapshot, width: usize) -> Vec<String> {
@@ -854,8 +877,22 @@ impl View {
                 row.tty.as_deref().unwrap_or("no tty"),
                 row.cwd.as_deref().unwrap_or("—")
             ));
+            if row.state == TurnState::NeedsInput {
+                messages.push(format!(
+                    "Input requested {}",
+                    state_age(row, snapshot.observed_at).unwrap_or_else(|| "—".into())
+                ));
+            }
+            let ending = if matches!(
+                row.state,
+                TurnState::Ready | TurnState::Interrupted | TurnState::Error
+            ) {
+                "Last ended"
+            } else {
+                "Previous turn ended"
+            };
             messages.push(format!(
-                "Last ended {}  ·  PID {}",
+                "{ending} {}  ·  PID {}",
                 row.last_finished_at
                     .map_or_else(|| "—".into(), |at| age(snapshot.observed_at, at)),
                 row.pid
@@ -925,22 +962,35 @@ fn short_state(state: TurnState) -> &'static str {
     }
 }
 
+fn state_age(row: &Row, observed_at: u64) -> Option<String> {
+    match row.state {
+        TurnState::NeedsInput => row.input_requested_at,
+        TurnState::Ready | TurnState::Interrupted | TurnState::Error => row.last_finished_at,
+        TurnState::Working | TurnState::Unknown => None,
+    }
+    .map(|at| age(observed_at, at))
+}
+
 #[derive(Clone, Copy)]
 struct Columns {
     state: usize,
     time: usize,
     agents: usize,
     tokens: usize,
-    finished: usize,
 }
 impl Columns {
     fn new(width: u16) -> Self {
         Self {
-            state: if width < 62 { 6 } else { 12 },
+            state: if width >= 90 {
+                26
+            } else if width >= 62 {
+                12
+            } else {
+                6
+            },
             time: if width < 62 { 10 } else { 11 },
             agents: if width >= 50 { 15 } else { 0 },
             tokens: if width >= 70 { 10 } else { 0 },
-            finished: if width >= 110 { 14 } else { 0 },
         }
     }
 }

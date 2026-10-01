@@ -107,6 +107,8 @@ mod observer {
         pub(super) token_usage: Option<super::tokens::Usage>,
         pub(super) last_finished_at: Option<i64>,
         #[serde(skip)]
+        pub(super) input_requested_at: Option<i64>,
+        #[serde(skip)]
         pub(super) completion: Option<super::transcript::Completion>,
         // Retained as null for JSON v1 compatibility; exited processes are removed.
         pub(super) exited_at: Option<u64>,
@@ -204,6 +206,7 @@ mod observer {
                     agents: None,
                     token_usage: None,
                     last_finished_at: None,
+                    input_requested_at: None,
                     completion: None,
                     exited_at: None,
                     detail: None,
@@ -223,6 +226,7 @@ mod observer {
                             .or(row.cwd);
                         row.state = root.state;
                         row.last_finished_at = root.last_finished_at;
+                        row.input_requested_at = root.input_requested_at;
                         row.completion = root.completion.clone();
                         row.detail.clone_from(&root.detail);
                         row.agents = Some(super::agents::summarize(&root.id, children, true));
@@ -520,6 +524,33 @@ mod observer {
             live.warning = Some("Cannot inspect Codex's open session logs".into());
             let partial = observer.observe(vec![live], vec![], 103, |_| Ok(true));
             assert!(partial.windows[0].agents.is_none());
+        }
+
+        #[test]
+        fn blocking_question_time_reaches_the_dashboard_without_changing_json() {
+            use serde_json::json;
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("root.jsonl");
+            std::fs::write(
+                &root,
+                concat!(
+                    "{\"type\":\"session_meta\",\"payload\":{\"id\":\"root\",\"source\":\"cli\"}}\n",
+                    "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"one\"}}\n",
+                    "{\"type\":\"response_item\",\"timestamp\":\"1970-01-01T00:01:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"request_user_input\",\"call_id\":\"question\"}}\n"
+                ),
+            )
+            .unwrap();
+            let mut live = window(1);
+            live.transcripts = vec![root];
+            let mut observer = Observer::default();
+            let snapshot = observer.observe(vec![live], vec![], 100, |_| Ok(true));
+            let row = &snapshot.windows[0];
+            assert_eq!(row.state, TurnState::NeedsInput);
+            assert_eq!(row.input_requested_at, Some(60));
+            assert_eq!(row.last_finished_at, None);
+            let output = serde_json::to_value(row).unwrap();
+            assert_eq!(output["state"], json!("needs_input"));
+            assert!(output.get("input_requested_at").is_none());
         }
 
         #[test]

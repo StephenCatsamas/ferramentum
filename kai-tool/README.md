@@ -33,13 +33,20 @@ Install with `cargo install --path kai-tool --locked --force`.
 opened before the dashboard started. Its Ratatui interface follows the `kai r` session picker:
 blue selection, a `›` marker, subdued metadata, type-to-search, and keyboard hints below the list.
 Rows show thread names and **Turn time**, a **Subagents** column from 50 columns wide,
-**Tokens** from 70 columns, and **Last ended** from 110 columns. Turn time
-is elapsed time for the current turn, or the final duration of the most recent ended turn;
+and **Tokens** from 70 columns. From 90 columns, **State** includes a relative time:
+`Ready · 3m ago`, `Needs input · 3m ago`, or `Interrupted · 3m ago`.
+Ready, Interrupted, and Error use the latest turn ending; Needs input measures the continuous
+wait since the first pending blocking question. Active and Unknown have no age. Missing timestamps
+are omitted. Narrower terminals show only the state, with its age in comfortable rows and Ctrl-E
+details. The previous turn ending is retained in details, including while a new turn is active.
+Turn time is elapsed time for the current turn, or the final duration of the most recent ended turn;
 it is not the age of the whole session.
 Names come from Codex's `session_index.jsonl`, including subsequent renames.
 
-Newly completed main turns gain a **●** before the thread name and a bold yellow title until
-their window is seen. The marker remains visible without color and on the selected row.
+Newly completed main turns gain a **●** before the thread name, bold yellow emphasis on the title
+and completion age, and a subtle tint across the row until their window is seen. Blue selection
+takes precedence over the tint; the marker and bold emphasis remain visible without color and
+on the selected row.
 Focusing the actual session clears it, including switching through the desktop rather than Kai;
 successful Enter-to-focus also clears it. Results observed while their session is focused are
 already seen. Merely selecting, searching for, or opening details for a dashboard row does not
@@ -149,7 +156,7 @@ Rust tests, formatting, and Clippy commands.
 | Error | The latest recorded turn completion contains an error. |
 | Unknown | There is insufficient evidence to identify the main conversation or its state. |
 
-“Last ended” refers to a turn ending, including interruptions and errors; it does not mean
+The State completion age refers to a turn ending, including interruptions and errors; it does not mean
 the overall task was accomplished. Only open windows are listed; closed-window history is not kept.
 If a process cannot be inspected, it remains Unknown until a refresh can confirm its state or exit.
 
@@ -183,7 +190,7 @@ are Unix seconds, run time is milliseconds, and state names
 are `working`, `ready`, `needs_input`, `interrupted`, `error`, or `unknown`. `warnings`
 reports incomplete process discovery. No terminal escape sequences are emitted in JSON mode.
 The existing JSON names `working`, `run_time_ms`, and `last_finished_at` remain unchanged;
-they correspond to the UI's Active, Turn time, and Last ended. UI filters do not remove rows
+they correspond to the UI's Active, Turn time, and turn-ending timestamp. UI filters do not remove rows
 from JSON output. The legacy `exited_at` field remains present as null for version 1 compatibility;
 exited rows are no longer emitted.
 The additive `agents` object contains `total`, `running`, `ready`, `interrupted`, `error`,

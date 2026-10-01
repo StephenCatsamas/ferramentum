@@ -16,6 +16,7 @@ fn row(state: TurnState, turn: &str, at_ms: i64) -> Row {
         agents: None,
         token_usage: None,
         last_finished_at: Some(at_ms / 1000),
+        input_requested_at: None,
         exited_at: None,
         detail: None,
         completion: Some(Completion {

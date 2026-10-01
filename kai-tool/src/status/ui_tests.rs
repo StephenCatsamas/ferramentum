@@ -23,6 +23,7 @@ fn snapshot() -> Snapshot {
                 }),
                 run_time_ms: Some(65000),
                 last_finished_at: Some(900),
+                input_requested_at: None,
                 completion: Some(super::super::transcript::Completion {
                     turn_id: Some("previous".into()),
                     at_ms: Some(900_000),
@@ -51,6 +52,9 @@ fn view() -> View {
             .bg(Color::Rgb(99, 168, 248))
             .bold(),
         secondary: Style::new().dim(),
+        unread: Style::new()
+            .fg(Color::Rgb(240, 228, 192))
+            .bg(Color::Rgb(48, 44, 26)),
         colors: true,
     })
 }
@@ -109,6 +113,142 @@ fn failed_or_delayed_focus_results_do_not_clear_unread_completions() {
     view.focusing = Some(target);
     view.finish_focus(Ok(1_000_101));
     assert!(!view.attention.unseen(&snapshot.windows[0]));
+}
+
+#[test]
+fn state_age_uses_the_current_wait_or_completion_and_collapses_on_narrow_screens() {
+    for (state, expected) in [
+        (TurnState::Working, "Active"),
+        (TurnState::NeedsInput, "Needs input · 20s ago"),
+        (TurnState::Ready, "Ready · 1m ago"),
+        (TurnState::Interrupted, "Interrupted · 1m ago"),
+        (TurnState::Error, "Error · 1m ago"),
+        (TurnState::Unknown, "Unknown"),
+    ] {
+        let mut snapshot = snapshot();
+        snapshot.windows.truncate(1);
+        snapshot.windows[0].state = state;
+        snapshot.windows[0].input_requested_at = Some(980);
+        let mut view = view();
+        view.reconcile(&snapshot);
+        for width in [90, 120] {
+            let text = contents(&render(&mut view, &snapshot, width, 24));
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("Last ended"), "{text}");
+            if matches!(state, TurnState::Working | TurnState::Unknown) {
+                assert!(!text.contains("ago"), "{text}");
+            }
+            assert!(text.contains("Prepare release"), "{text}");
+        }
+        for width in [38, 70, 89] {
+            let text = contents(&render(&mut view, &snapshot, width, 24));
+            assert!(!text.contains("ago"), "{text}");
+            view.dense = false;
+            let text = contents(&render(&mut view, &snapshot, width, 24));
+            if state_age(&snapshot.windows[0], snapshot.observed_at).is_some() {
+                assert!(text.contains(expected), "{text}");
+            } else {
+                assert!(!text.contains("ago"), "{text}");
+            }
+            view.dense = true;
+        }
+        if state == TurnState::NeedsInput {
+            view.expanded = true;
+            let text = contents(&render(&mut view, &snapshot, 70, 40));
+            assert!(text.contains("Input requested 20s ago"), "{text}");
+            snapshot.windows[0].input_requested_at = None;
+            view.expanded = false;
+            let text = contents(&render(&mut view, &snapshot, 120, 24));
+            assert!(!text.contains("ago"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn unread_tint_covers_the_row_and_time_while_selection_and_no_color_remain_readable() {
+    use ratatui::style::Modifier;
+    for colors in [true, false] {
+        for dense in [true, false] {
+            for width in [120, 70] {
+                let mut snapshot = snapshot();
+                let mut view = view();
+                view.palette.colors = colors;
+                if !colors {
+                    view.palette.selection = Style::new().reversed().bold();
+                }
+                view.dense = dense;
+                view.attention.observe(&snapshot.windows, 1_000_000);
+                snapshot.windows[0].state = TurnState::Ready;
+                snapshot.windows[0].completion.as_mut().unwrap().turn_id = Some("new".into());
+                view.attention.observe(&snapshot.windows, 1_000_001);
+                view.reconcile(&snapshot);
+                for selected in [false, true] {
+                    view.key(
+                        key(if selected {
+                            KeyCode::Home
+                        } else {
+                            KeyCode::Down
+                        }),
+                        &snapshot,
+                    );
+                    let terminal = render(&mut view, &snapshot, width, 24);
+                    let buffer = terminal.backend().buffer();
+                    let y = (0..24)
+                        .find(|&y| {
+                            (0..width)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                                .contains("Prepare")
+                        })
+                        .unwrap();
+                    let expected_bg = if selected {
+                        view.palette.selection.bg.unwrap_or(Color::Reset)
+                    } else if colors {
+                        view.palette.unread.bg.unwrap()
+                    } else {
+                        Color::Reset
+                    };
+                    for row_y in y..y + if dense { 1 } else { 3 } {
+                        for x in 1..width - 1 {
+                            assert_eq!(buffer[(x, row_y)].bg, expected_bg, "x={x}, y={row_y}");
+                        }
+                    }
+                    // The combined State age (or comfortable-row age at narrow widths)
+                    // gets the same emphasis as the thread name.
+                    if width >= 90 || !dense {
+                        let age_y = if width >= 90 { y } else { y + 2 };
+                        let age_x = (0..width - 2)
+                            .find(|&x| {
+                                buffer[(x, age_y)].symbol() == "a"
+                                    && buffer[(x + 1, age_y)].symbol() == "g"
+                                    && buffer[(x + 2, age_y)].symbol() == "o"
+                            })
+                            .unwrap();
+                        let cell = &buffer[(age_x, age_y)];
+                        assert!(cell.modifier.contains(Modifier::BOLD));
+                        if colors && !selected {
+                            assert_eq!(cell.fg, Color::Yellow);
+                        }
+                    }
+                }
+                view.key(
+                    KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                    &snapshot,
+                );
+                view.key(key(KeyCode::Down), &snapshot);
+                let terminal = render(&mut view, &snapshot, width, 24);
+                assert!(!contents(&terminal).contains("● Prepare"));
+                assert!(
+                    !terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .any(|cell| cell.bg == view.palette.unread.bg.unwrap())
+                );
+            }
+        }
+    }
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -260,7 +400,10 @@ fn comfortable_view_and_expansion_show_terminal_directory_and_thread_id() {
     let terminal = render(&mut view, &snapshot, 90, 24);
     let text = contents(&terminal);
     assert!(text.contains("pts/0  ·  /workspace/kai"));
-    assert!(text.contains("Last ended 1m ago  ·  PID 10"));
+    assert!(
+        text.contains("Previous turn ended 1m ago · PID 10"),
+        "{text}"
+    );
     assert!(text.contains("Thread thread-0"));
     assert!(text.contains("ctrl+o dense"));
 }
