@@ -23,6 +23,10 @@ fn snapshot() -> Snapshot {
                 }),
                 run_time_ms: Some(65000),
                 last_finished_at: Some(900),
+                completion: Some(super::super::transcript::Completion {
+                    turn_id: Some("previous".into()),
+                    at_ms: Some(900_000),
+                }),
                 exited_at: None,
                 detail: None,
                 agents: Some(super::super::agents::Summary {
@@ -49,6 +53,62 @@ fn view() -> View {
         secondary: Style::new().dim(),
         colors: true,
     })
+}
+
+#[test]
+fn unread_completion_has_a_marker_without_color_and_browsing_does_not_clear_it() {
+    for colors in [true, false] {
+        for width in [120, 70, 38] {
+            let mut snapshot = snapshot();
+            let mut view = view();
+            view.palette.colors = colors;
+            view.attention.observe(&snapshot.windows, 1_000_000);
+            snapshot.windows[0].state = TurnState::Ready;
+            snapshot.windows[0].completion = Some(super::super::transcript::Completion {
+                turn_id: Some("finished".into()),
+                at_ms: Some(1_000_001),
+            });
+            // A ready parent is unread even when its subagents are still running.
+            snapshot.windows[0].agents.as_mut().unwrap().running = 2;
+            view.attention.observe(&snapshot.windows, 1_000_002);
+            view.reconcile(&snapshot);
+            view.key(key(KeyCode::Down), &snapshot);
+            assert!(view.attention.unseen(&snapshot.windows[0]));
+            let text = contents(&render(&mut view, &snapshot, width, 18));
+            assert!(text.contains("● Prepare"), "{text}");
+            view.key(key(KeyCode::Home), &snapshot);
+            view.key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                &snapshot,
+            );
+            assert!(!view.attention.unseen(&snapshot.windows[0]));
+            let text = contents(&render(&mut view, &snapshot, width, 18));
+            assert!(!text.contains("● Prepare"), "{text}");
+        }
+    }
+}
+
+#[test]
+fn failed_or_delayed_focus_results_do_not_clear_unread_completions() {
+    let mut snapshot = snapshot();
+    let mut view = view();
+    view.attention.observe(&snapshot.windows, 1_000_000);
+    snapshot.windows[0].state = TurnState::Ready;
+    snapshot.windows[0].completion = Some(super::super::transcript::Completion {
+        turn_id: Some("finished".into()),
+        at_ms: Some(1_000_100),
+    });
+    view.attention.observe(&snapshot.windows, 1_000_200);
+    let target = snapshot.windows[0].identity;
+    view.focusing = Some(target);
+    view.finish_focus(Err(anyhow::anyhow!("Not focused")));
+    assert!(view.attention.unseen(&snapshot.windows[0]));
+    view.focusing = Some(target);
+    view.finish_focus(Ok(1_000_099));
+    assert!(view.attention.unseen(&snapshot.windows[0]));
+    view.focusing = Some(target);
+    view.finish_focus(Ok(1_000_101));
+    assert!(!view.attention.unseen(&snapshot.windows[0]));
 }
 
 fn key(code: KeyCode) -> KeyEvent {

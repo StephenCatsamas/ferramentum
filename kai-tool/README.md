@@ -38,6 +38,29 @@ is elapsed time for the current turn, or the final duration of the most recent e
 it is not the age of the whole session.
 Names come from Codex's `session_index.jsonl`, including subsequent renames.
 
+Newly completed main turns gain a **●** before the thread name and a bold yellow title until
+their window is seen. The marker remains visible without color and on the selected row.
+Focusing the actual session clears it, including switching through the desktop rather than Kai;
+successful Enter-to-focus also clears it. Results observed while their session is focused are
+already seen. Merely selecting, searching for, or opening details for a dashboard row does not
+acknowledge it. Ctrl-R marks the selected displayed completion read manually. New work and
+closed windows clear the marker; a ready parent can be unread while subagents continue running.
+
+Unread tracking belongs to the interactive dashboard and starts when it opens. Already-ready
+sessions establish a baseline rather than being labelled unread without an interaction history.
+Thread switches and reused process IDs establish new baselines. Markers have no time-based
+expiry; temporary discovery failures preserve them until the state can be read again. Terminal
+titles, plain output, and JSON output are unchanged.
+
+Focus is sampled by a separate worker approximately every half-second, independently of the
+session refresh interval. Very brief visits between samples can be missed; Ctrl-R is also useful
+on unsupported desktops or terminal arrangements. Sway, Hyprland, X11, and the updated GNOME
+companion extension use the same unambiguous terminal matching as window switching. macOS reads
+the foreground Terminal/iTerm2 tab's tty using AppleScript and its existing Automation permission.
+Focus-query errors appear only in Ctrl-E details; stalled helpers cannot block the dashboard.
+GNOME users must update the extension for its read-only `GetWindows` method. The feature adds no
+background service or persistent interaction history.
+
 Subagents shows the number of subagents with an active recorded turn (for example, `2 active`),
 including nested descendants.
 It follows currently open subagent logs, using root/parent thread IDs to associate

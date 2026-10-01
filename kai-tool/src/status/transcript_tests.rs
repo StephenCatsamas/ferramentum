@@ -41,6 +41,33 @@ fn root_and_subagent_logs_are_distinguished() {
 }
 
 #[test]
+fn completion_identity_preserves_milliseconds_and_rejects_delayed_old_turns() {
+    let mut file = NamedTempFile::new().unwrap();
+    let mut transcript = Transcript::default();
+    append(&mut file, &header(json!("cli")), &mut transcript);
+    append(&mut file, &event("task_started", "first"), &mut transcript);
+    append(
+        &mut file,
+        &event("task_complete", "first").replace("00Z", "00.123Z"),
+        &mut transcript,
+    );
+    let first = transcript.view().completion.unwrap();
+    assert_eq!(first.turn_id.as_deref(), Some("first"));
+    assert_eq!(first.at_ms.unwrap() % 1000, 123);
+    append(&mut file, &event("task_started", "second"), &mut transcript);
+    append(&mut file, &event("task_complete", "first"), &mut transcript);
+    assert_eq!(transcript.view().completion, Some(first.clone()));
+    append(
+        &mut file,
+        &event("task_complete", "second").replace("00Z", "00.456Z"),
+        &mut transcript,
+    );
+    let second = transcript.view().completion.unwrap();
+    assert_eq!(second.turn_id.as_deref(), Some("second"));
+    assert_eq!(second.at_ms.unwrap() - first.at_ms.unwrap(), 333);
+}
+
+#[test]
 fn lifecycle_rejects_old_completion_and_retains_the_previous_finish_time() {
     let mut file = NamedTempFile::new().unwrap();
     let mut transcript = Transcript::default();

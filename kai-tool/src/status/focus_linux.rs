@@ -1,4 +1,5 @@
 //! Desktop backends live here; the picker only supplies a stable process identity.
+use super::attention::{Focused, Target, now_ms};
 use super::command;
 use super::process::{Ancestor, ProcessIdentity};
 use super::process_linux as process;
@@ -21,6 +22,17 @@ enum Backend {
 }
 
 impl Backend {
+    fn current() -> Result<Self> {
+        Self::detect(
+            std::env::var_os("SWAYSOCK"),
+            &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+            std::env::var("XDG_SESSION_TYPE").is_ok_and(|value| value == "wayland")
+                || std::env::var_os("WAYLAND_DISPLAY").is_some(),
+            std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
+            std::env::var_os("DISPLAY").is_some(),
+        )
+    }
+
     fn detect(
         socket: Option<OsString>,
         desktop: &str,
@@ -54,14 +66,7 @@ impl Backend {
 
 pub(super) fn focus(identity: ProcessIdentity, cancel: &Cancellation) -> Result<()> {
     cancel.check()?;
-    let backend = Backend::detect(
-        std::env::var_os("SWAYSOCK"),
-        &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
-        std::env::var("XDG_SESSION_TYPE").is_ok_and(|value| value == "wayland")
-            || std::env::var_os("WAYLAND_DISPLAY").is_some(),
-        std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some(),
-        std::env::var_os("DISPLAY").is_some(),
-    )?;
+    let backend = Backend::current()?;
     match backend {
         Backend::Sway => focus_sway(Path::new("/proc"), identity, |kind, payload| {
             let reply = command::run("swaymsg", &["-r", "-t", if kind == 4 { "get_tree" } else { "command" }, payload], Duration::from_secs(2), cancel)
@@ -72,6 +77,95 @@ pub(super) fn focus(identity: ProcessIdentity, cancel: &Cancellation) -> Result<
         Backend::Gnome => focus_gnome(identity, cancel),
         Backend::X11 => focus_x11(identity, cancel),
     }
+}
+
+/// Read desktop focus without activating a window. Resolve the same unambiguous,
+/// birth-checked terminal ancestry used by Enter-to-focus.
+pub(super) fn focused(targets: Vec<Target>, cancel: &Cancellation) -> Result<Focused> {
+    focused_with(
+        Path::new("/proc"),
+        &targets,
+        Backend::current()?,
+        |program, args| command::run(program, args, Duration::from_secs(1), cancel),
+    )
+}
+
+fn focused_with(
+    proc_root: &Path,
+    targets: &[Target],
+    backend: Backend,
+    mut run: impl FnMut(&str, &[&str]) -> Result<Vec<u8>>,
+) -> Result<Focused> {
+    let at_ms = now_ms();
+    let chains: Vec<_> = targets
+        .iter()
+        .filter_map(|target| {
+            checked_chain(proc_root, target.identity)
+                .ok()
+                .map(|chain| (target.identity, chain))
+        })
+        .collect();
+    let tree: Node = match backend {
+        Backend::Sway => serde_json::from_slice(&run("swaymsg", &["-r", "-t", "get_tree"])?)?,
+        Backend::Hyprland => {
+            let mut tree = hyprland_tree(&run("hyprctl", &["-j", "clients"])?)?;
+            let active: Value = serde_json::from_slice(&run("hyprctl", &["-j", "activewindow"])?)?;
+            if let (Some(address), Some(pid)) = (active["address"].as_str(), active["pid"].as_u64())
+            {
+                let id = hex_id(address)?;
+                for node in &mut tree.nodes {
+                    node.focused = node.id == id && node.pid.map(u64::from) == Some(pid);
+                }
+            }
+            tree
+        }
+        Backend::X11 => {
+            let before = run("xprop", &["-root", "_NET_ACTIVE_WINDOW"])?;
+            let mut tree = x11_tree(&run("wmctrl", &["-lp"])?)?;
+            let active = run("xprop", &["-root", "_NET_ACTIVE_WINDOW"])?;
+            let id = std::str::from_utf8(&active)?
+                .split_whitespace()
+                .last()
+                .and_then(|id| hex_id(id).ok());
+            for node in &mut tree.nodes {
+                node.focused = before == active && Some(node.id) == id;
+            }
+            tree
+        }
+        Backend::Gnome => {
+            let reply = run(
+                "gdbus",
+                &[
+                    "call",
+                    "--session",
+                    "--dest",
+                    "org.gnome.Shell",
+                    "--object-path",
+                    "/org/gnome/Shell/Extensions/KaiWindowFocus",
+                    "--method",
+                    "org.gnome.Shell.Extensions.KaiWindowFocus.GetWindows",
+                ],
+            )
+            .context("Update and enable the Kai Window Focus GNOME extension for focus tracking")?;
+            // The extension returns numeric IDs/PIDs and booleans only, so its JSON
+            // needs no GVariant string unescaping. Never interpret titles or shell text.
+            let json = std::str::from_utf8(&reply)?
+                .trim()
+                .strip_prefix("('")
+                .and_then(|value| value.strip_suffix("',)"))
+                .context("Invalid GNOME window snapshot")?;
+            serde_json::from_str(json)?
+        }
+    };
+    let identities = chains
+        .into_iter()
+        .filter_map(|(identity, chain)| {
+            let window = resolve(&tree, &chain).ok()?;
+            (window.focused && process::ancestry(proc_root, identity).ok().as_ref() == Some(&chain))
+                .then_some(identity)
+        })
+        .collect();
+    Ok(Focused { at_ms, identities })
 }
 
 fn focus_sway(

@@ -36,6 +36,67 @@ fn tree(focused: bool) -> Value {
 }
 
 #[test]
+fn observes_focus_read_only_and_rejects_shared_windows_and_reused_processes() {
+    let (dir, identity) = fixture();
+    let targets = [Target { identity }];
+    let query = |value: Value| {
+        focused_with(dir.path(), &targets, Backend::Sway, |program, args| {
+            assert_eq!(program, "swaymsg");
+            assert_eq!(args, ["-r", "-t", "get_tree"]);
+            Ok(serde_json::to_vec(&value).unwrap())
+        })
+        .unwrap()
+        .identities
+    };
+    assert_eq!(query(tree(true)), [identity]);
+    assert!(query(tree(false)).is_empty());
+    assert!(
+        query(json!({"id": 0, "nodes": [
+            {"id":42,"pid":30,"focused":true}, {"id":43,"pid":30}
+        ]}))
+        .is_empty()
+    );
+    proc_stat(dir.path(), 10, 20, "kai", 101);
+    assert!(query(tree(true)).is_empty());
+}
+
+#[test]
+fn observes_hyprland_x11_and_gnome_without_activation_commands() {
+    let (dir, identity) = fixture();
+    let targets = [Target { identity }];
+    for backend in [Backend::Hyprland, Backend::X11, Backend::Gnome] {
+        let observed = focused_with(dir.path(), &targets, backend, |program, args| {
+            Ok(match (program, args) {
+                ("hyprctl", ["-j", "clients"]) => br#"[{"address":"0x2a","pid":30}]"#.to_vec(),
+                ("hyprctl", ["-j", "activewindow"]) => br#"{"address":"0x2a","pid":30}"#.to_vec(),
+                ("wmctrl", ["-lp"]) => b"0x2a 0 30 hostname a title\n".to_vec(),
+                ("xprop", ["-root", "_NET_ACTIVE_WINDOW"]) => {
+                    b"_NET_ACTIVE_WINDOW(WINDOW): window id # 0x2a\n".to_vec()
+                }
+                ("gdbus", _)
+                    if args.last()
+                        == Some(&"org.gnome.Shell.Extensions.KaiWindowFocus.GetWindows") =>
+                {
+                    format!("('{}',)", tree(true)).into_bytes()
+                }
+                _ => panic!("unexpected or mutating command: {program} {args:?}"),
+            })
+        })
+        .unwrap();
+        assert_eq!(observed.identities, [identity]);
+    }
+    let observed = focused_with(dir.path(), &targets, Backend::Hyprland, |_, args| {
+        Ok(if args == ["-j", "clients"] {
+            br#"[{"address":"0x2a","pid":30}]"#.to_vec()
+        } else {
+            b"{}".to_vec()
+        })
+    })
+    .unwrap();
+    assert!(observed.identities.is_empty());
+}
+
+#[test]
 fn focuses_the_exact_window_and_checks_the_desktop_reply() {
     let (dir, identity) = fixture();
     let mut calls = Vec::new();

@@ -4,6 +4,8 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod agents;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod attention;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod command;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod focus;
@@ -104,6 +106,8 @@ mod observer {
         pub(super) agents: Option<super::agents::Summary>,
         pub(super) token_usage: Option<super::tokens::Usage>,
         pub(super) last_finished_at: Option<i64>,
+        #[serde(skip)]
+        pub(super) completion: Option<super::transcript::Completion>,
         // Retained as null for JSON v1 compatibility; exited processes are removed.
         pub(super) exited_at: Option<u64>,
         pub(super) detail: Option<String>,
@@ -200,6 +204,7 @@ mod observer {
                     agents: None,
                     token_usage: None,
                     last_finished_at: None,
+                    completion: None,
                     exited_at: None,
                     detail: None,
                 };
@@ -218,6 +223,7 @@ mod observer {
                             .or(row.cwd);
                         row.state = root.state;
                         row.last_finished_at = root.last_finished_at;
+                        row.completion = root.completion.clone();
                         row.detail.clone_from(&root.detail);
                         row.agents = Some(super::agents::summarize(&root.id, children, true));
                         row.token_usage = root.token_usage;

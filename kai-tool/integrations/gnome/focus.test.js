@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {FocusConfirmation, focusWindow} from './focus.js';
+import {FocusConfirmation, focusWindow, windowSnapshot} from './focus.js';
+
+test('read-only snapshot keeps ambiguous windows separate and suppresses focus while locked', () => {
+    const first = {get_pid: () => 42, get_stable_sequence: () => 1};
+    const second = {get_pid: () => 42, get_stable_sequence: () => 2};
+    assert.deepEqual(windowSnapshot([first, second], second, false), {id: 0, nodes: [
+        {id: 1, pid: 42, focused: false}, {id: 2, pid: 42, focused: true},
+    ]});
+    assert.equal(windowSnapshot([first], first, true).nodes[0].focused, false);
+    assert.deepEqual(windowSnapshot([], null, false), {id: 0, nodes: []});
+});
 
 test('activates one exact process and refuses stale, ambiguous, or locked targets', async () => {
     const window = {get_pid: () => 42};

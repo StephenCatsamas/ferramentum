@@ -1,10 +1,10 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-import {FocusConfirmation, focusWindow} from './focus.js';
+import {FocusConfirmation, focusWindow, windowSnapshot} from './focus.js';
 
-const xml = `<node><interface name="org.gnome.Shell.Extensions.KaiWindowFocus"><method name="Focus"><arg type="u" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>`;
+const xml = `<node><interface name="org.gnome.Shell.Extensions.KaiWindowFocus"><method name="Focus"><arg type="u" direction="in"/><arg type="s" direction="in"/><arg type="s" direction="out"/></method><method name="GetWindows"><arg type="s" direction="out"/></method></interface></node>`;
 const loop = GLib.MainLoop.new(null, false);
-const target = {get_pid: () => 42};
+const target = {get_pid: () => 42, get_stable_sequence: () => 1};
 const signals = new Map();
 let active = null;
 let timers = 0;
@@ -42,6 +42,7 @@ const confirmation = new FocusConfirmation({
     schedule,
 });
 const service = Gio.DBusExportedObject.wrapJSObject(xml, {
+    GetWindows: () => JSON.stringify(windowSnapshot([target], active, false)),
     FocusAsync: ([pid, startTicks], invocation) => {
         focusWindow({
             pid, startTicks, locked: () => false, windows: [target],
@@ -69,7 +70,21 @@ connection.call(connection.get_unique_name(), path,
                 throw new Error(`Unexpected asynchronous reply: ${result}`);
             if (signals.size || timers)
                 throw new Error('Confirmation leaked signals or timers');
-            print('GJS asynchronous D-Bus focus confirmed after delayed activation; cleanup passed');
+            connection.call(connection.get_unique_name(), path,
+                'org.gnome.Shell.Extensions.KaiWindowFocus', 'GetWindows',
+                null, new GLib.VariantType('(s)'), Gio.DBusCallFlags.NONE, 2000, null,
+                (source, reply) => {
+                    try {
+                        const [json] = source.call_finish(reply).deepUnpack();
+                        const window = JSON.parse(json).nodes[0];
+                        if (window.id !== 1 || window.pid !== 42 || !window.focused)
+                            throw new Error(`Unexpected window snapshot: ${json}`);
+                        print('GJS asynchronous focus and read-only window snapshot passed; cleanup passed');
+                    } catch (error) { failure = error; }
+                    GLib.Source.remove(watchdog);
+                    loop.quit();
+                });
+            return;
         } catch (error) {
             failure = error;
         }

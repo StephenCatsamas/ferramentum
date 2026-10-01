@@ -1,5 +1,6 @@
 //! Session-picker conventions used by `kai r`: compact chrome, blue selection,
 //! type-to-search, arrow navigation, Ctrl-O density, and a ruled shortcut footer.
+use super::attention::{Attention, Target, now_ms};
 use super::observer::{DISCOVERY_TIMEOUT, Observer, Row, Snapshot, age, now, safe_text};
 use super::process::ProcessIdentity;
 use super::transcript::TurnState;
@@ -32,7 +33,11 @@ use unicode_width::UnicodeWidthStr;
 pub(super) fn watch(interval: Duration) -> Result<()> {
     let mut observer = Observer::default();
     let mut observation = Worker::new(move |(), cancel| observer.snapshot(now(), cancel));
-    let mut focusing = Worker::new(super::focus::focus);
+    let mut focusing = Worker::new(|identity, cancel: &super::worker::Cancellation| {
+        super::focus::focus(identity, cancel)?;
+        Ok(now_ms())
+    });
+    let mut interactions = Worker::new(super::focus::focused);
     // Restore the terminal before bounded worker/helper cleanup during shutdown.
     let _screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -46,6 +51,7 @@ pub(super) fn watch(interval: Duration) -> Result<()> {
     view.loading = true;
     view.reconcile(&snapshot);
     let mut next_refresh = Instant::now();
+    let mut next_interaction_check = Instant::now();
     let mut dirty = true;
     loop {
         if let Some(result) = observation.poll() {
@@ -53,6 +59,7 @@ pub(super) fn watch(interval: Duration) -> Result<()> {
             match result {
                 Ok(update) => {
                     snapshot = update;
+                    view.attention.observe(&snapshot.windows, now_ms());
                     view.refresh_error = None;
                     view.reconcile(&snapshot);
                 }
@@ -65,19 +72,29 @@ pub(super) fn watch(interval: Duration) -> Result<()> {
             observation.start((), DISCOVERY_TIMEOUT)?;
         }
         if let Some(result) = focusing.poll() {
-            let target = view.focusing;
-            view.focusing = None;
-            view.notice = result.err().map(|error| {
-                safe_text(
-                    &format!(
-                        "PID {}: {error:#}",
-                        target.map_or(0, |identity| identity.pid)
-                    ),
-                    2048,
-                )
-            });
-            view.focus_error.clone_from(&view.notice);
+            view.finish_focus(result);
             dirty = true;
+        }
+        if let Some(result) = interactions.poll() {
+            let delay = if result.is_ok() { 500 } else { 5000 };
+            match result {
+                Ok(update) => {
+                    view.attention.focused(update);
+                    view.interaction_error = None;
+                }
+                Err(error) => view.interaction_error = Some(format!("{error:#}")),
+            }
+            next_interaction_check = Instant::now() + Duration::from_millis(delay);
+            dirty = true;
+        }
+        if !interactions.busy()
+            && !snapshot.windows.is_empty()
+            && Instant::now() >= next_interaction_check
+        {
+            interactions.start(
+                snapshot.windows.iter().map(Target::from).collect(),
+                Duration::from_secs(3),
+            )?;
         }
         if dirty {
             terminal.draw(|frame| view.draw(frame, &snapshot, interval))?;
@@ -246,6 +263,8 @@ struct View {
     palette: Palette,
     notice: Option<String>,
     focus_error: Option<String>,
+    interaction_error: Option<String>,
+    attention: Attention,
     loading: bool,
     focusing: Option<ProcessIdentity>,
     refresh_error: Option<String>,
@@ -255,6 +274,23 @@ struct View {
 }
 
 impl View {
+    fn finish_focus(&mut self, result: Result<u64>) {
+        let target = self.focusing.take();
+        if let (Ok(at_ms), Some(identity)) = (&result, target) {
+            self.attention.acknowledge(identity, *at_ms);
+        }
+        self.notice = result.err().map(|error| {
+            safe_text(
+                &format!(
+                    "PID {}: {error:#}",
+                    target.map_or(0, |identity| identity.pid)
+                ),
+                2048,
+            )
+        });
+        self.focus_error.clone_from(&self.notice);
+    }
+
     fn new(palette: Palette) -> Self {
         Self {
             query: String::new(),
@@ -268,6 +304,8 @@ impl View {
             palette,
             notice: None,
             focus_error: None,
+            interaction_error: None,
+            attention: Attention::default(),
             loading: false,
             focusing: None,
             refresh_error: None,
@@ -350,6 +388,11 @@ impl View {
                 self.detail_scroll = 0;
             }
             KeyCode::Char('u') if control => self.query.clear(),
+            KeyCode::Char('r') if control => {
+                if let Some(identity) = self.selected {
+                    self.attention.mark_read(identity);
+                }
+            }
             KeyCode::Up => self.select(index.saturating_sub(1), snapshot),
             KeyCode::Down => self.select(index.saturating_add(1).min(last), snapshot),
             KeyCode::PageUp if self.expanded => {
@@ -457,12 +500,20 @@ impl View {
             )
         };
         let mut header_text = format!("Kai windows  ·  {} open", snapshot.windows.len());
+        let unread = snapshot
+            .windows
+            .iter()
+            .filter(|row| self.attention.unseen(row))
+            .count();
         if self.loading {
             header_text = "Kai windows  ·  Loading…".into();
         } else if self.refresh_error.is_some() {
             header_text.push_str("  ·  Stale · Ctrl+E details");
         } else if !snapshot.warnings.is_empty() {
             header_text.push_str("  ·  Discovery warnings · Ctrl+E details");
+        }
+        if unread > 0 {
+            header_text.push_str(&format!("  ·  ● {unread} unread"));
         }
         frame.render_widget(Line::from(header_text).bold(), inset(header));
         frame.render_widget(notice, inset(message));
@@ -606,7 +657,11 @@ impl View {
                         inset(footer).width,
                     ),
                     hints(
-                        &[("ctrl+o", density), ("ctrl+e", "details")],
+                        &[
+                            ("ctrl+o", density),
+                            ("ctrl+e", "details"),
+                            ("ctrl+r", "mark read"),
+                        ],
                         self.palette.secondary,
                         inset(footer).width,
                     ),
@@ -628,6 +683,7 @@ impl View {
                         &[
                             ("ctrl+o", density),
                             ("ctrl+e", "details"),
+                            ("ctrl+r", "mark read"),
                             ("pgup/pgdn", if self.expanded { "details" } else { "page" }),
                         ],
                         self.palette.secondary,
@@ -656,6 +712,7 @@ impl View {
         index: usize,
     ) -> ListItem<'static> {
         let selected = self.list.selected() == Some(index);
+        let unread = self.attention.unseen(row);
         let normal = if selected {
             Style::new()
         } else {
@@ -721,13 +778,17 @@ impl View {
                 normal,
             ));
         }
+        let title = format!(
+            "{}{}",
+            if unread { "● " } else { "" },
+            row.thread_name.as_deref().unwrap_or("Unnamed thread")
+        );
         summary.push(Span::styled(
-            clip(
-                row.thread_name.as_deref().unwrap_or("Unnamed thread"),
-                title_width,
-            ),
-            if selected {
+            clip(&title, title_width),
+            if selected || (unread && !self.palette.colors) {
                 Style::new().bold()
+            } else if unread {
+                Style::new().yellow().bold()
             } else {
                 Style::new()
             },
@@ -767,6 +828,11 @@ impl View {
         if let Some(error) = &self.refresh_error {
             messages.push(error.clone());
         }
+        if let Some(error) = &self.interaction_error {
+            messages.push(format!(
+                "Focus tracking: {error}. Ctrl+R marks the selected completion read."
+            ));
+        }
         for warning in &snapshot.warnings {
             messages.push(format!("Discovery: {warning}"));
         }
@@ -775,6 +841,11 @@ impl View {
             .iter()
             .find(|row| Some(row.identity) == self.selected)
         {
+            if self.attention.unseen(row) {
+                messages.push(
+                    "● Unread completion · focus this session or press Ctrl+R to mark read".into(),
+                );
+            }
             if let Some(detail) = &row.detail {
                 messages.push(format!("{}: {detail}", row.state.label()));
             }

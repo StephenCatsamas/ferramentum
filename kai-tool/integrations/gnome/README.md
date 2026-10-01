@@ -1,7 +1,11 @@
 # Kai Window Focus
 
 Internal status: **beta**. This companion extension supplies GNOME Wayland window activation
-for `kai status --watch`. It exports one narrow D-Bus method; it does not enable Shell.Eval.
+for `kai status --watch`. It exports narrow `Focus` and read-only `GetWindows` D-Bus methods;
+it does not enable Shell.Eval. `GetWindows` returns numeric window IDs, process IDs, and focus
+flags so the dashboard can clear unread completions when users switch through the desktop.
+It excludes titles and contents and reports no focused window while the desktop is locked.
+Update an older installation to enable automatic unread clearing through this backend.
 The code targets GNOME Shell 45–51's ES module API. Native GNOME testing is still required;
 the activation logic has fixture tests. Activation waits asynchronously for the requested window
 to receive focus, for up to one second. Closing the window, locking the session, or disabling the

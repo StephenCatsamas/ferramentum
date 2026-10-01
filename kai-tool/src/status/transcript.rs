@@ -38,6 +38,13 @@ impl TurnState {
     }
 }
 
+/// Identity and precise log time of the last terminal event; never contains response text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Completion {
+    pub turn_id: Option<String>,
+    pub at_ms: Option<i64>,
+}
+
 #[derive(Clone, Default)]
 pub(super) struct View {
     pub id: String,
@@ -46,6 +53,7 @@ pub(super) struct View {
     pub cwd: Option<PathBuf>,
     pub state: TurnState,
     pub last_finished_at: Option<i64>,
+    pub completion: Option<Completion>,
     pub started_at: Option<i64>,
     pub duration_ms: Option<u64>,
     pub detail: Option<String>,
@@ -327,11 +335,11 @@ impl Transcript {
     }
 
     fn apply(&mut self, record: Record) {
-        let at = record
+        let timestamp = record
             .timestamp
             .as_deref()
-            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
-            .map(OffsetDateTime::unix_timestamp);
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok());
+        let at = timestamp.map(OffsetDateTime::unix_timestamp);
         let payload = record.payload;
         match (record.kind.as_str(), payload.kind.as_str()) {
             ("token_usage_record", _) if payload.thread_id.as_deref() == Some(&self.view.id) => {
@@ -375,6 +383,11 @@ impl Transcript {
                     TurnState::Ready
                 };
                 self.view.last_finished_at = payload.completed_at.or(at);
+                self.view.completion = Some(Completion {
+                    turn_id: payload.turn_id.clone().or_else(|| self.turn.clone()),
+                    at_ms: timestamp
+                        .and_then(|time| (time.unix_timestamp_nanos() / 1_000_000).try_into().ok()),
+                });
                 self.view.started_at = payload.started_at.or(self.view.started_at);
                 self.view.duration_ms = payload
                     .duration_ms

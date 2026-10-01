@@ -1,3 +1,12 @@
+// Snapshot only IDs and focus. Shared-PID windows stay separate so clients can
+// reject ambiguous terminals; a locked desktop never acknowledges a completion.
+export function windowSnapshot(windows, focused, locked) {
+    return {id: 0, nodes: windows.map(window => ({
+        id: window.get_stable_sequence(), pid: window.get_pid(),
+        focused: !locked && window === focused,
+    }))};
+}
+
 export async function focusWindow({pid, startTicks, locked, windows, readStat, activateAndWait}) {
     const sameProcess = () => {
         const stat = readStat(pid);

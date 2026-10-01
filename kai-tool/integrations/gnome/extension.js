@@ -3,10 +3,13 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import {FocusConfirmation, focusWindow} from './focus.js';
+import {FocusConfirmation, focusWindow, windowSnapshot} from './focus.js';
 
 const interfaceXml = `<node>
   <interface name="org.gnome.Shell.Extensions.KaiWindowFocus">
+    <method name="GetWindows">
+      <arg name="snapshot" type="s" direction="out"/>
+    </method>
     <method name="Focus">
       <arg name="pid" type="u" direction="in"/>
       <arg name="startTicks" type="s" direction="in"/>
@@ -43,6 +46,9 @@ export default class KaiWindowFocus extends Extension {
         });
         this._confirmation = confirmation;
         this._service = Gio.DBusExportedObject.wrapJSObject(interfaceXml, {
+            GetWindows: () => JSON.stringify(windowSnapshot(
+                global.get_window_actors().map(actor => actor.meta_window),
+                global.display.focus_window, Main.sessionMode.isLocked)),
             FocusAsync: ([pid, startTicks], invocation) => {
                 const reply = result => invocation.return_value(new GLib.Variant('(s)', [result]));
                 focusWindow({

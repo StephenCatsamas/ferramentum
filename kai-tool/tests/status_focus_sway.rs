@@ -85,16 +85,29 @@ fn focused(tree: &Value, pid: u32) -> bool {
 #[test]
 #[ignore = "requires headless Sway and Foot; run explicitly on Linux"]
 fn enter_focuses_selected_window_without_leaving_the_dashboard() {
-    exercise_focus(false);
+    exercise_focus(false, false);
 }
 
 #[test]
 #[ignore = "requires headless Sway and Foot; run explicitly on Linux"]
 fn slow_focus_keeps_keys_responsive_and_escape_or_quit_reaps_helpers() {
-    exercise_focus(true);
+    exercise_focus(true, false);
 }
 
-fn exercise_focus(slow: bool) {
+#[test]
+#[ignore = "requires headless Sway and Foot; run explicitly on Linux"]
+fn new_completions_are_unread_until_external_focus_or_enter() {
+    exercise_focus(false, true);
+}
+
+fn rendered(parser: &mut vt100::Parser, receiver: &std::sync::mpsc::Receiver<Vec<u8>>) -> String {
+    for chunk in receiver.try_iter() {
+        parser.process(&chunk);
+    }
+    parser.screen().contents()
+}
+
+fn exercise_focus(slow: bool, attention: bool) {
     let root = tempfile::tempdir().unwrap();
     let runtime = root.path().join("runtime");
     fs::create_dir(&runtime).unwrap();
@@ -154,6 +167,15 @@ fn exercise_focus(slow: bool) {
         format!("{}\n", json!({"id":"focus-fixture","thread_name":title})),
     )
     .unwrap();
+    if attention {
+        let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"first"}})
+        )
+        .unwrap();
+    }
     let codex = root.path().join("codex");
     fs::write(&codex, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.158.0'; exit; fi\nexec 3< \"$KAI_FOCUS_LOG\"\nwhile :; do /bin/sleep 1; done\n").unwrap();
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
@@ -202,7 +224,7 @@ fn exercise_focus(slow: bool) {
         let helper = root.path().join("swaymsg");
         fs::write(
             &helper,
-            "#!/bin/sh\necho $$ > \"$KAI_HELPER_PID\"\n/bin/sleep 30\n",
+            "#!/bin/sh\nif [ \"$#\" = 3 ]; then exec /usr/bin/swaymsg \"$@\"; fi\necho $$ > \"$KAI_HELPER_PID\"\n/bin/sleep 30\n",
         )
         .unwrap();
         fs::set_permissions(helper, fs::Permissions::from_mode(0o700)).unwrap();
@@ -227,6 +249,56 @@ fn exercise_focus(slow: bool) {
         String::from_utf8_lossy(&screen).contains(&title)
     });
     input.write_all(title.as_bytes()).unwrap();
+    let mut parser = vt100::Parser::new(30, 120, 0);
+    parser.process(&screen);
+    if attention {
+        let finish = |turn| {
+            let mut file = fs::OpenOptions::new().append(true).open(&log).unwrap();
+            for kind in ["task_started", "task_complete"] {
+                writeln!(
+                    file,
+                    "{}",
+                    json!({"type":"event_msg","payload":{"type":kind,"turn_id":turn}})
+                )
+                .unwrap();
+            }
+        };
+        let activate = |pid| {
+            fn id(node: &Value, pid: u32) -> Option<u64> {
+                if node["pid"] == pid {
+                    return node["id"].as_u64();
+                }
+                ["nodes", "floating_nodes"].into_iter().find_map(|key| {
+                    node[key]
+                        .as_array()
+                        .and_then(|nodes| nodes.iter().find_map(|node| id(node, pid)))
+                })
+            }
+            let target = id(&tree(&ipc), pid).unwrap();
+            assert!(
+                Command::new("swaymsg")
+                    .arg("-s")
+                    .arg(&ipc)
+                    .arg(format!("[con_id={target}] focus"))
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        };
+        input.flush().unwrap();
+        finish("first");
+        wait(|| rendered(&mut parser, &recv).contains(&format!("● {title}")));
+        // A desktop shortcut or mouse focus must acknowledge without Enter in Kai.
+        activate(first.0.id());
+        wait(|| {
+            let contents = rendered(&mut parser, &recv);
+            contents.contains(&title) && !contents.contains(&format!("● {title}"))
+        });
+        activate(second.0.id());
+        finish("second");
+        wait(|| rendered(&mut parser, &recv).contains(&format!("● {title}")));
+    }
     input.write_all(b"\r").unwrap();
     input.flush().unwrap();
     if slow {
@@ -283,6 +355,9 @@ fn exercise_focus(slow: bool) {
         assert!(focused(&tree(&ipc), second.0.id()));
     } else {
         wait(|| focused(&tree(&ipc), first.0.id()));
+        if attention {
+            wait(|| !rendered(&mut parser, &recv).contains(&format!("● {title}")));
+        }
     }
     if !slow {
         assert!(watcher.0.try_wait().unwrap().is_none());
