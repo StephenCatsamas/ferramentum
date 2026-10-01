@@ -189,7 +189,7 @@ impl Client {
         body: Option<&Value>,
         timeout: Duration,
     ) -> Result<(Value, Option<usize>)> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + crate::lifecycle::remaining_timeout(timeout)?;
         let read = method == Method::GET;
         let max_attempts = if read {
             self.retry_policy.max_attempts.max(1)

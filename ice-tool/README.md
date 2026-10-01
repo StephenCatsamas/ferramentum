@@ -1,7 +1,12 @@
 # ice
 
-Minimal CLI for deploying and managing workloads on `vast.ai`, `gcp`, `aws`, `verda`, and `local`.
-
+Ice manages machines and workloads on Vast, Verda, AWS, GCP and local runtimes.
+It helps rent machines for short work sessions: select within explicit resource
+and price limits, provision, connect, transfer files, and release resources.
+Setup wall time matters. Prefer a provider image containing the needed tools,
+reuse a suitable rental across nearby jobs, and delete it at the agreed end.
+Application installation, benchmarks and CUDA/profiling admission belong in the
+workload project. Ice does not turn SSH readiness into an application guarantee.
 ## Install
 
 ```bash
@@ -35,7 +40,7 @@ Supported cloud identifiers:
 - `vast.ai`
 - `gcp`
 - `aws`
-- `verda` — ordinary GPU VMs with SSH; see [Verda setup, billing and profiling](docs/verda.md).
+- `verda` — ordinary GPU VMs with SSH; see [Verda setup, images and billing](docs/verda.md).
 - `local`
 
 ## Commands
@@ -76,14 +81,14 @@ ice logs --cloud local INSTANCE --follow --json
 JSON uses the same provider and workload support as each existing command. Actual
 creation and previews both support JSON, including managed workloads. Interactive
 shell sessions require a terminal: `shell --json` requires `--print-creds`, which
-supports Vast, GCP and AWS. Local shell connection printing remains unsupported.
+supports Vast, Verda, GCP and AWS. Local shell connection printing remains unsupported.
 Clap's `--help`, `help` and argument-validation usage text remain human-readable;
 argument errors with `--json` put that text inside a JSON error message.
 
 Successful commands other than `logs` write one JSON object and a newline to stdout:
 
 ```json
-{"schema_version":1,"command":"list","cloud":"vast.ai","result":{"instances":[]}}
+{"schema_version":2,"command":"list","cloud":"vast.ai","result":{"instances":[]}}
 ```
 
 - `list` returns an `instances` array with stable string IDs, names, provider state
@@ -107,9 +112,7 @@ Successful commands other than `logs` write one JSON object and a newline to std
   instance. `--no-probe` prints reported connection details with
   `readiness: "unchecked"` instead. It can include a local
   identity-file path, but never key contents or provider credentials.
-- `start` and `stop` return the observed instance state and a `changed` boolean,
-  distinguishing an already running/stopped instance from a state transition.
-  `delete` returns `status: "deleted"`, `instance_id` and `name` after deletion.
+- `start`, `stop` and `delete` share a verified lifecycle result, documented below.
 - `pull` and `push` return `status: "completed"`, the requested instance identifier
   and the local/remote paths after the transfer succeeds. Paths retain the user's
   spelling; omitted destinations are represented as `"."`.
@@ -138,7 +141,7 @@ Progress, prompts and diagnostics use stderr. Failures write an error envelope t
 stdout and return a nonzero exit status:
 
 ```json
-{"schema_version":1,"command":"list","cloud":"gcp","error":{"code":"command_failed","message":"Failed to list instances"}}
+{"schema_version":2,"command":"list","cloud":"gcp","error":{"code":"command_failed","message":"Failed to list instances"}}
 ```
 
 Argument parsing errors use `code: "invalid_arguments"` and exit status 2; command
@@ -211,8 +214,7 @@ creates temporary keys or changes account-wide keys. `--preserve-ephemeral`
 remains accepted for compatibility and reports that it is no longer needed.
 Reuse a suitable instance across short jobs in a work session.
 Use `start` explicitly if it is stopped; connection lookup returns
-`instance_stopped` instead of prompting to start it. Stop preserves storage;
-delete removes the instance and its data.
+`instance_stopped` instead of prompting to start it. Stopping and deleting have different billing and storage effects; see below.
 
 Ice disables cloud CLI prompts/pagers and uses SSH batch authentication for
 unattended probes and transfers. Interactive shells and `--custom` are rejected
@@ -266,6 +268,46 @@ is not confirmation of the stopped state. Inspect the instance and delete it whe
 no longer needed; storage billing continues after stop. Existing provider jobs
 are not migrated or removed automatically.
 
+## Verified lifecycle operations
+
+JSON schema version **2** changes lifecycle results. For example:
+
+```json
+{"schema_version":2,"command":"delete","cloud":"gcp","result":{"action":"delete","instance_id":"ice-example","outcome":"verified","state":"deleted","request":"acknowledged","verification":"read_back","elapsed_ms":2040,"mutation_retried":false,"instance":null,"storage":{"verification":"unknown","deleted_volume_ids":null,"retained_volume_ids":null}}}
+```
+
+A successful provider request is only an acknowledgement. Ice reads the selected
+resource again and waits for the requested state; AWS `shutting-down` and GCP
+`TERMINATED` do not count as deleted. GCP `TERMINATED` means stopped. Verification
+uses resource identity, not the presence of an Ice management label.
+
+`request` is `acknowledged`, `unconfirmed` (the receipt was lost or rejected but
+readback proved the state), or `not_needed` (already in the requested state).
+Ice submits each cloud lifecycle request once, then reconciles through reads.
+AWS/GCP requests run through their provider CLIs, which manage their own transport.
+Start verifies the running state, not SSH; use `shell --print-creds` to verify access.
+A failed read or deadline returns a nonzero exit with `operation_unverified`,
+known IDs, observed state when available, and reconciliation advice. It never
+reports deletion simply because a CLI accepted a request.
+
+`start/stop/delete --timeout 5m` bounds the command's provider requests,
+subprocesses and verification, including CLI availability and instance lookup.
+The default is five minutes. Deadline expiry kills a hung provider CLI locally;
+it cannot cancel an operation already accepted in the cloud. Before a mutation,
+a failed lookup/preflight can instead return `operation_timeout` with the input
+identifier. Creation retains its separate `--startup-timeout` readiness budget.
+Timeouts never trigger automatic deletion.
+
+AWS, GCP and Vast accept deletion directly, so Ice no longer requests stop and
+waits for it before deleting. Normal provider shutdown semantics apply; local
+containers still receive a graceful stop before removal. Removing the instance
+is distinct from removing all disks: generic lifecycle output marks storage
+cleanup `unknown`. Verda separately verifies the OS volume and reports retained
+attached volumes under `storage`, with detailed evidence under `provider_details`.
+Do not interpret VM deletion as proof that all storage charges have ended.
+Verda shutdown retains **compute and storage billing**. See its
+[cleanup contract](docs/verda.md#deadlines-failures-and-deletion).
+
 ## Config
 
 Ice uses the OS configuration directory: on Linux,
@@ -283,7 +325,8 @@ do not save answers or command-line overrides into this file.
 `create --no-defaults` ignores saved **search filters and disk preferences** for
 that invocation. It retains credentials, provider location/image settings, the
 default cloud, and the default runtime; pass `--cloud` and `--hours` explicitly
-when those must be reproducible. Existing disk fallbacks remain Vast 32 GB,
+when those must be reproducible. Verda additionally ignores its saved image and
+location, so supply `--image` explicitly with `--no-defaults`. Existing disk fallbacks remain Vast 32 GB,
 GCP 50 GB, and the AWS AMI's root volume size.
 
 Before searching, human output identifies effective filter values and their
@@ -305,7 +348,7 @@ Auth values are redacted in config output.
 
 ### Config keys
 
-- `default.cloud`: `vast.ai|gcp|aws|local`
+- `default.cloud`: `vast.ai|verda|gcp|aws|local`
 - `default.runtime_hours`
 - `default.vast_ai.min_cpus|min_ram_gb|allowed_gpus|max_price_per_hr`
 - `default.gcp.min_cpus|min_ram_gb|allowed_gpus|max_price_per_hr`
@@ -315,6 +358,9 @@ Auth values are redacted in config output.
   combinations fail during creation rather than being ignored.
 - `default.gcp.region|zone|image_family|image_project|boot_disk_gb`
 - `default.aws.region|ami|key_name|ssh_key_path|ssh_user|security_group_id|subnet_id|root_disk_gb`
+- `default.verda.image|location|ssh_key_id|ssh_key_path`
+- `default.verda.min_cpus|min_ram_gb|allowed_gpus|max_price_per_hr|gpu_count|min_gpu_memory_gb|disk_gb`
+- `auth.verda.client_id|client_secret`
 - `auth.vast_ai.api_key`
 - `auth.gcp.project|service_account_json`
 - `auth.aws.access_key_id|secret_access_key`
@@ -366,6 +412,9 @@ Behavior:
   base-price and reserved-discount fallbacks cannot bypass the ceiling. GCP/AWS
   caps and estimates cover compute. These are hourly limits, not total spending
   caps; bandwidth is billed separately and storage billing continues after stop.
+- `--image` selects a Verda provider OS catalog image (required explicitly or as
+  a saved default). It does not upload a local image or select a container image.
+  See [Verda provisioning and setup latency](docs/verda.md#image-provisioning-and-short-rentals).
 - `--machine` pins a specific marketplace machine type.
 - `--dry-run` reports the chosen machine and exits before provisioning.
 

@@ -5,14 +5,13 @@ use serde_json::json;
 
 use crate::cache::remove_instance;
 use crate::cli::{InstanceArgs, LogsArgs, PullArgs, PushArgs, ShellArgs};
+use crate::lifecycle::{Action, Budget};
 use crate::model::{Cloud, IceConfig};
 use crate::providers::{
     CloudInstance, CloudProvider, CommandProvider, RemoteCloudProvider, aws, gcp, local, vast,
     verda,
 };
-use crate::support::{
-    VAST_WAIT_TIMEOUT_SECS, ensure_provider_cli_installed, resolve_cloud, spinner,
-};
+use crate::support::{ensure_provider_cli_installed, resolve_cloud};
 
 pub(crate) fn cmd_logs(args: LogsArgs, config: &IceConfig) -> Result<()> {
     let cloud = resolve_cloud(args.cloud, config)?;
@@ -74,6 +73,7 @@ pub(crate) fn cmd_push(args: PushArgs, config: &IceConfig) -> Result<()> {
 }
 
 pub(crate) fn cmd_stop(args: InstanceArgs, config: &IceConfig) -> Result<()> {
+    let _budget = Budget::enter(Duration::from_secs(args.timeout))?;
     match resolve_cloud(args.cloud, config)? {
         Cloud::Verda => cmd_stop_cloud::<verda::Provider>(config, &args.instance),
         Cloud::VastAi => cmd_stop_cloud::<vast::Provider>(config, &args.instance),
@@ -84,6 +84,7 @@ pub(crate) fn cmd_stop(args: InstanceArgs, config: &IceConfig) -> Result<()> {
 }
 
 pub(crate) fn cmd_start(args: InstanceArgs, config: &IceConfig) -> Result<()> {
+    let _budget = Budget::enter(Duration::from_secs(args.timeout))?;
     match resolve_cloud(args.cloud, config)? {
         Cloud::Verda => cmd_start_cloud::<verda::Provider>(config, &args.instance),
         Cloud::VastAi => cmd_start_cloud::<vast::Provider>(config, &args.instance),
@@ -94,6 +95,7 @@ pub(crate) fn cmd_start(args: InstanceArgs, config: &IceConfig) -> Result<()> {
 }
 
 pub(crate) fn cmd_delete(args: InstanceArgs, config: &IceConfig) -> Result<()> {
+    let _budget = Budget::enter(Duration::from_secs(args.timeout))?;
     match resolve_cloud(args.cloud, config)? {
         Cloud::Verda => verda::delete(config, &args.instance),
         Cloud::VastAi => cmd_delete_remote::<vast::Provider>(config, &args.instance),
@@ -153,143 +155,48 @@ fn run_push<P: CommandProvider>(config: &IceConfig, args: &PushArgs) -> Result<(
 }
 
 fn cmd_stop_cloud<P: CloudProvider>(config: &IceConfig, identifier: &str) -> Result<()> {
-    ensure_cli::<P>()?;
-    let context = P::context(config)?;
-    let instance = P::resolve_instance(&context, identifier)?;
-    let name = instance.display_name();
-    if instance.is_stopped() {
-        if crate::output::is_json() {
-            return crate::output::emit(
-                "stop",
-                P::CLOUD,
-                json!({
-                    "changed": false, "instance": instance.json_summary(),
-                }),
-            );
-        }
-        println!("Instance {name} is already stopped.");
-        return Ok(());
-    }
-    P::set_running(&context, &instance, false)?;
-    let stopped = P::wait_for_running_state(
-        &context,
-        &instance,
-        false,
-        Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-    )?;
-    if crate::output::is_json() {
-        return crate::output::emit(
-            "stop",
-            P::CLOUD,
-            json!({
-                "changed": true, "instance": stopped.json_summary(),
-            }),
-        );
-    }
-    println!("Stopped instance {name}.");
-    Ok(())
+    cmd_transition::<P>(config, identifier, Action::Stop).map(|_| ())
 }
-
 fn cmd_start_cloud<P: CloudProvider>(config: &IceConfig, identifier: &str) -> Result<()> {
-    ensure_cli::<P>()?;
-    let context = P::context(config)?;
-    let instance = P::resolve_instance(&context, identifier)?;
-    let name = instance.display_name();
-    if instance.is_running() {
-        if crate::output::is_json() {
-            return crate::output::emit(
-                "start",
-                P::CLOUD,
-                json!({
-                    "changed": false, "instance": instance.json_summary(),
-                }),
-            );
-        }
-        println!("Instance {name} is already running.");
-        return Ok(());
-    }
-    P::set_running(&context, &instance, true)?;
-    let started = P::wait_for_running_state(
-        &context,
-        &instance,
-        true,
-        Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-    )?;
-    if crate::output::is_json() {
-        return crate::output::emit(
-            "start",
-            P::CLOUD,
-            json!({
-                "changed": true, "instance": started.json_summary(),
-            }),
-        );
-    }
-    println!("Started instance {name}.");
-    Ok(())
+    cmd_transition::<P>(config, identifier, Action::Start).map(|_| ())
 }
-
 fn cmd_delete_remote<P: RemoteCloudProvider>(config: &IceConfig, identifier: &str) -> Result<()>
 where
     <P::Instance as CloudInstance>::ListContext: Default,
 {
-    ensure_cli::<P>()?;
-    let context = P::context(config)?;
-    let mut instance = P::resolve_instance(&context, identifier)?;
-    if !instance.is_stopped() {
-        P::set_running(&context, &instance, false)?;
-        instance = P::wait_for_running_state(
-            &context,
-            &instance,
-            false,
-            Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-        )?;
-    }
-
-    let name = instance.display_name();
-    let spinner = spinner(&format!("Deleting instance {name}..."));
-    P::delete_instance(&context, &instance)?;
-    spinner.finish_with_message("Deleted.");
+    let instance = cmd_transition::<P>(config, identifier, Action::Delete)?;
     remove_instance::<P::CacheModel>(&instance);
-    if crate::output::is_json() {
-        return crate::output::emit(
-            "delete",
-            P::CLOUD,
-            json!({
-                "status": "deleted", "instance_id": instance.json_summary()["id"], "name": name,
-            }),
-        );
-    }
-    println!("Deleted instance {name}.");
     Ok(())
 }
-
 fn cmd_delete_local<P: CloudProvider>(config: &IceConfig, identifier: &str) -> Result<()> {
+    cmd_transition::<P>(config, identifier, Action::Delete).map(|_| ())
+}
+fn cmd_transition<P: CloudProvider>(
+    config: &IceConfig,
+    identifier: &str,
+    action: Action,
+) -> Result<P::Instance> {
+    crate::automation::recovery(
+        "resolving_instance",
+        json!({"action":action, "instance_identifier":identifier, "request":"not_sent"}),
+    );
     ensure_cli::<P>()?;
     let context = P::context(config)?;
-    let mut instance = P::resolve_instance(&context, identifier)?;
-    if !instance.is_stopped() {
-        P::set_running(&context, &instance, false)?;
-        instance = P::wait_for_running_state(
-            &context,
-            &instance,
-            false,
-            Duration::from_secs(VAST_WAIT_TIMEOUT_SECS),
-        )?;
-    }
-
-    let name = instance.display_name();
-    P::delete_instance(&context, &instance)?;
+    let instance = P::resolve_instance(&context, identifier)?;
+    let result = crate::lifecycle::transition::<P>(&context, &instance, action)?;
     if crate::output::is_json() {
-        return crate::output::emit(
-            "delete",
-            P::CLOUD,
-            json!({
-                "status": "deleted", "instance_id": instance.json_summary()["id"], "name": name,
-            }),
+        crate::output::emit(action.command(), P::CLOUD, result)?;
+    } else {
+        println!(
+            "{}: {} (verified)",
+            instance.display_name(),
+            result["state"].as_str().unwrap_or("unknown")
         );
+        if let Some(note) = result["billing_note"].as_str() {
+            eprintln!("{note}");
+        }
     }
-    println!("Deleted instance {name}.");
-    Ok(())
+    Ok(instance)
 }
 
 fn ensure_cli<P: CloudProvider>() -> Result<()> {

@@ -9,6 +9,7 @@ mod commands;
 mod config_store;
 mod gpu;
 mod http_retry;
+mod lifecycle;
 mod listing;
 mod local;
 mod login;

@@ -21,7 +21,6 @@ pub(crate) const CONFIG_FILE_NAME: &str = "config.toml";
 pub(crate) const ICE_LABEL_PREFIX: &str = "ice-";
 pub(crate) const VAST_DEFAULT_IMAGE: &str = "vastai/base-image:@vastai-automatic-tag";
 pub(crate) const VAST_DEFAULT_DISK_GB: f64 = 32.0;
-pub(crate) const VAST_WAIT_TIMEOUT_SECS: u64 = 900;
 pub(crate) const VAST_POLL_INTERVAL_SECS: u64 = 5;
 pub(crate) const VAST_LOG_READY_TIMEOUT_SECS: u64 = 30;
 pub(crate) const VAST_LOG_READY_POLL_INTERVAL_MILLIS: u64 = 1000;
@@ -354,6 +353,21 @@ pub(crate) fn ensure_provider_cli_installed(cloud: Cloud) -> Result<()> {
 }
 
 pub(crate) fn ensure_command_available(command: &str) -> Result<()> {
+    if crate::lifecycle::deadline().is_some() {
+        let flag = if std::path::Path::new(command)
+            .file_name()
+            .is_some_and(|name| name == "ssh")
+        {
+            "-V"
+        } else {
+            "--version"
+        };
+        return run_command_output(
+            Command::new(command).arg(flag),
+            "check provider CLI availability",
+        )
+        .map(|_| ());
+    }
     if std::path::Path::new(command)
         .file_name()
         .is_none_or(|name| name != "ssh")
@@ -417,16 +431,30 @@ pub(crate) fn run_command_output(
     context: &str,
 ) -> Result<std::process::Output> {
     crate::automation::prepare_command(command);
+    if crate::lifecycle::deadline().is_some() {
+        return crate::lifecycle::run_output(command, context);
+    }
     capulus::process::run_output(command, context)
 }
 
 pub(crate) fn run_command_json(command: &mut Command, context: &str) -> Result<Value> {
     crate::automation::prepare_command(command);
+    if crate::lifecycle::deadline().is_some() {
+        return serde_json::from_slice(&run_command_output(command, context)?.stdout)
+            .context("Invalid provider JSON response");
+    }
     capulus::process::run_json_value(command, context)
 }
 
 pub(crate) fn run_command_text(command: &mut Command, context: &str) -> Result<String> {
     crate::automation::prepare_command(command);
+    if crate::lifecycle::deadline().is_some() {
+        return Ok(
+            String::from_utf8(run_command_output(command, context)?.stdout)?
+                .trim()
+                .to_owned(),
+        );
+    }
     capulus::process::run_text(command, context)
 }
 
@@ -443,6 +471,9 @@ pub(crate) fn run_command_status(command: &mut Command, context: &str) -> Result
     crate::automation::prepare_command(command);
     if crate::output::streaming_logs() {
         return crate::output::run_log_command(command, context);
+    }
+    if crate::lifecycle::deadline().is_some() {
+        return run_command_output(command, context).map(|_| ());
     }
     capulus::process::run_status(command, context)
 }

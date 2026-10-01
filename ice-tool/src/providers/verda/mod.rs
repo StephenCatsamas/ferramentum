@@ -1,4 +1,4 @@
-//! Ordinary on-demand GPU VMs. No scheduler, automatic deletion or profiling guarantee.
+//! Short-lived ordinary GPU VMs. Workload setup and validation are external.
 mod catalog;
 mod client;
 mod deletion;
@@ -184,7 +184,7 @@ impl CloudInstance for Instance {
             "compute_hourly_usd": self.price_per_hour, "ssh_host": self.ip, "ssh_user": "root", "ssh_port": 22,
             "os_volume_id": self.os_volume_id, "volume_ids": self.volume_ids,
             "compute_charges_continue_after_stop": true, "storage_charges_continue_after_stop": true,
-            "automatic_stop": false, "automatic_delete": false, "profiling_access": "unverified",
+            "automatic_stop": false, "automatic_delete": false,
             "workload": {"kind":"shell"}})
     }
     fn cache_key(&self) -> String {
@@ -217,7 +217,7 @@ impl CloudInstance for Instance {
             ],
             detail_fields: vec![
                 format!("verda://{}", self.id),
-                "No automatic deadline; profiling unverified".into(),
+                "Manual cleanup required".into(),
             ],
             status_note: None,
             text_effect: Default::default(),
@@ -287,6 +287,9 @@ impl CloudProvider for Provider {
         timeout: Duration,
     ) -> Result<Instance> {
         client.wait(&instance.id, running, timeout)
+    }
+    fn observe_instance(client: &Client, instance: &Instance) -> Result<Option<Instance>> {
+        client.instance(&instance.id, REQUEST_TIMEOUT)
     }
     fn delete_instance(client: &Client, instance: &Instance) -> Result<()> {
         delete_selected(client, instance, crate::automation::startup_timeout()).map(|_| ())
@@ -386,7 +389,7 @@ pub(crate) fn catalog_command(cloud: Cloud, config: &IceConfig) -> Result<()> {
         bail!("`ice catalog` currently supports --cloud verda only");
     }
     let catalog = Catalog::load(&Client::from_config(config)?)?;
-    let result = json!({"catalog": catalog, "profiling_access":"unverified", "prices_are_estimates":true, "billing_note":BILLING});
+    let result = json!({"catalog": catalog, "prices_are_estimates":true, "billing_note":BILLING});
     if crate::output::is_json() {
         crate::output::emit("catalog", cloud, result)
     } else {
@@ -414,7 +417,7 @@ fn preview(offer: &Offer, hours: f64, now: u64) -> Result<Value> {
         "cleanup":{"mode":"manual", "planned_deadline_unix":planned_deadline,
             "deadline_enforced":false, "automatic_stop":false, "automatic_delete":false,
             "required_creation_flag":"--manual-cleanup", "billing_note":BILLING},
-        "profiling":{"status":"unverified", "admitted":false, "requirement":"checked CUDA kernel plus numerical hardware counters imported from an NCU report"}}))
+        "image":{"id":offer.image.id,"reference":offer.image.image_type,"source":"provider_catalog","local_upload":false}}))
 }
 
 pub(crate) fn validate_create(args: &CreateArgs) -> Result<()> {
@@ -486,6 +489,8 @@ fn create_vm(client: &Client, offer: &Offer, hostname: &str, key: &str) -> Resul
 impl CreateProvider for Provider {
     fn create(config: &mut IceConfig, args: &CreateArgs) -> Result<()> {
         validate_create(args)?;
+        catalog::required_image(&config.default.verda)?;
+        let started = Instant::now();
         let requirements = crate::provision::build_search_requirements(config, Cloud::Verda)?;
         let hours = crate::workload::resolve_deploy_hours(config, args.hours)?;
         let client = Client::from_config(config)?;
@@ -494,6 +499,7 @@ impl CreateProvider for Provider {
             &config.default.verda,
             args.machine.as_deref(),
         )?;
+        let discovered = Instant::now();
         let mut result = preview(&offer, hours, now_unix_secs())?;
         if args.dry_run {
             if crate::output::is_json() {
@@ -537,7 +543,9 @@ impl CreateProvider for Provider {
             ));
         }
         result = preview(&current, hours, now_unix_secs())?;
+        let prepared = Instant::now();
         let id = create_vm(&client, &current, &hostname, key)?;
+        let accepted = Instant::now();
         eprintln!("Created Verda instance {id}. Manual cleanup: ice delete --cloud verda {id}");
         let deadline = Instant::now() + crate::automation::startup_timeout();
         let ready = (|| {
@@ -553,12 +561,14 @@ impl CreateProvider for Provider {
             let message = format!("Verda created instance {id}, but readiness failed: {err}. It remains billable; use the cleanup command and inspect retained volumes.");
             if capulus::error_is_cancelled(&err) { return err.context(message); }
             let mut details = crate::automation::recovery_details();
+            details["timings_ms"] = json!({"discovery":discovered.duration_since(started).as_millis(), "preflight_and_confirmation":prepared.duration_since(discovered).as_millis(), "create_request":accepted.duration_since(prepared).as_millis(), "readiness":accepted.elapsed().as_millis(), "total":started.elapsed().as_millis()});
             if let Some(cause) = err.downcast_ref::<crate::automation::AgentError>() {
                 details["cause"] = json!({"code":cause.code,"details":cause.details});
             }
             error("creation_incomplete", message, details)
         })?;
         crate::cache::upsert_instance::<CacheModel>(&instance);
+        result["timings_ms"] = json!({"discovery":discovered.duration_since(started).as_millis(), "preflight_and_confirmation":prepared.duration_since(discovered).as_millis(), "create_request":accepted.duration_since(prepared).as_millis(), "readiness":accepted.elapsed().as_millis(), "total":started.elapsed().as_millis()});
         result["status"] = json!("created");
         result["dry_run"] = json!(false);
         result["instance"] = instance.json_summary();
@@ -573,18 +583,47 @@ impl CreateProvider for Provider {
                 "Created {hostname} ({id}). {}",
                 result["connect_command"].as_str().unwrap()
             );
-            eprintln!(
-                "Manual cleanup: ice delete --cloud verda {id}. Profiling remains unverified."
-            );
+            eprintln!("Manual cleanup: ice delete --cloud verda {id}.");
             Ok(())
         }
     }
 }
 
 pub(crate) fn delete(config: &IceConfig, identifier: &str) -> Result<()> {
+    recovery(
+        "resolving_instance",
+        json!({"action":"delete", "instance_identifier":identifier,"request":"not_sent"}),
+    );
     let client = Client::from_config(config)?;
     let instance = Provider::resolve_instance(&client, identifier)?;
-    let result = delete_selected(&client, &instance, crate::automation::startup_timeout())?;
+    let started = Instant::now();
+    let cleanup = delete_selected(
+        &client,
+        &instance,
+        crate::lifecycle::remaining_timeout(Duration::from_secs(900))?,
+    ).map_err(|err| {
+        if capulus::error_is_cancelled(&err) { return err; }
+        let cause = err.downcast_ref::<crate::automation::AgentError>();
+        error("operation_unverified", "Verda deletion or storage cleanup remains unverified. Inspect the resource IDs before retrying; billing may continue.",
+            json!({"action":"delete","instance_id":instance.id,"instance":instance.json_summary(),"outcome":"unverified",
+                "mutation_retried":false,"reconcile_before_retry":true,"elapsed_ms":started.elapsed().as_millis(),
+                "provider_details":cause.map(|e| &e.details),"verification_error_code":cause.map(|e| e.code).unwrap_or("provider_error")}))
+    })?;
+    let mut result = crate::lifecycle::verified(
+        crate::lifecycle::Action::Delete,
+        instance.id.clone(),
+        if cleanup["action_receipt_confirmed"] == true {
+            "acknowledged"
+        } else {
+            "unconfirmed"
+        },
+        started,
+    );
+    result["instance"] = Value::Null;
+    result["storage"] = json!({"verification":if cleanup["storage_cleanup_known"] == true {"read_back"} else {"unknown"},
+        "deleted_volume_ids":cleanup["permanently_deleted_os_volume_ids"], "retained_volume_ids":cleanup["retained_volume_ids"],
+        "charges_may_continue":cleanup["retained_storage_charges_continue"]});
+    result["provider_details"] = cleanup;
     crate::cache::remove_instance::<CacheModel>(&instance);
     if crate::output::is_json() {
         crate::output::emit("delete", Cloud::Verda, result)

@@ -66,7 +66,7 @@ pub(crate) enum Commands {
     #[command(name = "start", about = "Start an instance.")]
     Start(InstanceArgs),
 
-    #[command(name = "delete", about = "Stop then delete an instance.")]
+    #[command(name = "delete", about = "Delete an instance and verify its removal.")]
     Delete(InstanceArgs),
 
     #[command(
@@ -202,6 +202,9 @@ pub(crate) struct InstanceArgs {
     #[arg(long, value_enum)]
     pub(crate) cloud: Option<Cloud>,
     pub(crate) instance: String,
+    /// Total lifecycle command budget, including provider requests and state verification.
+    #[arg(long, default_value="5m", value_parser=parse_duration)]
+    pub(crate) timeout: u64,
 }
 
 #[derive(Debug, Args)]
@@ -209,7 +212,7 @@ pub(crate) struct CreateArgs {
     /// Verda only: acknowledge that --hours is an estimate; arrange and verify deletion yourself.
     #[arg(long)]
     pub(crate) manual_cleanup: bool,
-    /// Verda only: pin a current Ubuntu CUDA image from `ice catalog`.
+    /// Verda only: select a provider OS image UUID/type from `ice catalog` (no local upload).
     #[arg(long)]
     pub(crate) image: Option<String>,
     /// Verda only: datacenter location code; otherwise choose cheapest available.

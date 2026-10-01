@@ -43,7 +43,7 @@ ice catalog --cloud verda --non-interactive --json
 `catalog` returns live machine types, supported image types, image IDs,
 availability by location, and volume prices. It includes unavailable types for
 discovery; `create` intersects the catalog with current on-demand availability.
-Catalog entries and provider claims do not establish profiling access.
+Ice reports infrastructure capabilities; application and GPU-tool validation belong to the caller.
 
 Register your SSH public key in Verda before creating a VM. Supply its ID with
 `--ssh-key-id` or `default.verda.ssh_key_id`. Before creating a billable VM, Ice
@@ -74,7 +74,7 @@ structured diagnostics. Ice does not rewrite `known_hosts` to bypass a mismatch.
 
 ```sh
 ice create --cloud verda --ssh --gpu-count 1 --min-gpu-memory-gb 48 \
-  --disk-gb 100 --max-price-per-hr 1 --hours 0.25 \
+  --image IMAGE_TYPE_OR_UUID --disk-gb 100 --max-price-per-hr 1 --hours 0.25 \
   --no-defaults --non-interactive --dry-run --json
 ```
 
@@ -87,16 +87,44 @@ Host internet-speed filters are rejected because the catalog
 does not supply measured rates. CPU-only, bare-metal and confidential-computing
 configurations are outside this adapter's initial creation scope.
 
-Ice selects a currently advertised Ubuntu 24/26 image with CUDA 12.9 or newer
-from the machine's `supported_os` list, preferring the highest Ubuntu/CUDA
-version. Both current dotted names (`26.04.cuda13.2`) and legacy names
-(`ubuntu-24.04-cuda-12.9-open`) are supported. At equal versions, a plain CUDA
-image is preferred over a Docker image. Cluster, Kubernetes and
-confidential-computing images are excluded. Override with
-`--image IMAGE_TYPE_OR_UUID` and `--location LOCATION_CODE`, or the matching
-`default.verda.image`/`location` settings. The selected image UUID is submitted
-to creation. Compatibility metadata is a selection constraint, not runtime
-verification of the driver, tools or counters.
+An explicit image is required: use `--image IMAGE_TYPE_OR_UUID` or save
+`default.verda.image`. Discover values using `ice catalog --cloud verda --json`.
+Ice checks that the selected ordinary image is in the machine's `supported_os`
+list and submits its exact catalog UUID. Missing, ambiguous or incompatible
+selections fail before purchase. There is no implicit newest-image, Ubuntu or
+CUDA-version preference. Cluster/Kubernetes and confidential-computing images
+remain excluded. Use `--location` or `default.verda.location` to constrain location.
+Compatibility metadata does not prove installed software or workload readiness.
+
+### Image provisioning and short rentals
+
+Verda's [create API](https://api.verda.com/v1/docs) provisions an OS boot volume
+from a provider image; `--image` does not upload an image from your computer or
+ask the VM to pull a container registry image. Ice currently accepts advertised
+catalog images only, not custom retained OS volumes. Choose a stock image that
+already contains your required tools to avoid installing them on every rental.
+An image UUID identifies the catalog choice, not a measured filesystem digest.
+
+The [VM setup guide](https://docs.verda.com/cpu-and-gpu-instances/set-up-a-gpu-instance/)
+describes provisioning in minutes. The reviewed documentation does not specify
+per-image boot latency, cache placement or whether image preparation involves
+internal copying. Do not assume zero image-transfer time. Any downloads you run
+after boot still depend on the VM's network and the download source. Ice cannot
+filter Verda by network speed because its catalog does not expose measurements.
+
+Ice overlaps four independent catalog reads and reuses that snapshot during
+selection, then refreshes once immediately before purchase. It neither installs
+a workload toolkit nor runs a workload validation during creation. Successful
+Verda creation returns `timings_ms` for discovery, preflight/confirmation,
+create request, readiness, and total time. Readiness includes VM startup and an
+SSH authentication check; it is not an image-only download measurement. The
+preflight bucket includes human confirmation time if interactive.
+
+The separately authorised 1 October Ada trial took approximately 74 seconds from
+the provider's `created_at` timestamp to Ice command completion with SSH ready.
+That is one historical observation on Ubuntu 26.04/CUDA 13.2, not an SLA or a
+comparison of image choices. Image-size/cache effects need a separately authorised
+measurement; these changes do not launch a trial.
 
 `no_matching_offers` includes counts by the first failing selection stage:
 resources/price, compatible image, or availability/location. It is not by itself
@@ -144,7 +172,7 @@ selected VM's OS volume and verifies that the VM and OS volume are absent,
 or have exact-ID terminal records (`discontinued` for the VM; `deleted` with
 `is_permanently_deleted: true` for its OS volume). Both paths also require absence
 from the paginated active-instance/volume lists and volume trash. Additional attached volumes are retained and
-listed as `retained_volume_ids`; they may continue to incur storage charges.
+listed under `storage.retained_volume_ids`; they may continue to incur storage charges.
 If the OS volume ID is unavailable, the receipt explicitly marks storage
 cleanup as unknown. Inspect and remove remaining storage through Verda.
 
@@ -155,12 +183,14 @@ include the generated hostname for reconciliation using `ice list` or the
 Verda console. Once an ID is returned, recovery details preserve it and any
 observed OS/attached volume IDs, plus a cleanup command. A startup failure leaves
 the VM billable; it does not imply a stop or deletion. Inspect that resource
-before retrying creation. A deletion timeout is also an unverified outcome;
+before retrying creation. Start/stop/delete accept `--timeout` (default `5m`) covering provider requests
+and state verification. A deletion timeout is also an unverified outcome;
 inspect the returned VM/volume IDs rather than assuming billing ended.
 
 An ambiguous or rejected delete receipt triggers bounded read-only reconciliation,
 never a repeated mutation. Success requires all the resource checks above, and
-reports `action_receipt_confirmed: false` plus sanitized `action_error` diagnostics
+reports `request: "unconfirmed"` with `provider_details.action_receipt_confirmed: false`
+and sanitized `provider_details.action_error` diagnostics
 when reconciliation establishes deletion despite that receipt. An unverified result
 retains the VM/OS/attached-volume IDs and both action and verification diagnostics.
 Receipt diagnostics preserve types, field presence, row counts and ID/action
@@ -178,9 +208,9 @@ ice shell --cloud verda INSTANCE_UUID --print-creds --json
 ice shell --cloud verda INSTANCE_UUID --print-creds --no-probe --json
 ice push --cloud verda INSTANCE_UUID ./input /root/input --json
 ice pull --cloud verda INSTANCE_UUID /root/results ./results --json
-ice stop --cloud verda INSTANCE_UUID --json
-ice start --cloud verda INSTANCE_UUID --json
-ice delete --cloud verda INSTANCE_UUID --json
+ice stop --cloud verda INSTANCE_UUID --timeout 2m --json
+ice start --cloud verda INSTANCE_UUID --timeout 5m --json
+ice delete --cloud verda INSTANCE_UUID --timeout 5m --json
 ```
 
 List discovery shows Ice-prefixed hostnames. Explicit full resource IDs can
@@ -190,60 +220,26 @@ matching local keys, or requiring an installed SSH executable/local private key.
 Transfers use rsync with protected arguments and require a running VM, SSH access
 and rsync at both ends. Noninteractive connection lookup never starts a stopped VM.
 
-## Profiling admission: a capture is required
+## Workload boundary
 
-All VM receipts report profiling as **unverified**, even after SSH succeeds.
-Verda documents enabled counters on current images; installation, compatibility
-and that claim are not admission evidence. The included probe is a separate,
-explicit operation on an authorized trial VM, not an automatic creation side effect.
+Ice ends at provisioning, lifecycle, connection and transfer support. It does
+not install CUDA, run Nsight Compute, select images for profiling, or declare a
+GPU suitable for a particular workload. Perform those checks with your workload's
+tools over the returned SSH connection. A successful SSH check proves access,
+not application readiness.
 
-Copy the [profiling directory](../profiling) to the VM using `ice push`, then run
-the following over the SSH connection returned by Ice, with a new output path:
-
-```sh
-timeout --kill-after=5s 180s bash check-ncu.sh /root/ncu-admission-01
-```
-
-The checked CUDA fixture uses 8 MiB device storage, launches one integer kernel
-and checks every result (including unsigned wraparound). It compiles native code
-for the selected GPU, checks ordinary execution before and after capture, and
-checks results during NCU capture. The script imports the resulting `.ncu-rep`
-and requires positive numerical `sm__cycles_elapsed.sum` and
-`smsp__inst_executed.sum` counters for that kernel in the same capture/device.
-Both long `Metric Name`/`Metric Value` rows and NCU 2026.1.1's wide table with a
-separate units row are supported; the admission rules are identical.
-An exit-zero permission failure, missing/empty report, missing counter, NaN,
-zero counter or failed output check cannot pass. GPU UUID consistency and
-source/binary/report/log hashes are recorded in `admission.json`.
-
-`CUDA_VISIBLE_DEVICES` selects the GPU (default `0`); `NVCC`, `NCU` and
-`NVIDIA_SMI` can select explicit tool paths. Tools must already be installed.
-The probe does not install software, elevate privileges, change driver policy,
-lock clocks, or retry failed captures. A failed/unsupported capture is a blocker;
-retain evidence and apply the agreed cleanup. Admission applies only to the
-captured GPU/image/driver/user/tool context, not every Verda instance.
-
-Pull the entire output directory locally, including `.ncu-rep`, CSV, logs and
-`admission.json`, before deletion. A separately authorised 1 October 2026 trial
-captured 2,604,224 SM cycles and 458,752 executed instructions on RTX 6000 Ada
-GPU 0 with Ubuntu 26.04/CUDA 13.2, driver 580.178.04, nvcc 13.2.86, NCU 2026.1.1
-and root. All 1,048,576 outputs passed before, during and after capture. Its
-original raw CSV is retained as a regression fixture. This verifies that context,
-not A6000, non-root execution, or a future VM. The trial needed an isolated
-creation hotfix and direct API cleanup verification; the corrected complete Ice
-lifecycle still needs separate live validation. No new paid trial is required
-to run the mocked regression suite.
+The former `ice-tool/profiling/` probe has moved to the CUDA research project's
+`evaluation/profiling/admission-probe/`. Its checked kernel, original CSV fixture,
+validator and tests were preserved; historical captures remain in that project's
+`results/profiling/`. No compatibility symlink or probe is shipped by Ice.
 
 ## Validation and references
 
 ```sh
 cargo test -p ice-tool
-python3 -m unittest discover -s ice-tool/profiling -p 'test_*.py' -v
-bash -n ice-tool/profiling/check-ncu.sh
 ```
 
-Rust tests use an HTTP mock server; profiling tests use fake compiler/profiler
-executables and the Python standard library. No rental or system package install
+Rust tests use an HTTP mock server and mocked provider executables. No rental or system package install
 is required. This workspace may need the Ice-only dependency workaround described
 in the repository's validation documentation when sibling crates are unavailable:
 `bash scripts/check-cli.sh ice-tool test --offline`.
@@ -252,4 +248,4 @@ in the repository's validation documentation when sibling crates are unavailable
 - [Verda CLI instances and images](https://docs.verda.com/cli/instances/)
 - [Verda CLI storage-price calculation](https://github.com/verda-cloud/verda-cli/blob/main/internal/verda-cli/cmd/util/pricing.go)
 - [Billing](https://docs.verda.com/welcome-to-verda/pricing-and-billing/)
-- [Provider profiling claim and prerequisites](https://docs.verda.com/cpu-and-gpu-instances/profile-with-nsight/)
+- [Shutdown, deletion and retained storage billing](https://docs.verda.com/cpu-and-gpu-instances/shutdown-hibernate-and-delete/)

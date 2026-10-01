@@ -193,14 +193,24 @@ fn requirements() -> crate::model::CreateSearchRequirements {
         ..Default::default()
     }
 }
+fn image_defaults() -> crate::model::VerdaDefaults {
+    crate::model::VerdaDefaults {
+        image: Some(EXTRA.into()),
+        ..Default::default()
+    }
+}
 fn offer() -> Offer {
     catalog()
-        .select(&requirements(), &Default::default(), None)
+        .select(&requirements(), &image_defaults(), None)
         .unwrap()
 }
 
 #[test]
 fn recorded_catalog_selects_current_image_and_enforces_per_gpu_memory() {
+    let selected_defaults = crate::model::VerdaDefaults {
+        image: Some("26.04.cuda13.2".into()),
+        ..Default::default()
+    };
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/verda-catalog-2026-10-01.json"
     ))
@@ -211,7 +221,7 @@ fn recorded_catalog_selects_current_image_and_enforces_per_gpu_memory() {
     req.gpu_count = Some(2);
     req.min_gpu_memory_gb = Some(48.0);
     let selected = cat
-        .select(&req, &Default::default(), Some("2RTX6000ADA.20V"))
+        .select(&req, &selected_defaults, Some("2RTX6000ADA.20V"))
         .unwrap();
     assert_eq!(selected.location, "FIN-03");
     assert_eq!(selected.image.image_type, "26.04.cuda13.2");
@@ -219,10 +229,10 @@ fn recorded_catalog_selects_current_image_and_enforces_per_gpu_memory() {
     assert_eq!(selected.gpu_memory_per_gpu_gb, 48.0);
     assert!((selected.hourly_usd - 2.3714).abs() < 1e-9);
     req.min_gpu_memory_gb = Some(49.0);
-    assert!(cat.select(&req, &Default::default(), None).is_err());
+    assert!(cat.select(&req, &selected_defaults, None).is_err());
     req.min_gpu_memory_gb = Some(48.0);
     req.max_price_per_hr = 2.35; // Compute alone fits; the required disk does not.
-    assert!(cat.select(&req, &Default::default(), None).is_err());
+    assert!(cat.select(&req, &selected_defaults, None).is_err());
     req.max_price_per_hr = 2.50;
     let defaults = crate::model::VerdaDefaults {
         image: Some("26.04.cuda13.2.docker".into()),
@@ -233,47 +243,67 @@ fn recorded_catalog_selects_current_image_and_enforces_per_gpu_memory() {
         "26.04.cuda13.2.docker"
     );
     cat.images.clear();
-    let error = cat.select(&req, &Default::default(), None).unwrap_err();
-    let detail = &error
-        .downcast_ref::<crate::automation::AgentError>()
-        .unwrap()
-        .details;
-    assert_eq!(detail["rejected_machines"]["compatible_image"], 1);
-    assert_eq!(detail["rejected_machines"]["availability_or_location"], 0);
+    let error = cat.select(&req, &selected_defaults, None).unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<crate::automation::AgentError>()
+            .unwrap()
+            .code,
+        "image_not_found"
+    );
 }
 
 #[test]
-fn image_formats_preserve_version_thresholds_and_workload_exclusions() {
+fn image_selection_uses_provider_compatibility_not_cuda_policy() {
+    for kind in [
+        "debian-12",
+        "ubuntu-22.04",
+        "26.04.base",
+        "24.04.cuda12.8",
+        "jupyter.cuda.13.2",
+    ] {
+        let mut cat = catalog();
+        cat.images[1].image_type = kind.into();
+        cat.machines[0].supported_os = vec![kind.into()];
+        assert_eq!(
+            cat.select(&requirements(), &image_defaults(), None)
+                .unwrap()
+                .image
+                .image_type,
+            kind
+        );
+    }
     let mut image = catalog().images[0].clone();
     for kind in [
-        "24.04.cuda12.9",
-        "26.04.cuda13.2",
-        "26.04.cuda13.2.docker",
-        "ubuntu-24.04-cuda-12.9-open",
-    ] {
-        image.image_type = kind.into();
-        assert!(catalog::image_version(&image).is_some(), "{kind}");
-    }
-    for kind in [
-        "22.04.cuda13.2",
-        "24.04.cuda12.8",
-        "26.04.base",
         "26.04.cuda13.2.cc",
         "26.04.cuda13.2.kubernetes-1.35.8",
-        "ubuntu-26.04-cuda-13.2-cluster",
-        "jupyter.cuda.13.2",
-        "26.04.cuda13",
-        "26.04.cuda13.2garbage",
+        "ubuntu-26.04-cluster",
     ] {
         image.image_type = kind.into();
-        assert!(catalog::image_version(&image).is_none(), "{kind}");
+        assert!(!catalog::ordinary_image(&image));
     }
-    image.image_type = "26.04.cuda13.2".into();
+    image.image_type = "26.04.base".into();
     image.is_cluster = true;
-    assert!(catalog::image_version(&image).is_none());
-    image.is_cluster = false;
-    image.category = "confidentialComputing".into();
-    assert!(catalog::image_version(&image).is_none());
+    assert!(!catalog::ordinary_image(&image));
+}
+
+#[test]
+fn image_is_required_and_ambiguous_aliases_are_rejected() {
+    let err = catalog()
+        .select(&requirements(), &Default::default(), None)
+        .unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<crate::automation::AgentError>()
+            .unwrap()
+            .code,
+        "image_required"
+    );
+    let mut cat = catalog();
+    cat.images.push(cat.images[1].clone());
+    assert!(
+        cat.select(&requirements(), &image_defaults(), None)
+            .is_err()
+    );
 }
 
 #[test]
@@ -283,11 +313,13 @@ fn storage_is_in_the_ceiling_and_preview_has_no_enforced_deadline() {
     assert!((offer.storage_hourly_usd - 0.0274).abs() < 1e-12);
     let mut req = requirements();
     req.max_price_per_hr = 0.62;
-    assert!(catalog().select(&req, &Default::default(), None).is_err());
+    assert!(catalog().select(&req, &image_defaults(), None).is_err());
     let preview = preview(&offer, 0.25, 100).unwrap();
     assert_eq!(preview["cleanup"]["planned_deadline_unix"], 1000);
     assert_eq!(preview["cleanup"]["deadline_enforced"], false);
-    assert_eq!(preview["profiling"]["admitted"], false);
+    assert!(preview.get("profiling").is_none());
+    assert_eq!(preview["image"]["source"], "provider_catalog");
+    assert_eq!(preview["image"]["local_upload"], false);
     assert_eq!(
         preview["cost"]["estimated_total_usd"],
         offer.hourly_usd * 0.25
@@ -319,7 +351,7 @@ fn live_catalog_shapes_and_authentication_are_supported() {
     });
     let chosen = Catalog::load(&server.client)
         .unwrap()
-        .select(&requirements(), &Default::default(), None)
+        .select(&requirements(), &image_defaults(), None)
         .unwrap();
     assert_eq!(chosen.image.image_type, "ubuntu-26.04-cuda-13.2-open");
     let requests = server.requests();
@@ -337,11 +369,11 @@ fn filters_image_pins_and_availability_are_enforced() {
     let mut req = requirements();
     for count in [0, 2] {
         req.gpu_count = Some(count);
-        assert!(catalog().select(&req, &Default::default(), None).is_err());
+        assert!(catalog().select(&req, &image_defaults(), None).is_err());
     }
     req.gpu_count = Some(1);
     req.min_gpu_memory_gb = Some(49.0);
-    assert!(catalog().select(&req, &Default::default(), None).is_err());
+    assert!(catalog().select(&req, &image_defaults(), None).is_err());
     req.min_gpu_memory_gb = Some(48.0);
     req.allowed_gpus = vec!["RTX A6000".into()];
     let mut defaults = crate::model::VerdaDefaults {
@@ -370,12 +402,12 @@ fn filters_image_pins_and_availability_are_enforced() {
     let mut cat = catalog();
     cat.availability.clear();
     assert!(
-        cat.select(&requirements(), &Default::default(), None)
+        cat.select(&requirements(), &image_defaults(), None)
             .is_err()
     );
     assert!(
         catalog()
-            .select(&requirements(), &Default::default(), Some("missing"))
+            .select(&requirements(), &image_defaults(), Some("missing"))
             .is_err()
     );
 }
@@ -392,46 +424,36 @@ fn unknown_prices_currencies_and_non_vm_types_are_not_accepted() {
         let mut cat = catalog();
         cat.machines[0].price_per_hour = price;
         assert!(
-            cat.select(&requirements(), &Default::default(), None)
+            cat.select(&requirements(), &image_defaults(), None)
                 .is_err()
         );
     }
     let mut cat = catalog();
     cat.volume_types[0].price.currency = "eur".into();
     assert!(
-        cat.select(&requirements(), &Default::default(), None)
+        cat.select(&requirements(), &image_defaults(), None)
             .is_err()
     );
     let mut cat = catalog();
     cat.machines[0].currency = "eur".into();
     assert!(
-        cat.select(&requirements(), &Default::default(), None)
+        cat.select(&requirements(), &image_defaults(), None)
             .is_err()
     );
     let mut cat = catalog();
     cat.machines[0].instance_type = "8H100.80S".into();
     assert!(
-        cat.select(&requirements(), &Default::default(), None)
+        cat.select(&requirements(), &image_defaults(), None)
             .is_err()
     );
 }
 
 #[test]
-fn incompatible_old_and_confidential_images_are_rejected() {
-    for image_type in [
-        "ubuntu-22.04-cuda-13.0",
-        "ubuntu-24.04-cuda-12.8",
-        "ubuntu-26.04",
-        "ubuntu-26.04-cuda-13.2-cc",
-    ] {
-        let mut image = catalog().images[0].clone();
-        image.image_type = image_type.into();
-        assert!(catalog::image_version(&image).is_none());
-    }
+fn incompatible_and_confidential_images_are_rejected() {
     let mut cat = catalog();
     cat.machines[0].supported_os.clear();
     assert!(
-        cat.select(&requirements(), &Default::default(), None)
+        cat.select(&requirements(), &image_defaults(), None)
             .is_err()
     );
     let mut cat = catalog();
@@ -439,13 +461,13 @@ fn incompatible_old_and_confidential_images_are_rejected() {
         image.category = "confidentialComputing".into();
     }
     assert!(
-        cat.select(&requirements(), &Default::default(), None)
+        cat.select(&requirements(), &image_defaults(), None)
             .is_err()
     );
     let mut cat = catalog();
     cat.machines[0].description = "Confidential Computing".into();
     assert!(
-        cat.select(&requirements(), &Default::default(), None)
+        cat.select(&requirements(), &image_defaults(), None)
             .is_err()
     );
 }
@@ -711,7 +733,7 @@ fn start_and_stop_map_to_verda_actions_without_deleting_storage() {
     assert_eq!(actions[1].body, json!({"id":ID,"action":"start"}));
     let summary = vm.json_summary().to_string();
     assert!(!summary.contains("must-not-appear"));
-    assert_eq!(vm.json_summary()["profiling_access"], "unverified");
+    assert!(vm.json_summary().get("profiling_access").is_none());
 }
 
 #[test]
@@ -1201,5 +1223,109 @@ fn mismatched_instance_receipt_cannot_target_another_vm() {
             .requests()
             .iter()
             .all(|r| r.method == "GET" || r.path == "/oauth2/token")
+    );
+}
+
+#[test]
+fn lifecycle_reconciles_an_ambiguous_receipt_without_replaying_shutdown() {
+    let server = Server::new(|request| match request.path.as_str() {
+        "/oauth2/token" => token(),
+        "/instances" => Reply::json(207, json!([{"status":"unknown", "secret":"never-echo"}])),
+        path if path == format!("/instances/{ID}") => Reply::json(200, instance("offline")),
+        _ => panic!("Unexpected request"),
+    });
+    let vm: Instance = serde_json::from_value(instance("running")).unwrap();
+    let _budget = crate::lifecycle::Budget::enter(Duration::from_secs(2)).unwrap();
+    let result = crate::lifecycle::transition::<Provider>(
+        &server.client,
+        &vm,
+        crate::lifecycle::Action::Stop,
+    )
+    .unwrap();
+    assert_eq!(result["outcome"], "verified");
+    assert_eq!(result["state"], "stopped");
+    assert_eq!(result["request"], "unconfirmed");
+    assert_eq!(result["instance_id"], ID);
+    assert!(
+        result["billing_note"]
+            .as_str()
+            .unwrap()
+            .contains("compute and storage")
+    );
+    assert!(!result.to_string().contains("never-echo"));
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn lifecycle_deadline_preserves_identity_and_never_repeats_a_mutation() {
+    let server = Server::new(|request| match request.path.as_str() {
+        "/oauth2/token" => token(),
+        "/instances" => Reply::json(204, Value::Null),
+        path if path == format!("/instances/{ID}") => Reply::json(200, instance("running")),
+        _ => panic!("Unexpected request"),
+    });
+    let vm: Instance = serde_json::from_value(instance("running")).unwrap();
+    let _budget = crate::lifecycle::Budget::enter(Duration::from_millis(150)).unwrap();
+    let error = crate::lifecycle::transition::<Provider>(
+        &server.client,
+        &vm,
+        crate::lifecycle::Action::Stop,
+    )
+    .unwrap_err();
+    let error = error
+        .downcast_ref::<crate::automation::AgentError>()
+        .unwrap();
+    assert_eq!(error.code, "operation_unverified");
+    assert_eq!(error.details["instance_id"], ID);
+    assert_eq!(error.details["instance"]["os_volume_id"], OS);
+    assert_eq!(
+        error.details["verification_error_code"],
+        "operation_timeout"
+    );
+    assert_eq!(error.details["request"], "acknowledged");
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn already_running_lifecycle_reads_state_without_a_mutation() {
+    let server = Server::new(|request| {
+        if request.path == "/oauth2/token" {
+            token()
+        } else {
+            assert_eq!(request.method, "GET");
+            Reply::json(200, instance("running"))
+        }
+    });
+    let vm: Instance = serde_json::from_value(instance("running")).unwrap();
+    let _budget = crate::lifecycle::Budget::enter(Duration::from_secs(2)).unwrap();
+    let result = crate::lifecycle::transition::<Provider>(
+        &server.client,
+        &vm,
+        crate::lifecycle::Action::Start,
+    )
+    .unwrap();
+    assert_eq!(result["request"], "not_needed");
+    assert_eq!(result["verification"], "read_back");
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PUT")
+            .count(),
+        0
     );
 }

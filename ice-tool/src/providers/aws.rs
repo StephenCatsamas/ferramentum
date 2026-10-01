@@ -562,6 +562,47 @@ impl CloudProvider for Provider {
         )
     }
 
+    fn observe_instance(
+        config: &Self::ProviderContext<'_>,
+        instance: &Self::Instance,
+    ) -> Result<Option<Self::Instance>> {
+        let mut cmd = command(config, &instance.region);
+        cmd.args([
+            "ec2",
+            "describe-instances",
+            "--filters",
+            &format!("Name=instance-id,Values={}", instance.instance_id),
+            "--region",
+            &instance.region,
+            "--output",
+            "json",
+        ]);
+        let value = run_command_json(&mut cmd, "observe AWS instance state")?;
+        let reservations = value["Reservations"]
+            .as_array()
+            .context("Missing AWS Reservations array")?;
+        let mut current = None;
+        for reservation in reservations {
+            for row in reservation["Instances"]
+                .as_array()
+                .context("Missing AWS Instances array")?
+            {
+                anyhow::ensure!(
+                    row["InstanceId"].as_str() == Some(&instance.instance_id),
+                    "AWS returned a different instance"
+                );
+                anyhow::ensure!(current.is_none(), "AWS returned duplicate instances");
+                let mut observed = instance.clone();
+                observed.state = row["State"]["Name"]
+                    .as_str()
+                    .context("Missing AWS instance state")?
+                    .to_owned();
+                current = Some(observed);
+            }
+        }
+        Ok(current)
+    }
+
     fn delete_instance(
         context: &Self::ProviderContext<'_>,
         instance: &Self::Instance,

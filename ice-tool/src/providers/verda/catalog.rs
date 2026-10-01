@@ -94,52 +94,45 @@ fn confidential(value: &str) -> bool {
     lower.contains("confidential") || lower.split(['-', '.', '_', ' ']).any(|part| part == "cc")
 }
 
-pub(super) fn image_version(image: &Image) -> Option<(u32, u32, u32, u32)> {
-    if image.is_cluster
-        || confidential(&image.category)
-        || confidential(&image.image_type)
-        || confidential(&image.name)
-        || [&image.category, &image.image_type, &image.name]
+pub(super) fn ordinary_image(image: &Image) -> bool {
+    !image.is_cluster
+        && [&image.category, &image.image_type, &image.name]
             .iter()
-            .any(|value| {
+            .all(|value| {
                 let value = value.to_ascii_lowercase();
-                value.contains("cluster") || value.contains("kubernetes")
+                !confidential(&value) && !value.contains("cluster") && !value.contains("kubernetes")
             })
-    {
-        return None;
-    }
-    // Current catalog uses 26.04.cuda13.2[.docker]; older entries use
-    // ubuntu-24.04-cuda-12.9-open. Preserve both forms without treating every
-    // image containing a version number as a supported Ubuntu/CUDA image.
-    let (ubuntu, cuda) = if let Some(legacy) = image.image_type.strip_prefix("ubuntu-") {
-        legacy.split_once("-cuda-")?
-    } else {
-        image.image_type.split_once(".cuda")?
-    };
-    let mut ubuntu = ubuntu.split('.');
-    let ubuntu_major = ubuntu.next()?.parse::<u32>().ok()?;
-    let ubuntu_minor = ubuntu.next()?.parse::<u32>().ok()?;
-    if ubuntu.next().is_some() {
-        return None;
-    }
-    let mut cuda = cuda.split('-').next()?.split('.');
-    let major = cuda.next()?.parse::<u32>().ok()?;
-    let minor = cuda.next()?.parse::<u32>().ok()?;
-    (matches!(ubuntu_major, 24 | 26) && (major, minor) >= (12, 9)).then_some((
-        ubuntu_major,
-        ubuntu_minor,
-        major,
-        minor,
-    ))
+}
+
+pub(super) fn required_image(defaults: &VerdaDefaults) -> Result<&str> {
+    defaults.image.as_deref().filter(|image| !image.trim().is_empty()).ok_or_else(|| crate::automation::error(
+        "image_required", "Choose a provider OS image with --image or default.verda.image. Ice does not select or install a workload environment.",
+        json!({"flag":"--image", "config_key":"default.verda.image", "discovery_command":"ice catalog --cloud verda --json"})))
 }
 
 impl Catalog {
     pub(super) fn load(client: &Client) -> Result<Self> {
-        Ok(Self {
-            machines: client.list("/instance-types?currency=usd")?,
-            images: client.list("/images")?,
-            availability: client.list("/instance-availability?is_spot=false")?,
-            volume_types: client.list("/volume-types")?,
+        // Independent catalog reads share authentication and run concurrently.
+        // Reuse this snapshot through confirmation; refresh it once at purchase.
+        std::thread::scope(|scope| {
+            let machines = scope.spawn(|| client.list("/instance-types?currency=usd"));
+            let images = scope.spawn(|| client.list("/images"));
+            let availability = scope.spawn(|| client.list("/instance-availability?is_spot=false"));
+            let volumes = scope.spawn(|| client.list("/volume-types"));
+            Ok(Self {
+                machines: machines
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Verda machine discovery worker failed"))??,
+                images: images
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Verda image discovery worker failed"))??,
+                availability: availability
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Verda availability worker failed"))??,
+                volume_types: volumes
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Verda storage discovery worker failed"))??,
+            })
         })
     }
 
@@ -149,6 +142,27 @@ impl Catalog {
         defaults: &VerdaDefaults,
         pinned_machine: Option<&str>,
     ) -> Result<Offer> {
+        let reference = required_image(defaults)?;
+        let matching: Vec<_> = self
+            .images
+            .iter()
+            .filter(|image| image.id == reference || image.image_type == reference)
+            .collect();
+        if matching.len() != 1 {
+            return Err(crate::automation::error(
+                "image_not_found",
+                "The image reference must identify exactly one advertised provider image. Use its UUID from ice catalog.",
+                json!({"image_reference":reference,"matches":matching.len(),"discovery_command":"ice catalog --cloud verda --json"}),
+            ));
+        }
+        let image = matching[0];
+        if !ordinary_image(image) {
+            return Err(crate::automation::error(
+                "unsupported_image",
+                "This adapter supports ordinary VM images; cluster and confidential-computing images are unsupported.",
+                json!({"image_id":image.id}),
+            ));
+        }
         let disk = requirements.disk_gb.unwrap_or(100);
         let nvme = self
             .volume_types
@@ -204,30 +218,14 @@ impl Catalog {
                 resource_rejections += 1;
                 continue;
             }
-            let image =
-                self.images
-                    .iter()
-                    .filter(|image| {
-                        image_version(image).is_some()
-                            && machine
-                                .supported_os
-                                .iter()
-                                .any(|os| os == &image.image_type || os == &image.id)
-                            && defaults.image.as_ref().is_none_or(|wanted| {
-                                wanted == &image.image_type || wanted == &image.id
-                            })
-                    })
-                    .max_by_key(|image| {
-                        (
-                            image_version(image),
-                            !image.image_type.contains("docker"),
-                            &image.image_type,
-                        )
-                    });
-            let Some(image) = image else {
+            if !machine
+                .supported_os
+                .iter()
+                .any(|os| os == &image.image_type || os == &image.id)
+            {
                 image_rejections += 1;
                 continue;
-            };
+            }
             let mut available = false;
             for location in &self.availability {
                 if defaults
@@ -263,7 +261,7 @@ impl Catalog {
         });
         offers.into_iter().next().ok_or_else(|| crate::automation::error("no_matching_offers",
             "No available ordinary NVIDIA GPU VM matches the filters, current Ubuntu 24/26 CUDA 12.9+ image compatibility and compute-plus-OS-storage price ceiling.",
-            json!({"max_price_per_hr": requirements.max_price_per_hr, "allocated_disk_gb": disk, "cost_scope":"compute_and_os_storage", "profiling_access":"unverified",
+            json!({"max_price_per_hr": requirements.max_price_per_hr, "allocated_disk_gb": disk, "cost_scope":"compute_and_os_storage",
                 "rejected_machines":{"resources_or_price":resource_rejections,"compatible_image":image_rejections,"availability_or_location":availability_rejections}})))
     }
 }

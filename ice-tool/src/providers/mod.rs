@@ -110,6 +110,12 @@ pub(crate) trait CloudProvider: Sized {
         running: bool,
         timeout: Duration,
     ) -> Result<Self::Instance>;
+    /// Fresh exact-identity observation; None must mean confirmed absence.
+    fn observe_instance(
+        context: &Self::ProviderContext<'_>,
+        instance: &Self::Instance,
+    ) -> Result<Option<Self::Instance>>;
+
     fn delete_instance(
         context: &Self::ProviderContext<'_>,
         instance: &Self::Instance,

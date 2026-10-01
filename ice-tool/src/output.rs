@@ -28,7 +28,7 @@ pub(crate) fn document(command: &str, cloud: impl Into<Option<Cloud>>, mut resul
     {
         result["selection"] = selection;
     }
-    json!({"schema_version": 1, "command": command, "cloud": cloud.into(), "result": result})
+    json!({"schema_version": 2, "command": command, "cloud": cloud.into(), "result": result})
 }
 
 pub(crate) fn write_document(mut writer: impl Write, value: &Value) -> Result<()> {
@@ -50,7 +50,7 @@ pub(crate) fn error(
     write_document(
         io::stdout().lock(),
         &json!({
-            "schema_version": 1, "command": command, "cloud": cloud,
+            "schema_version": 2, "command": command, "cloud": cloud,
             "error": {"code": code, "message": message},
         }),
     )
@@ -328,7 +328,7 @@ pub(crate) fn command_error(
     }
     write_document(
         io::stdout().lock(),
-        &json!({"schema_version": 1, "command": command, "cloud": cloud,
+        &json!({"schema_version": 2, "command": command, "cloud": cloud,
         "error": {"code": typed.map_or("command_failed", |err| err.code), "message": message, "details": details}}),
     )
 }
@@ -369,7 +369,7 @@ mod tests {
         write_document(&mut bytes, &expected).unwrap();
         assert_eq!(bytes.last(), Some(&b'\n'));
         assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), expected);
-        assert_eq!(expected["schema_version"], 1);
+        assert_eq!(expected["schema_version"], 2);
         assert!(
             expected["result"]["instances"]
                 .as_array()

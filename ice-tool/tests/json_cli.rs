@@ -165,7 +165,7 @@ esac
         self.script("docker", r#"#!/bin/sh
 case "$1" in
   version) exit 0 ;;
-  ps) printf 'test-id\n' ;;
+  ps) if [ ! -f "$ICE_TEST_STATE.deleted" ]; then printf 'test-id\n'; fi ;;
   inspect)
     state=running
     if [ -f "$ICE_TEST_STATE" ]; then state=$(/bin/cat "$ICE_TEST_STATE"); fi
@@ -173,6 +173,7 @@ case "$1" in
     ;;
   stop) printf stopped > "$ICE_TEST_STATE"; printf 'provider stop output\n' ;;
   start) printf running > "$ICE_TEST_STATE"; printf 'provider start output\n' ;;
+  rm) printf deleted > "$ICE_TEST_STATE.deleted" ;;
   logs) printf 'stdout 🦀\n'; printf 'stderr 終' >&2 ;;
   login) /bin/cat >/dev/null; printf 'registry login output\n' ;;
   *) printf 'provider operation output\n' ;;
@@ -669,7 +670,7 @@ fn list_projects_provider_records_without_secrets_or_display_formatting() {
         false,
     );
     let value = parsed(fixture.run(&["list", "--cloud", "gcp", "--json"]));
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["command"], "list");
     assert_eq!(value["cloud"], "gcp");
     assert_eq!(value["result"]["instances"][0]["id"], "ice-example");
@@ -865,17 +866,19 @@ fn lifecycle_reports_actual_state_and_distinguishes_noop() {
     fixture.runtime();
     let args = |command| [command, "--cloud", "local", "ice-example", "--json"];
     let unchanged = parsed(fixture.run(&args("start")));
-    assert_eq!(unchanged["result"]["changed"], false);
+    assert_eq!(unchanged["result"]["request"], "not_needed");
     let stopped = parsed(fixture.run(&args("stop")));
-    assert_eq!(stopped["result"]["changed"], true);
+    assert_eq!(stopped["result"]["request"], "acknowledged");
     assert_eq!(stopped["result"]["instance"]["state"], "stopped");
     let stopped = parsed(fixture.run(&args("stop")));
-    assert_eq!(stopped["result"]["changed"], false);
+    assert_eq!(stopped["result"]["request"], "not_needed");
     let started = parsed(fixture.run(&args("start")));
-    assert_eq!(started["result"]["changed"], true);
+    assert_eq!(started["result"]["request"], "acknowledged");
     assert_eq!(started["result"]["instance"]["state"], "running");
     let deleted = parsed(fixture.run(&args("delete")));
-    assert_eq!(deleted["result"]["status"], "deleted");
+    assert_eq!(deleted["result"]["state"], "deleted");
+    assert_eq!(deleted["result"]["outcome"], "verified");
+    assert_eq!(deleted["result"]["verification"], "read_back");
     assert_eq!(deleted["result"]["instance_id"], "test-id");
     let actions = fs::read_to_string(fixture.root.path().join("actions")).unwrap();
     assert_eq!(actions.lines().filter(|line| *line == "stop").count(), 2);
@@ -1556,4 +1559,176 @@ fn verda_options_do_not_silently_change_other_providers() {
         "--json",
     ]));
     assert_eq!(value["error"]["code"], "unsupported_arguments");
+}
+
+#[test]
+fn lifecycle_delete_reconciles_once_and_does_not_confuse_gcp_stopped_with_deleted() {
+    for scenario in ["gone", "lost-receipt", "stopped", "malformed", "wrong-id"] {
+        let fixture = Fixture::new();
+        fixture.script(
+            "gcloud",
+            r#"#!/bin/sh
+[ "$1" != --version ] || exit 0
+printf '%s\n' "$*" >> "$ICE_TEST_ACTIONS"
+case "$1:$2:$3" in
+ compute:instances:list)
+  if [ ! -f "$ICE_TEST_STATE" ]; then
+    printf '[{"name":"ice-test","zone":"zones/test-a","status":"RUNNING"}]'
+  else
+    case "$ICE_TEST_SCENARIO" in
+      gone|lost-receipt) printf '[]' ;;
+      stopped) printf '[{"name":"ice-test","zone":"zones/test-a","status":"TERMINATED"}]' ;;
+      malformed) printf '{}' ;;
+      wrong-id) printf '[{"name":"ice-other","zone":"zones/test-a","status":"TERMINATED"}]' ;;
+    esac
+  fi ;;
+ compute:instances:delete)
+  printf deleted > "$ICE_TEST_STATE"
+  if [ "$ICE_TEST_SCENARIO" = lost-receipt ]; then printf secret-token >&2; exit 7; fi ;;
+ *) exit 71 ;;
+esac
+"#,
+        );
+        let output = bounded_output({
+            let mut cmd = fixture.command();
+            cmd.env("ICE_TEST_SCENARIO", scenario).args([
+                "delete",
+                "--cloud",
+                "gcp",
+                "ice-test",
+                "--timeout",
+                "1s",
+                "--json",
+            ]);
+            cmd
+        });
+        if matches!(scenario, "gone" | "lost-receipt") {
+            let value = parsed(output);
+            assert_eq!(value["result"]["state"], "deleted");
+            assert_eq!(value["result"]["outcome"], "verified");
+            assert_eq!(
+                value["result"]["request"],
+                if scenario == "gone" {
+                    "acknowledged"
+                } else {
+                    "unconfirmed"
+                }
+            );
+            assert_eq!(value["result"]["storage"]["verification"], "unknown");
+        } else {
+            let value = failed(output);
+            assert_eq!(value["error"]["code"], "operation_unverified");
+            assert_eq!(value["error"]["details"]["instance_id"], "ice-test");
+            assert!(!value.to_string().contains("secret-token"));
+        }
+        let calls = fs::read_to_string(fixture.root.path().join("actions")).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.contains("instances delete"))
+                .count(),
+            1
+        );
+        assert!(!calls.contains("instances stop"));
+        assert!(calls.contains("--zones test-a --filter name=ice-test"));
+    }
+}
+
+#[test]
+fn lifecycle_timeout_also_bounds_cli_availability_checks() {
+    let fixture = Fixture::new();
+    fixture.script("aws", "#!/bin/sh\nexec /bin/sleep 30\n");
+    let start = std::time::Instant::now();
+    let value = failed(bounded_output({
+        let mut cmd = fixture.command();
+        cmd.args([
+            "delete",
+            "--cloud",
+            "aws",
+            "i-test",
+            "--timeout",
+            "1s",
+            "--json",
+        ]);
+        cmd
+    }));
+    assert_eq!(value["error"]["code"], "operation_timeout");
+    assert_eq!(
+        value["error"]["details"]["recovery"]["instance_identifier"],
+        "i-test"
+    );
+    assert_eq!(value["error"]["details"]["recovery"]["request"], "not_sent");
+    assert!(start.elapsed() < std::time::Duration::from_secs(4));
+}
+
+#[test]
+fn verda_requires_an_explicit_image_before_any_provider_request() {
+    let fixture = Fixture::new();
+    let value = failed(fixture.run(&[
+        "create",
+        "--cloud",
+        "verda",
+        "--ssh",
+        "--max-price-per-hr",
+        "1",
+        "--dry-run",
+        "--json",
+    ]));
+    assert_eq!(value["error"]["code"], "image_required");
+    assert_eq!(value["error"]["details"]["flag"], "--image");
+}
+
+#[test]
+fn aws_termination_waits_for_terminal_state_and_survives_removed_tags() {
+    for scenario in ["terminated", "shutting-down", "malformed"] {
+        let fixture = Fixture::new();
+        fixture.config("[default.aws]\nregion = 'test-region'\n");
+        fixture.script("aws", r#"#!/bin/sh
+[ "$1" != --version ] || exit 0
+printf '%s\n' "$*" >> "$ICE_TEST_ACTIONS"
+case "$1:$2" in
+ ec2:describe-instances)
+  if [ ! -f "$ICE_TEST_STATE" ]; then
+   printf '{"Reservations":[{"Instances":[{"InstanceId":"i-test","State":{"Name":"running"},"Tags":[{"Key":"Name","Value":"ice-test"}]}]}]}'
+  elif [ "$ICE_TEST_SCENARIO" = malformed ]; then printf '{}'
+  else
+   printf '{"Reservations":[{"Instances":[{"InstanceId":"i-test","State":{"Name":"%s"}}]}]}' "$ICE_TEST_SCENARIO"
+  fi ;;
+ ec2:terminate-instances) printf accepted > "$ICE_TEST_STATE"; printf '{"TerminatingInstances":[{"CurrentState":{"Name":"shutting-down"}}]}' ;;
+ *) exit 71 ;;
+esac
+"#);
+        let output = bounded_output({
+            let mut cmd = fixture.command();
+            cmd.env("ICE_TEST_SCENARIO", scenario).args([
+                "delete",
+                "--cloud",
+                "aws",
+                "i-test",
+                "--timeout",
+                "1s",
+                "--json",
+            ]);
+            cmd
+        });
+        if scenario == "terminated" {
+            let value = parsed(output);
+            assert_eq!(value["result"]["state"], "deleted");
+            assert_eq!(value["result"]["instance"]["state"], "terminated");
+        } else {
+            let value = failed(output);
+            assert_eq!(value["error"]["code"], "operation_unverified");
+            assert_eq!(value["error"]["details"]["instance_id"], "i-test");
+        }
+        let calls = fs::read_to_string(fixture.root.path().join("actions")).unwrap();
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|l| l.contains("terminate-instances"))
+                .count(),
+            1
+        );
+        assert!(!calls.contains("stop-instances"));
+        assert!(calls.contains("Name=instance-id,Values=i-test"));
+    }
 }

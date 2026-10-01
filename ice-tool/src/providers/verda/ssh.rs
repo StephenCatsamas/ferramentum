@@ -209,7 +209,7 @@ pub(super) fn shell(config: &IceConfig, args: &ShellArgs) -> Result<()> {
                 "shell",
                 Cloud::Verda,
                 json!({"instance":instance.json_summary(), "connect_command":command,
-                "readiness":if args.no_probe {"unchecked"} else {"ssh_verified"}, "profiling_access":"unverified"}),
+                "readiness":if args.no_probe {"unchecked"} else {"ssh_verified"}}),
             );
         }
         println!("{command}");

@@ -102,7 +102,8 @@ struct VastHourlyBreakdown {
 
 #[derive(Debug, Deserialize)]
 struct VastInstancesResponse {
-    #[serde(default)]
+    // Explicit null is the provider's empty-list form; a missing field is not.
+    #[serde(deserialize_with = "Option::deserialize")]
     instances: Option<Vec<VastInstance>>,
     #[serde(default)]
     next_token: Option<String>,
@@ -707,10 +708,19 @@ impl VastClient {
         request.header("Authorization", format!("Bearer {}", self.api_key))
     }
 
-    fn send_json<F>(&self, make_request: F, context: &str) -> Result<Value>
+    fn send_json<F>(&self, mut make_request: F, context: &str) -> Result<Value>
     where
         F: FnMut() -> RequestBuilder,
     {
+        if crate::lifecycle::deadline().is_some() {
+            // A lifecycle mutation is submitted once; reconcile uncertain outcomes.
+            let response = make_request()
+                .timeout(crate::lifecycle::remaining_timeout(Duration::from_secs(
+                    30,
+                ))?)
+                .send()?;
+            return parse_json_response(response, context);
+        }
         parse_json_response(
             http_retry::send_with_429_backoff(
                 make_request,
@@ -907,6 +917,18 @@ impl CloudProvider for Provider {
             if running { "running" } else { "stopped" },
             timeout,
         )
+    }
+
+    fn observe_instance(
+        context: &Self::ProviderContext<'_>,
+        instance: &Self::Instance,
+    ) -> Result<Option<Self::Instance>> {
+        let current = context.get_instance(instance.id)?;
+        anyhow::ensure!(
+            current.as_ref().is_none_or(|i| i.id == instance.id),
+            "Vast returned a different instance"
+        );
+        Ok(current)
     }
 
     fn delete_instance(
@@ -2115,6 +2137,7 @@ fn parse_instance_from_value(value: &Value) -> Result<Option<VastInstance>> {
             .map(Some);
     }
     if let Some(instances) = value.get("instances").and_then(Value::as_array) {
+        anyhow::ensure!(instances.len() <= 1, "Expected at most one Vast instance");
         if let Some(first) = instances.first() {
             return serde_json::from_value::<VastInstance>(first.clone())
                 .context("Failed to parse vast instance payload from `instances[0]`")
@@ -2127,7 +2150,7 @@ fn parse_instance_from_value(value: &Value) -> Result<Option<VastInstance>> {
             return Ok(Some(parsed));
         }
     }
-    Ok(None)
+    bail!("Unrecognized Vast instance response; absence is unverified")
 }
 
 fn run_ssh_command(
@@ -2403,5 +2426,36 @@ mod pagination_tests {
                 .to_string()
                 .contains("repeated instance pagination token")
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_response_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_instance_data_does_not_establish_absence() {
+        for value in [
+            json!({}),
+            json!({"error":"unavailable"}),
+            json!({"instances":"unknown"}),
+            json!({"instances":[{"id":1},{"id":2}]}),
+        ] {
+            assert!(parse_instance_from_value(&value).is_err());
+        }
+        assert!(
+            parse_instance_from_value(&json!({"instances":[]}))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_instances_field_cannot_become_an_empty_listing() {
+        assert!(
+            serde_json::from_value::<VastInstancesResponse>(json!({"error":"unavailable"}))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<VastInstancesResponse>(json!({"instances":null})).is_ok());
     }
 }

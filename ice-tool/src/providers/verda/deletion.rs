@@ -173,16 +173,21 @@ pub(super) fn delete_selected(
         .collect::<Vec<_>>();
     let mut details = json!({"instance_id":instance.id,"os_volume_ids":os,"retained_volume_ids":retained,
         "storage_cleanup_known":instance.os_volume_id.is_some(), "billing_note":BILLING,
-        "mutation_retried":false,"reconcile_before_retry":true,
+        "request":"unconfirmed","mutation_retried":false,"reconcile_before_retry":true,
         "next_command":"Inspect the instance and volume IDs in the Verda console before retrying cleanup."});
     recovery("deleting", details.clone());
     // Even a rejected/unreadable receipt can follow a completed deletion. Read
     // back within the normal verification budget; never resend the mutation.
     let action_error = client.action(&instance.id, "delete", Some(&os)).err();
+    details["request"] = json!(if action_error.is_none() {
+        "acknowledged"
+    } else {
+        "unconfirmed"
+    });
     if let Some(err) = &action_error {
         details["action_error"] = failure_summary(err);
-        recovery("verifying_deletion", details.clone());
     }
+    recovery("verifying_deletion", details.clone());
     match verify(
         client,
         instance,

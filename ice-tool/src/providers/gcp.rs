@@ -534,6 +534,42 @@ impl CloudProvider for Provider {
         )
     }
 
+    fn observe_instance(
+        config: &Self::ProviderContext<'_>,
+        instance: &Self::Instance,
+    ) -> Result<Option<Self::Instance>> {
+        let mut cmd = command(config);
+        cmd.args([
+            "compute",
+            "instances",
+            "list",
+            "--zones",
+            &instance.zone,
+            "--filter",
+            &format!("name={}", instance.name),
+            "--format=json",
+        ]);
+        maybe_add_project_arg(&mut cmd, config);
+        let value = run_command_json(&mut cmd, "observe GCP instance state")?;
+        let rows = value.as_array().context("Expected a GCP instance array")?;
+        let mut current = None;
+        for row in rows {
+            let zone = row["zone"].as_str().and_then(|s| s.rsplit('/').next());
+            anyhow::ensure!(
+                row["name"].as_str() == Some(&instance.name) && zone == Some(&instance.zone),
+                "GCP returned a different instance"
+            );
+            let mut i = instance.clone();
+            i.status = row["status"]
+                .as_str()
+                .context("Missing GCP instance status")?
+                .to_owned();
+            anyhow::ensure!(current.is_none(), "GCP returned duplicate instances");
+            current = Some(i);
+        }
+        Ok(current)
+    }
+
     fn delete_instance(
         context: &Self::ProviderContext<'_>,
         instance: &Self::Instance,
