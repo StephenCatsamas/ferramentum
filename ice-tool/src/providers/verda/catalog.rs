@@ -260,8 +260,8 @@ impl Catalog {
                 .then(a.location.cmp(&b.location))
         });
         offers.into_iter().next().ok_or_else(|| crate::automation::error("no_matching_offers",
-            "No available ordinary NVIDIA GPU VM matches the resource filters, selected image, location and compute-plus-OS-storage price ceiling.",
-            json!({"max_price_per_hr": requirements.max_price_per_hr, "allocated_disk_gb": disk, "cost_scope":"compute_and_os_storage",
+            "No available on-demand ordinary NVIDIA GPU VM matches the resource filters, selected image, location and compute-plus-OS-storage price ceiling. Spot capacity is not searched.",
+            json!({"rental_type":"on_demand", "max_price_per_hr": requirements.max_price_per_hr, "allocated_disk_gb": disk, "cost_scope":"compute_and_os_storage",
                 "rejected_machines":{"resources_or_price":resource_rejections,"compatible_image":image_rejections,"availability_or_location":availability_rejections}})))
     }
 }

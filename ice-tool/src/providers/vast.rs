@@ -73,6 +73,14 @@ pub(crate) struct VastOffer {
     pub(crate) inet_up_cost: Option<f64>,
     pub(crate) id: u64,
     #[serde(default)]
+    pub(crate) machine_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) host_id: Option<u64>,
+    #[serde(default)]
+    pub(crate) driver_version: Option<String>,
+    #[serde(default)]
+    pub(crate) vms_enabled: Option<bool>,
+    #[serde(default)]
     pub(crate) gpu_name: Option<String>,
     #[serde(default)]
     pub(crate) num_gpus: Option<u32>,

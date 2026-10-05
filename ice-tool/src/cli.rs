@@ -85,7 +85,7 @@ pub(crate) enum Commands {
     )]
     RefreshCatalog(RefreshCatalogArgs),
 
-    /// Discover live machine types, images, availability and storage prices (Verda).
+    /// Discover live machine types, images, on-demand availability and storage prices (Verda).
     Catalog(CloudArgs),
 }
 

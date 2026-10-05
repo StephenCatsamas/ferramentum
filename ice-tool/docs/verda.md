@@ -45,6 +45,12 @@ availability by location, and volume prices. It includes unavailable types for
 discovery; `create` intersects the catalog with current on-demand availability.
 Ice reports infrastructure capabilities; application and GPU-tool validation belong to the caller.
 
+Catalog and create results report `rental_type: "on_demand"`; creation selection
+metadata records it as a built-in choice. `no_matching_offers` has the same scope.
+Ice does not search spot capacity, use spot prices or create spot rentals. A lack
+of matching on-demand offers says nothing about spot availability. There is no
+automatic fallback to another rental type or replacement VM.
+
 Register your SSH public key in Verda before creating a VM. Supply its ID with
 `--ssh-key-id` or `default.verda.ssh_key_id`. Before creating a billable VM, Ice
 reads that key and matches its public material to an existing local or agent key.
@@ -171,6 +177,11 @@ The API offers no atomic price reservation; a preview does not reserve capacity.
 Startup waits for both `running` and successful SSH authentication within one
 readiness budget. Creation itself is a separate, bounded API request.
 
+Spot rentals need a separate adapter extension with explicit selection,
+spot-specific pricing/availability, interruption information and an OS-volume
+eviction policy. VM eviction is not storage cleanup. The 1 October spot study
+used a separate direct-API helper; it does not validate an Ice spot workflow.
+
 ## Deadlines, failures and deletion
 
 **There is no automatic stop or deletion in this adapter.** `--hours` supplies a
@@ -234,6 +245,11 @@ address other VMs in the project; only operate resources authorized for the task
 matching local keys, or requiring an installed SSH executable/local private key.
 Transfers use rsync with protected arguments and require a running VM, SSH access
 and rsync at both ends. Noninteractive connection lookup never starts a stopped VM.
+
+If a VM has already disappeared, retain its previously recorded OS-volume ID and
+reconcile that volume through Verda. Ice currently has no standalone volume
+cleanup command or way to supply a missing VM's recorded volume ID to `delete`.
+Do not infer permanent disk deletion from an absent VM or a failed lookup.
 
 ## Workload boundary
 

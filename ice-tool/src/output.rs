@@ -264,6 +264,8 @@ pub(crate) fn workload(workload: Option<&InstanceWorkload>) -> Value {
 pub(crate) fn vast_offer(offer: &VastOffer) -> Value {
     json!({
         "offer_id": offer.id, "gpu_model": offer.gpu_name,
+        "machine_id": offer.machine_id, "host_id": offer.host_id,
+        "driver_version": offer.driver_version, "vms_enabled": offer.vms_enabled,
         "gpu_memory_gb": offer.gpu_ram.map(|v| v / 1000.0),
         "available_disk_gb": offer.disk_space,
         "download_mbps": offer.inet_down, "upload_mbps": offer.inet_up,
@@ -408,6 +410,8 @@ mod tests {
     fn vast_quote_and_output_do_not_expose_unrelated_provider_fields() {
         let offer: VastOffer = serde_json::from_value(json!({
             "id": 123, "gpu_name": "RTX 5060 Ti", "num_gpus": 1,
+            "machine_id": 456, "host_id": 789, "driver_version": "595.71.05",
+            "vms_enabled": false,
             "dph_total": 0.12, "search": {"totalHour": 0.15},
             "image_login": "secret-registry-token", "api_key": "secret-api-token"
         }))
@@ -415,6 +419,11 @@ mod tests {
         let value = vast_offer(&offer);
         assert_eq!(value["offer_id"], 123);
         assert_eq!(value["num_gpus"], 1);
+        assert_eq!(value["machine_id"], 456);
+        assert_eq!(value["host_id"], 789);
+        assert_eq!(value["driver_version"], "595.71.05");
+        assert_eq!(value["vms_enabled"], false);
+        assert!(value.get("profiling_access").is_none());
         assert_eq!(value["hourly_usd"], 0.15);
         assert_eq!(value["provider_hourly_usd"], 0.12);
         assert_eq!(value["quoted_total_hourly_usd"], 0.15);
@@ -422,5 +431,9 @@ mod tests {
         assert!(!value.to_string().contains("secret-"));
         let incomplete: VastOffer = serde_json::from_value(json!({"id": 456})).unwrap();
         assert_eq!(incomplete.quoted_total_hourly_price(), None);
+        let incomplete = vast_offer(&incomplete);
+        for field in ["machine_id", "host_id", "driver_version", "vms_enabled"] {
+            assert_eq!(incomplete[field], Value::Null);
+        }
     }
 }
