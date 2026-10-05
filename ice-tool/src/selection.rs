@@ -314,6 +314,7 @@ pub(crate) fn resolve(config: &IceConfig, cloud: Cloud, args: &CreateArgs) -> Re
     }
     let mut provider_options = json!({});
     if cloud == Cloud::Verda {
+        provider_options["rental_type"] = json!({"value":"on_demand", "source":"built_in"});
         for (field, supplied) in [
             ("image", &args.image),
             ("location", &args.location),

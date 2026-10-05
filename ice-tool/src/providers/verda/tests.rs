@@ -573,12 +573,47 @@ fn storage_is_in_the_ceiling_and_preview_has_no_enforced_deadline() {
     assert_eq!(preview["cleanup"]["planned_deadline_unix"], 1000);
     assert_eq!(preview["cleanup"]["deadline_enforced"], false);
     assert!(preview.get("profiling").is_none());
+    assert_eq!(preview["rental_type"], "on_demand");
     assert_eq!(preview["image"]["source"], "provider_catalog");
     assert_eq!(preview["image"]["local_upload"], false);
     assert_eq!(
         preview["cost"]["estimated_total_usd"],
         offer.hourly_usd * 0.25
     );
+}
+
+#[test]
+fn on_demand_selection_does_not_substitute_spot_prices_or_claim_spot_capacity() {
+    let mut data = serde_json::to_value(catalog()).unwrap();
+    data["machines"][0]["spot_price"] = json!(0.01);
+    let mut catalog: Catalog = serde_json::from_value(data).unwrap();
+    let mut requirements = requirements();
+    requirements.max_price_per_hr = 0.5;
+    let error = catalog
+        .select(&requirements, &image_defaults(), None)
+        .unwrap_err();
+    let details = &error
+        .downcast_ref::<crate::automation::AgentError>()
+        .unwrap()
+        .details;
+    assert_eq!(details["rental_type"], "on_demand");
+    assert_eq!(details["rejected_machines"]["resources_or_price"], 1);
+
+    requirements.max_price_per_hr = 0.7;
+    let offer = catalog
+        .select(&requirements, &image_defaults(), None)
+        .unwrap();
+    assert_eq!(offer.compute_hourly_usd, 0.6);
+    catalog.availability.clear();
+    let error = catalog
+        .select(&requirements, &image_defaults(), None)
+        .unwrap_err();
+    let details = &error
+        .downcast_ref::<crate::automation::AgentError>()
+        .unwrap()
+        .details;
+    assert_eq!(details["rental_type"], "on_demand");
+    assert_eq!(details["rejected_machines"]["availability_or_location"], 1);
 }
 
 #[test]

@@ -389,7 +389,7 @@ pub(crate) fn catalog_command(cloud: Cloud, config: &IceConfig) -> Result<()> {
         bail!("`ice catalog` currently supports --cloud verda only");
     }
     let catalog = Catalog::load(&Client::from_config(config)?)?;
-    let result = json!({"catalog": catalog, "prices_are_estimates":true, "billing_note":BILLING});
+    let result = json!({"catalog": catalog, "rental_type":"on_demand", "prices_are_estimates":true, "billing_note":BILLING});
     if crate::output::is_json() {
         crate::output::emit("catalog", cloud, result)
     } else {
@@ -410,14 +410,16 @@ fn preview(offer: &Offer, hours: f64, now: u64) -> Result<Value> {
     let planned_deadline = now
         .checked_add(seconds.ceil() as u64)
         .context("Verda planned deadline overflows")?;
-    Ok(json!({"status":"preview", "dry_run":true, "offer": offer,
+    Ok(
+        json!({"status":"preview", "dry_run":true, "rental_type":"on_demand", "offer": offer,
         "cost":{"currency":"USD", "hourly_usd":offer.hourly_usd, "compute_hourly_usd":offer.compute_hourly_usd,
             "storage_hourly_usd":offer.storage_hourly_usd, "requested_hours":hours, "estimated_total_usd":total,
             "cost_scope":"compute_and_os_storage", "bandwidth_included":false, "taxes_included":false},
         "cleanup":{"mode":"manual", "planned_deadline_unix":planned_deadline,
             "deadline_enforced":false, "automatic_stop":false, "automatic_delete":false,
             "required_creation_flag":"--manual-cleanup", "billing_note":BILLING},
-        "image":{"id":offer.image.id,"reference":offer.image.image_type,"source":"provider_catalog","local_upload":false}}))
+        "image":{"id":offer.image.id,"reference":offer.image.image_type,"source":"provider_catalog","local_upload":false}}),
+    )
 }
 
 pub(crate) fn validate_create(args: &CreateArgs) -> Result<()> {
@@ -526,7 +528,7 @@ impl Provider {
             return Ok(());
         }
         eprintln!(
-            "Verda {} in {}: ${:.4}/hour including {} GB OS storage. {BILLING}",
+            "Verda on-demand {} in {}: ${:.4}/hour including {} GB OS storage. {BILLING}",
             offer.machine.instance_type, offer.location, offer.hourly_usd, offer.allocated_disk_gb
         );
         if !args.yes && !prompt_confirm("Create this VM with manual cleanup?", false)? {

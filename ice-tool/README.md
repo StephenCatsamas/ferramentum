@@ -47,7 +47,8 @@ Supported cloud identifiers:
 - `vast.ai`
 - `gcp`
 - `aws`
-- `verda` — ordinary GPU VMs with SSH; see [Verda setup, images and billing](docs/verda.md).
+- `verda` — ordinary on-demand GPU VMs with SSH; spot rentals are unsupported.
+  See [Verda setup, images and billing](docs/verda.md).
 - `local`
 
 ## Commands
@@ -59,7 +60,7 @@ Supported cloud identifiers:
 - `ice config set <KEY=VALUE>`
 - `ice config unset <KEY>`
 - `ice list [--cloud CLOUD]`
-- `ice catalog --cloud verda` — live types, images, availability and storage prices
+- `ice catalog --cloud verda` — live types, images, on-demand availability and storage prices
 - `ice logs [--cloud CLOUD] <INSTANCE> [--tail N] [--follow]`
 - `ice shell [--cloud CLOUD] <INSTANCE>`
 - `ice pull [--cloud CLOUD] <INSTANCE> <REMOTE_PATH> [LOCAL_PATH]`
@@ -109,6 +110,13 @@ Successful commands other than `logs` write one JSON object and a newline to std
   includes the instance ID. Vast results include allocated disk, the requested
   image reference and the scheduled UTC stop time as Unix seconds. An automatic
   image reference is not a verified image digest or installed toolkit version.
+- Vast offers include nullable `machine_id`, `host_id`, `driver_version` and
+  `vms_enabled` as reported by the provider. These identify the offer's host
+  configuration; they do not select a VM launch mode or verify workload/profiler
+  access. `--machine` still selects a GPU model on Vast, not a numeric host ID.
+- Verda catalog and create results identify `rental_type: "on_demand"`.
+  Selection provenance and `no_matching_offers` errors identify the same scope;
+  they make no claim about spot prices or availability.
 - Cost values have explicit units. GCP/AWS estimates cover compute. Vast selection,
   `--max-price-per-hr`, `cost` and offer `hourly_usd` use the on-demand quote for
   compute plus the requested storage (`search.totalHour`). Offers without a finite,

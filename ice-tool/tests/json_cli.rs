@@ -1466,6 +1466,10 @@ fn verda_filters_and_provider_options_preserve_provenance() {
     assert_eq!(selection["filters"]["gpu_count"]["value"], 1);
     assert_eq!(selection["price_scope"], "compute_and_os_storage");
     assert_eq!(
+        selection["provider_options"]["rental_type"],
+        json!({"value":"on_demand", "source":"built_in"})
+    );
+    assert_eq!(
         selection["provider_options"]["image"]["source"],
         "command_line"
     );
